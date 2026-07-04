@@ -4,6 +4,62 @@ A fast terminal viewer for large M3U/M3U8 playlists, written in Rust.
 Browse, filter, and play IPTV channel lists that are far too big for a
 text editor — smoothly, even at 100 MB.
 
+## Usage
+
+### Build & run
+
+Requires a stable [Rust toolchain](https://rustup.rs) (pinned via
+`rust-toolchain.toml`) and, for playback, [VLC](https://www.videolan.org).
+
+```console
+$ cargo build --release
+$ ./target/release/m3u-viewer <playlist.m3u>
+```
+
+Or directly:
+
+```console
+$ cargo run --release -- <playlist.m3u>
+```
+
+The UI opens immediately; large files keep loading in the background
+while you browse (progress shows in the status bar).
+
+### Command line
+
+```
+m3u-viewer <playlist.m3u> [--vlc <path-to-vlc>]
+```
+
+- `<playlist.m3u>` — the playlist to open (`.m3u` or `.m3u8`, UTF-8).
+- `--vlc <path>` — use this VLC executable instead of auto-detection.
+  Without it, `vlc` is looked up on `PATH`, then in the standard install
+  locations (e.g. `C:\Program Files\VideoLAN\VLC` on Windows,
+  `/Applications/VLC.app` on macOS).
+
+### Keys at a glance
+
+Press `?` inside the viewer for the full list. The essentials:
+
+| Key | Action |
+| --- | --- |
+| `/` + text | filter channels as you type |
+| `g` | restrict to one group |
+| `Enter` | play the selected channel in VLC |
+| `f` | mark/unmark as favorite (`★`) |
+| `F` / `R` / `Tab` | favorites view / recents view / cycle views |
+| `Esc` | clear filter and group |
+| `q` | quit |
+
+### Where your data lives
+
+Favorites and recently played channels are stored as small JSON files in
+the per-user config directory — on Windows
+`%APPDATA%\m3u-viewer\config\`, on Linux `~/.config/m3u-viewer/`, on
+macOS `~/Library/Application Support/m3u-viewer/`. They are keyed by
+stream URL, so they survive playlist re-downloads and re-ordering.
+Deleting the directory simply resets both lists.
+
 ## Specification
 
 ### Goals
