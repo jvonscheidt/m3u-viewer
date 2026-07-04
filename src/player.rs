@@ -38,20 +38,27 @@ impl Player {
     pub fn discover(override_path: Option<&Path>) -> Result<Self, PlayerError> {
         if let Some(path) = override_path {
             return if path.is_file() {
+                log::info!("using VLC override: {}", path.display());
                 Ok(Self {
                     exe: path.to_path_buf(),
                 })
             } else {
+                log::warn!("VLC override is not a file: {}", path.display());
                 Err(PlayerError::BadOverride(path.to_path_buf()))
             };
         }
         let path_dirs = env::var_os("PATH")
             .map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
             .unwrap_or_default();
-        find_executable(path_dirs.iter().map(PathBuf::as_path))
+        let result = find_executable(path_dirs.iter().map(PathBuf::as_path))
             .or_else(|| find_executable(standard_dirs().iter().map(PathBuf::as_path)))
             .map(|exe| Self { exe })
-            .ok_or(PlayerError::NotFound)
+            .ok_or(PlayerError::NotFound);
+        match &result {
+            Ok(player) => log::info!("VLC found: {}", player.exe.display()),
+            Err(_) => log::warn!("VLC not found"),
+        }
+        result
     }
 
     /// Full path of the executable that will be launched.
@@ -68,6 +75,7 @@ impl Player {
     ///
     /// [`PlayerError::Spawn`] if the process cannot be started.
     pub fn play(&self, url: &str) -> Result<(), PlayerError> {
+        log::info!("launching VLC for playback");
         let mut child = Command::new(&self.exe)
             .arg(url)
             .stdin(Stdio::null())
