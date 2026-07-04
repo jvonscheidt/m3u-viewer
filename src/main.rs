@@ -2,7 +2,7 @@
 //! loop gluing keys, background [`LoadEvent`]s, and the VLC player to the
 //! application state.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -33,6 +33,16 @@ struct Args {
     save_config: bool,
 }
 
+/// Whether `arg` is one of the recognised option flags — used to detect a
+/// flag whose value was omitted (e.g. `--username --password`), so the next
+/// flag is not silently swallowed as that value.
+fn looks_like_flag(arg: &OsStr) -> bool {
+    matches!(
+        arg.to_str(),
+        Some("--vlc" | "--xtream" | "--username" | "--password" | "--save-config")
+    )
+}
+
 /// Parses CLI arguments, filling in missing Xtream credentials and the VLC
 /// path from `config` when they are not provided on the command line.
 fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<Args> {
@@ -43,10 +53,13 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
     let mut password: Option<String> = None;
     let mut save_config = false;
 
-    let mut args = args.peekable();
+    let mut args = args;
     while let Some(arg) = args.next() {
         let mut string_flag = |name: &str| -> Result<String> {
             match args.next() {
+                Some(value) if looks_like_flag(&value) => {
+                    bail!("{name} needs a value\n{USAGE}")
+                }
                 Some(value) => Ok(value.to_string_lossy().into_owned()),
                 None => bail!("{name} needs a value\n{USAGE}"),
             }
@@ -69,14 +82,19 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
     }
 
     // Fill in Xtream credentials from config when --xtream was not given on
-    // the CLI and no playlist file was provided either.
+    // the CLI and no playlist file was provided either. CLI values always
+    // win, so only fields the user did not supply are taken from config.
     if server.is_none()
         && playlist.is_none()
         && let Some(ref xtream_cfg) = config.xtream
     {
         server = Some(xtream_cfg.server.clone());
-        username = Some(xtream_cfg.username.clone());
-        password = Some(xtream_cfg.password.clone());
+        if username.is_none() {
+            username = Some(xtream_cfg.username.clone());
+        }
+        if password.is_none() {
+            password = Some(xtream_cfg.password.clone());
+        }
     }
     // VLC path from config only when --vlc was not given on the CLI.
     if vlc_override.is_none() {
@@ -358,5 +376,41 @@ mod tests {
         ])
         .unwrap();
         assert!(args.save_config);
+    }
+
+    #[test]
+    fn cli_credentials_override_config() {
+        // Regression: partial CLI credentials must win over stored ones
+        // rather than being silently replaced by the whole config block.
+        let config = Config {
+            xtream: Some(XtreamConfig {
+                server: "http://example.com".to_owned(),
+                username: "stored".to_owned(),
+                password: "stored-pw".to_owned(),
+            }),
+            vlc_path: None,
+        };
+        let args = parse_args(
+            ["--username", "cli-user"].iter().map(OsString::from),
+            &config,
+        )
+        .unwrap();
+        let Source::Xtream(account) = args.source else {
+            panic!("expected an Xtream source");
+        };
+        let (server, username, password) = account.credentials();
+        assert_eq!(server, "http://example.com"); // filled from config
+        assert_eq!(username, "cli-user"); // CLI wins
+        assert_eq!(password, "stored-pw"); // filled from config
+    }
+
+    #[test]
+    fn missing_flag_value_is_an_error_not_a_swallowed_flag() {
+        // `--username` with no value must not consume `--password` as its
+        // value.
+        let error = parse(&["--xtream", "example.com", "--username", "--password", "p"])
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("--username needs a value"));
     }
 }
