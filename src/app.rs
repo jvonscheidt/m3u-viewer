@@ -23,6 +23,15 @@ pub enum Mode {
     Help,
 }
 
+/// A channel the user asked to play, handed from [`App::handle_key`] to
+/// the event loop (which owns the external player).
+pub struct PlayRequest {
+    /// Display name, for the status-bar confirmation.
+    pub name: String,
+    /// Stream URL to hand to the player.
+    pub url: String,
+}
+
 /// Top-level TUI state.
 pub struct App {
     pub(crate) channels: Vec<Channel>,
@@ -50,6 +59,10 @@ pub struct App {
     pub(crate) file_name: String,
     /// Cursor in the group popup: 0 is "(all groups)", `n + 1` is group `n`.
     pub(crate) group_cursor: usize,
+    /// Transient status-bar notice (playback confirmations and errors);
+    /// cleared by the next key press.
+    pub(crate) message: Option<String>,
+    play_request: Option<PlayRequest>,
     quit: bool,
 }
 
@@ -75,6 +88,8 @@ impl App {
             error: None,
             file_name,
             group_cursor: 0,
+            message: None,
+            play_request: None,
             quit: false,
         }
     }
@@ -122,8 +137,21 @@ impl App {
         }
     }
 
+    /// Takes the pending playback request, if the last key press created
+    /// one. The event loop consumes this and talks to the player.
+    pub fn take_play_request(&mut self) -> Option<PlayRequest> {
+        self.play_request.take()
+    }
+
+    /// Puts a transient notice (e.g. playback confirmation or error) in
+    /// the status bar; the next key press clears it.
+    pub fn set_message(&mut self, message: String) {
+        self.message = Some(message);
+    }
+
     /// Routes a key press according to the current [`Mode`].
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.message = None;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
             return;
@@ -139,6 +167,15 @@ impl App {
     fn key_normal(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Enter => {
+                if let Some(&index) = self.filtered.get(self.selected) {
+                    let channel = &self.channels[index];
+                    self.play_request = Some(PlayRequest {
+                        name: channel.name.clone(),
+                        url: channel.url.clone(),
+                    });
+                }
+            }
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char('g') => {
                 self.group_cursor = self.group_filter.map_or(0, |id| id + 1);
@@ -368,6 +405,34 @@ mod tests {
         });
         // Only the matching newcomer joins the filtered list.
         assert_eq!(app.filtered, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn enter_requests_playback_of_the_selection() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let request = app.take_play_request().unwrap();
+        assert_eq!(request.name, "CNN");
+        assert_eq!(request.url, "http://example.com/CNN");
+        // Consumed: a second take yields nothing.
+        assert!(app.take_play_request().is_none());
+    }
+
+    #[test]
+    fn enter_on_empty_list_requests_nothing() {
+        let mut app = App::new("empty.m3u".into());
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.take_play_request().is_none());
+    }
+
+    #[test]
+    fn next_key_clears_transient_message() {
+        let mut app = loaded_app();
+        app.set_message("▶ CNN in VLC".into());
+        assert!(app.message.is_some());
+        app.handle_key(key(KeyCode::Down));
+        assert!(app.message.is_none());
     }
 
     #[test]
