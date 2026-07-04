@@ -76,6 +76,7 @@ macOS `~/Library/Application Support/m3u-viewer/`.
 | `config.toml` | Xtream credentials and VLC path (written by `--save-config`) |
 | `favorites.json` | Favorited channel URLs |
 | `recents.json` | Recently played channel URLs (newest first, capped at 50) |
+| `m3u-viewer.log` | Diagnostic log (startup, loading, playback); overwritten each run |
 
 Favorites and recents are keyed by stream URL, so they survive playlist
 re-downloads and re-ordering. **`config.toml` stores Xtream credentials

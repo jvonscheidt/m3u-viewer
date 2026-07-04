@@ -57,13 +57,25 @@ pub fn spawn(source: Source) -> Receiver<LoadEvent> {
     let (tx, rx) = channel();
     thread::spawn(move || {
         let result = match source {
-            Source::File(path) => load_file(&path, &tx),
-            Source::Xtream(account) => load_xtream(&account, &tx),
+            Source::File(path) => {
+                log::info!("loading playlist from file: {}", path.display());
+                load_file(&path, &tx)
+            }
+            Source::Xtream(account) => {
+                log::info!("loading Xtream playlist: {}", account.display_name());
+                load_xtream(&account, &tx)
+            }
         };
         // A send failure just means the UI is gone; nothing left to do.
         let _ = match result {
-            Ok(()) => tx.send(LoadEvent::Finished),
-            Err(message) => tx.send(LoadEvent::Failed(message)),
+            Ok(()) => {
+                log::info!("playlist loading complete");
+                tx.send(LoadEvent::Finished)
+            }
+            Err(message) => {
+                log::error!("playlist loading failed: {message}");
+                tx.send(LoadEvent::Failed(message))
+            }
         };
     });
     rx

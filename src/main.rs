@@ -3,7 +3,7 @@
 //! application state.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -117,12 +117,39 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
     }
 }
 
+/// Initialises file-only logging to `path`, truncating any previous run's
+/// log. Silently does nothing if `path` is `None` or the file cannot be
+/// created.
+fn init_logger(path: Option<&Path>) {
+    let Some(path) = path else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(file) = std::fs::File::create(path) {
+        let _ = simplelog::WriteLogger::init(
+            simplelog::LevelFilter::Info,
+            simplelog::Config::default(),
+            file,
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let config_path = Config::default_path();
+    let log_path = config_path
+        .as_ref()
+        .map(|p| p.with_file_name("m3u-viewer.log"));
+    init_logger(log_path.as_deref());
+    log::info!("m3u-viewer {} starting", env!("CARGO_PKG_VERSION"));
+
     let config = if let Some(ref path) = config_path {
         match Config::load(path) {
-            Ok(cfg) => cfg,
+            Ok(cfg) => {
+                log::info!("config loaded from: {}", path.display());
+                cfg
+            }
             Err(e) => {
+                log::warn!("config load error: {e}");
                 eprintln!("warning: could not load config: {e}");
                 Config::default()
             }
@@ -159,7 +186,10 @@ fn main() -> Result<()> {
         match config_path {
             Some(ref path) => {
                 if let Err(e) = new_config.save(path) {
+                    log::warn!("config save error: {e}");
                     eprintln!("warning: {e}");
+                } else {
+                    log::info!("config saved to: {}", path.display());
                 }
             }
             None => eprintln!("warning: --save-config: no config directory on this platform"),

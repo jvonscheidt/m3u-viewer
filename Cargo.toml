@@ -9,10 +9,12 @@ repository = "https://github.com/jvonscheidt/m3u-viewer"
 [dependencies]
 anyhow = "1.0.103"
 directories = "6.0.0"
+log = "0.4.33"
 percent-encoding = "2.3.2"
 ratatui = "0.30.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+simplelog = "0.12.2"
 thiserror = "2.0.18"
 toml = "1.1.2"
 ureq = "3.3.0"
