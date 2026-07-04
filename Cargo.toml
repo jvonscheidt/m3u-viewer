@@ -1,0 +1,18 @@
+[package]
+name = "m3u-viewer"
+version = "0.1.0"
+edition = "2024"
+description = "Fast terminal viewer for large M3U playlists"
+license = "MIT"
+repository = "https://github.com/jvonscheidt/m3u-viewer"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
