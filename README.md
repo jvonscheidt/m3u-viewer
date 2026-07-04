@@ -29,9 +29,17 @@ while you browse (progress shows in the status bar).
 
 ```
 m3u-viewer <playlist.m3u> [--vlc <path-to-vlc>]
+m3u-viewer --xtream <server> --username <user> --password <pass> [--vlc <path>]
 ```
 
 - `<playlist.m3u>` — the playlist to open (`.m3u` or `.m3u8`, UTF-8).
+- `--xtream <server>` — instead of a file, load the playlist of an
+  Xtream Codes account. `<server>` is the provider's base URL (e.g.
+  `http://provider.example:8080`; `http://` is assumed if omitted).
+  Requires `--username` and `--password`. The playlist is downloaded via
+  the account's `get.php` endpoint and streams into the viewer while it
+  arrives. Note that the credentials are visible in your shell history
+  and process list.
 - `--vlc <path>` — use this VLC executable instead of auto-detection.
   Without it, `vlc` is looked up on `PATH`, then in the standard install
   locations (e.g. `C:\Program Files\VideoLAN\VLC` on Windows,
@@ -81,6 +89,11 @@ Deleting the directory simply resets both lists.
 #### Loading & parsing
 
 - Invocation: `m3u-viewer <playlist.m3u>`; also accepts `.m3u8` (UTF-8).
+- Alternative source (since 0.2.0): `--xtream <server> --username <u>
+  --password <p>` downloads the account playlist over HTTP
+  (`get.php?type=m3u_plus`) and streams it through the same parser;
+  progress is indeterminate when the server does not announce a
+  content length.
 - Parses `#EXTINF` metadata: channel name, `tvg-id`, `tvg-logo` (ignored),
   `group-title`, and the stream URL on the following line.
 - Malformed entries are skipped, counted, and reported in the status bar —

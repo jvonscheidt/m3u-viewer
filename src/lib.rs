@@ -8,3 +8,4 @@ pub mod player;
 pub mod playlist;
 pub mod store;
 pub mod ui;
+pub mod xtream;
