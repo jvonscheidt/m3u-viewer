@@ -67,5 +67,4 @@ Before declaring any change done, all three must pass locally:
 - Update branches with `git pull --rebase`; never force-push a shared branch.
 - Use the `gh` CLI for GitHub work (`gh pr create`, `gh issue view`, …). Keep
   PRs small and single-purpose; CI (fmt check, clippy, tests) must be green
-  before merge. 
-- Once committed and pushed, PR, wait for CI completion and then merge to main.
+  before merge.
