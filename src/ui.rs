@@ -135,11 +135,16 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// Centered popup listing "(all groups)" plus every interned group.
+/// Centered popup listing "(all groups)" plus every interned group, in
+/// alphabetical order.
 fn draw_group_popup(frame: &mut Frame, app: &App) {
     let area = centered(frame.area(), 44, 16);
     let items = std::iter::once(ListItem::new("(all groups)"))
-        .chain(app.groups.iter().map(|name| ListItem::new(name.clone())))
+        .chain(
+            app.sorted_groups
+                .iter()
+                .map(|&id| ListItem::new(app.groups[id].clone())),
+        )
         .collect::<Vec<_>>();
     let list = List::new(items)
         .block(Block::bordered().title(" group (Enter select · Esc close) "))
