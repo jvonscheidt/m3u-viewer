@@ -26,12 +26,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// materialized, so list size does not affect frame time.
 fn draw_channels(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.filtered.is_empty() {
-        let message = match app.view {
-            View::Favorites => "no favorites yet — f toggles the selected channel",
-            View::Recents => "nothing played yet — Enter plays the selected channel",
-            View::All if app.loading => "loading…",
-            View::All if app.channels.is_empty() => "playlist is empty",
-            View::All => "no channels match",
+        let filtering = !app.filter.is_empty() || app.group_filter.is_some();
+        let message = if app.channels.is_empty() {
+            // Nothing loaded (yet).
+            if app.loading {
+                "loading…"
+            } else {
+                "playlist is empty"
+            }
+        } else if filtering {
+            // Channels exist but the active filter/group excludes them all;
+            // during load more may still match, so don't claim "none".
+            if app.loading {
+                "no matches yet — loading…"
+            } else {
+                "no channels match"
+            }
+        } else {
+            // The whole view is empty on its own terms.
+            match app.view {
+                View::Favorites => "no favorites yet — f toggles the selected channel",
+                View::Recents => "nothing played yet — Enter plays the selected channel",
+                View::All => "no channels match",
+            }
         };
         frame.render_widget(Paragraph::new(message).dim().centered(), area);
         return;
@@ -243,5 +260,19 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         let screen = render(&mut app);
         assert!(screen.contains("navigate"));
+    }
+
+    #[test]
+    fn empty_filter_result_says_no_match_not_loading() {
+        // Regression: a non-matching filter on a loaded list showed the
+        // wrong empty-state message.
+        let mut app = app_with_channels(3);
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for c in "zzz".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let screen = render(&mut app);
+        assert!(screen.contains("no channels match"));
+        assert!(!screen.contains("loading"));
     }
 }

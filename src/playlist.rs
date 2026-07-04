@@ -235,22 +235,46 @@ fn split_at_unquoted_comma(s: &str) -> Option<(&str, &str)> {
 
 /// Extracts the value of a `key="value"` attribute from `#EXTINF` metadata.
 ///
-/// The key must start the string or follow whitespace, so that e.g.
-/// `tvg-id` does not match inside `x-tvg-id`. Attributes without a closing
-/// quote are treated as absent.
+/// The metadata is scanned as a sequence of tokens (the leading duration and
+/// any tokens that are not `name="value"` pairs are skipped), so `key`
+/// matches only as a whole attribute name — never as a substring of another
+/// name (`x-tvg-id`) and never inside another attribute's quoted value.
+/// Attributes without a closing quote are treated as absent.
 fn attribute<'a>(meta: &'a str, key: &str) -> Option<&'a str> {
-    let mut from = 0;
-    while let Some(pos) = meta[from..].find(key) {
-        let start = from + pos;
-        let at_boundary = start == 0 || meta.as_bytes()[start - 1].is_ascii_whitespace();
-        let after = &meta[start + key.len()..];
-        if at_boundary
-            && let Some(value) = after.strip_prefix("=\"")
-            && let Some(end) = value.find('"')
-        {
-            return Some(&value[..end]);
+    let bytes = meta.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip whitespace between tokens.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
-        from = start + key.len();
+        // Read this token's name, up to '=' or the next whitespace.
+        let name_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name = &meta[name_start..i];
+        // Only `name="value"` tokens carry a value; anything else (the
+        // leading duration, bare tokens) is skipped by the outer loop.
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'"' {
+                i += 1;
+                let value_start = i;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    // Unterminated quote: treat as absent.
+                    return None;
+                }
+                let value = &meta[value_start..i];
+                i += 1; // Consume the closing quote.
+                if name == key {
+                    return Some(value);
+                }
+            }
+        }
     }
     None
 }
@@ -368,6 +392,33 @@ mod tests {
     fn key_must_be_a_whole_word() {
         let playlist = parse("#EXTINF:-1 x-tvg-id=\"wrong\",A\nhttp://u\n");
         assert_eq!(playlist.channels[0].tvg_id, None);
+    }
+
+    #[test]
+    fn key_inside_another_quoted_value_is_not_matched() {
+        // Regression: a key name embedded in another attribute's quoted
+        // value must not be mistaken for the real attribute.
+        let playlist =
+            parse("#EXTINF:-1 tvg-name=\"x group-title=Fake\" group-title=\"Real\",N\nhttp://u\n");
+        let channel = &playlist.channels[0];
+        assert_eq!(playlist.group_name(channel.group.unwrap()), Some("Real"));
+    }
+
+    #[test]
+    fn attributes_need_not_be_whitespace_separated() {
+        // Regression: an attribute glued to the previous closing quote was
+        // dropped because the old parser required leading whitespace.
+        let playlist = parse("#EXTINF:-1 group-title=\"A\"tvg-id=\"B\",N\nhttp://u\n");
+        let channel = &playlist.channels[0];
+        assert_eq!(channel.tvg_id.as_deref(), Some("B"));
+        assert_eq!(playlist.group_name(channel.group.unwrap()), Some("A"));
+    }
+
+    #[test]
+    fn unterminated_attribute_quote_is_absent() {
+        // Exercised directly: a never-closed quote in the full payload is
+        // rejected earlier (no separator comma), so this guards attribute().
+        assert_eq!(attribute("-1 tvg-id=\"abc", "tvg-id"), None);
     }
 
     #[test]

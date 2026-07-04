@@ -83,9 +83,12 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| ConfigError::Write(e.to_string()))?;
         }
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, &text).map_err(|e| ConfigError::Write(e.to_string()))?;
-        fs::rename(&tmp, path).map_err(|e| ConfigError::Write(e.to_string()))?;
+        let tmp = unique_tmp(path);
+        let write_and_rename = fs::write(&tmp, &text).and_then(|()| fs::rename(&tmp, path));
+        if let Err(e) = write_and_rename {
+            let _ = fs::remove_file(&tmp);
+            return Err(ConfigError::Write(e.to_string()));
+        }
         Ok(())
     }
 
@@ -96,6 +99,17 @@ impl Config {
         directories::ProjectDirs::from("", "", "m3u-viewer")
             .map(|dirs| dirs.config_dir().join(CONFIG_FILE))
     }
+}
+
+/// A sibling temp path unique to this process and moment, so concurrent
+/// writers cannot clobber each other's temp file before their renames.
+fn unique_tmp(path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{}.{nanos}", std::process::id()));
+    path.with_file_name(name)
 }
 
 #[cfg(test)]

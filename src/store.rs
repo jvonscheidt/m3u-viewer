@@ -125,11 +125,28 @@ fn read_list(path: &Path) -> Vec<String> {
 }
 
 /// Writes via a sibling temp file and rename, so a crash mid-write can
-/// never leave a truncated JSON file behind.
+/// never leave a truncated JSON file behind. The temp name is unique per
+/// process and instant, so two concurrent writers cannot clobber each
+/// other's temp file before their renames.
 fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, contents)?;
-    fs::rename(&tmp, path)
+    let tmp = unique_tmp(path);
+    let result = fs::write(&tmp, contents).and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        // Best effort: don't leave the temp file behind on failure.
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// A sibling temp path unique to this process and moment, e.g.
+/// `favorites.json.tmp.4711.1234567890`.
+fn unique_tmp(path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{}.{nanos}", std::process::id()));
+    path.with_file_name(name)
 }
 
 #[cfg(test)]
