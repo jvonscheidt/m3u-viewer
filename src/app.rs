@@ -67,7 +67,8 @@ pub struct App {
     pub(crate) page_rows: usize,
     pub(crate) mode: Mode,
     pub(crate) loading: bool,
-    pub(crate) percent: u8,
+    /// Load progress 0–100; `None` when the source size is unknown.
+    pub(crate) percent: Option<u8>,
     pub(crate) skipped: usize,
     pub(crate) error: Option<String>,
     pub(crate) file_name: String,
@@ -104,7 +105,7 @@ impl App {
             page_rows: 1,
             mode: Mode::Normal,
             loading: true,
-            percent: 0,
+            percent: None,
             skipped: 0,
             error: None,
             file_name,
@@ -163,7 +164,7 @@ impl App {
             }
             LoadEvent::Finished => {
                 self.loading = false;
-                self.percent = 100;
+                self.percent = Some(100);
             }
             LoadEvent::Failed(message) => {
                 self.loading = false;
@@ -448,7 +449,7 @@ mod tests {
             ],
             new_groups: vec!["News".into(), "Sports".into()],
             skipped: 0,
-            percent: 100,
+            percent: Some(100),
         });
         app.on_load_event(LoadEvent::Finished);
         app
@@ -536,7 +537,7 @@ mod tests {
             channels: vec![channel("Comedy Central", None), channel("Arte", None)],
             new_groups: Vec::new(),
             skipped: 0,
-            percent: 100,
+            percent: Some(100),
         });
         // Only the matching newcomer joins the filtered list.
         assert_eq!(app.filtered, vec![0, 1, 3]);
