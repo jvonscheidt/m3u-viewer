@@ -52,7 +52,20 @@ pub struct App {
     /// Lowercase "name group" per channel, precomputed so a filter pass
     /// over a million entries stays within the latency budget.
     search_keys: Vec<String>,
+    /// Lowercase channel name per channel, cached so sorting never
+    /// re-lowercases a name it has already seen.
+    name_keys: Vec<String>,
+    /// All channel indices, sorted alphabetically by name (case
+    /// insensitive) and merge-updated as batches arrive — see
+    /// [`Self::absorb_channels`]. The source of iteration order for both
+    /// the "all channels" and favorites views.
+    sorted_channels: Vec<usize>,
     pub(crate) groups: Vec<String>,
+    /// `groups` ids in alphabetical order, for the group popup. Rebuilt
+    /// from scratch whenever groups change: the interned group table
+    /// stays orders of magnitude smaller than the channel list, so a
+    /// full resort here is cheap even at playlist scale.
+    pub(crate) sorted_groups: Vec<GroupId>,
     pub(crate) filter: String,
     filter_lower: String,
     pub(crate) group_filter: Option<GroupId>,
@@ -95,7 +108,10 @@ impl App {
         Self {
             channels: Vec::new(),
             search_keys: Vec::new(),
+            name_keys: Vec::new(),
+            sorted_channels: Vec::new(),
             groups: Vec::new(),
+            sorted_groups: Vec::new(),
             filter: String::new(),
             filter_lower: String::new(),
             group_filter: None,
@@ -135,12 +151,18 @@ impl App {
                 skipped,
                 percent,
             } => {
-                self.groups.extend(new_groups);
+                if !new_groups.is_empty() {
+                    self.groups.extend(new_groups);
+                    self.rebuild_sorted_groups();
+                }
                 self.skipped = skipped;
                 self.percent = percent;
                 let start = self.channels.len();
                 for channel in &channels {
-                    self.search_keys.push(self.search_key(channel));
+                    let name_lower = channel.name.to_lowercase();
+                    self.search_keys
+                        .push(self.search_key(&name_lower, channel.group));
+                    self.name_keys.push(name_lower);
                 }
                 self.channels.extend(channels);
                 for index in start..self.channels.len() {
@@ -148,19 +170,7 @@ impl App {
                         .entry(self.channels[index].url.clone())
                         .or_insert(index);
                 }
-                if self.view == View::All {
-                    // Appending can't invalidate existing matches, so
-                    // extend the filtered index list instead.
-                    for index in start..self.channels.len() {
-                        if self.matches(index) {
-                            self.filtered.push(index);
-                        }
-                    }
-                } else {
-                    // Favorites/recents views need the store checks and
-                    // (for recents) store-defined ordering.
-                    self.recompute_filter();
-                }
+                self.absorb_channels(start);
             }
             LoadEvent::Finished => {
                 self.loading = false;
@@ -233,7 +243,9 @@ impl App {
             }
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char('g') => {
-                self.group_cursor = self.group_filter.map_or(0, |id| id + 1);
+                self.group_cursor = self
+                    .group_filter
+                    .map_or(0, |id| self.group_display_position(id) + 1);
                 self.mode = Mode::Groups;
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -301,7 +313,10 @@ impl App {
                 self.group_cursor = (self.group_cursor + 1).min(self.groups.len());
             }
             KeyCode::Enter => {
-                self.group_filter = self.group_cursor.checked_sub(1);
+                self.group_filter = self
+                    .group_cursor
+                    .checked_sub(1)
+                    .map(|position| self.sorted_groups[position]);
                 self.mode = Mode::Normal;
                 self.recompute_filter();
             }
@@ -343,17 +358,23 @@ impl App {
         self.filter_lower = self.filter.to_lowercase();
         self.filtered = match (self.view, &self.store) {
             // Recents ordering comes from the store (newest first), not
-            // from playlist order.
+            // alphabetically.
             (View::Recents, Some(store)) => store
                 .recents()
                 .iter()
                 .filter_map(|url| self.url_index.get(url).copied())
                 .filter(|&index| self.matches(index))
                 .collect(),
-            (View::All, _) => (0..self.channels.len())
+            (View::All, _) => self
+                .sorted_channels
+                .iter()
+                .copied()
                 .filter(|&index| self.matches(index))
                 .collect(),
-            (View::Favorites, Some(store)) => (0..self.channels.len())
+            (View::Favorites, Some(store)) => self
+                .sorted_channels
+                .iter()
+                .copied()
                 .filter(|&index| {
                     store.is_favorite(&self.channels[index].url) && self.matches(index)
                 })
@@ -364,6 +385,50 @@ impl App {
         };
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
         self.offset = self.offset.min(self.selected);
+    }
+
+    /// Merge-updates [`Self::sorted_channels`] (and, for the "all
+    /// channels" view, [`Self::filtered`]) with the channels appended at
+    /// `start..self.channels.len()`.
+    ///
+    /// The new slice is sorted once (cheap: one batch) and merged into
+    /// the already-sorted running lists in a single linear pass, so
+    /// absorbing a batch costs O(n) rather than re-sorting everything —
+    /// the same budget the previous plain-append approach spent, now
+    /// spent keeping alphabetical order instead of arrival order.
+    fn absorb_channels(&mut self, start: usize) {
+        let mut new_indices: Vec<usize> = (start..self.channels.len()).collect();
+        new_indices.sort_by(|&a, &b| self.name_keys[a].cmp(&self.name_keys[b]));
+        self.sorted_channels = merge_by_key(&self.sorted_channels, &new_indices, &self.name_keys);
+        if self.view == View::All {
+            let matching: Vec<usize> = new_indices
+                .iter()
+                .copied()
+                .filter(|&index| self.matches(index))
+                .collect();
+            self.filtered = merge_by_key(&self.filtered, &matching, &self.name_keys);
+        } else {
+            // Favorites/recents views need the store checks and (for
+            // recents) store-defined ordering.
+            self.recompute_filter();
+        }
+    }
+
+    /// Rebuilds the alphabetical group order shown in the group popup.
+    fn rebuild_sorted_groups(&mut self) {
+        self.sorted_groups = (0..self.groups.len()).collect();
+        let groups = &self.groups;
+        self.sorted_groups
+            .sort_by(|&a, &b| groups[a].to_lowercase().cmp(&groups[b].to_lowercase()));
+    }
+
+    /// Row of `id` in the group popup (its position in
+    /// [`Self::sorted_groups`]).
+    fn group_display_position(&self, id: GroupId) -> usize {
+        self.sorted_groups
+            .iter()
+            .position(|&group_id| group_id == id)
+            .unwrap_or(0)
     }
 
     /// Group restriction and text filter (view membership is handled in
@@ -377,10 +442,10 @@ impl App {
                 || self.search_keys[index].contains(&self.filter_lower))
     }
 
-    /// Lowercase haystack for filtering: channel name plus group name.
-    fn search_key(&self, channel: &Channel) -> String {
-        let mut key = channel.name.to_lowercase();
-        if let Some(name) = channel.group.and_then(|id| self.groups.get(id)) {
+    /// Lowercase haystack for filtering: `name_lower` plus the group name.
+    fn search_key(&self, name_lower: &str, group: Option<GroupId>) -> String {
+        let mut key = name_lower.to_owned();
+        if let Some(name) = group.and_then(|id| self.groups.get(id)) {
             key.push(' ');
             key.push_str(&name.to_lowercase());
         }
@@ -413,6 +478,27 @@ impl App {
             .offset
             .min(self.filtered.len().saturating_sub(self.page_rows));
     }
+}
+
+/// Merges two channel-index lists, each already sorted by `keys[index]`,
+/// into one sorted list — the linear-time counterpart to re-sorting the
+/// concatenation, used to fold a newly arrived batch into a running
+/// alphabetical order without re-touching the entries already placed.
+fn merge_by_key(a: &[usize], b: &[usize], keys: &[String]) -> Vec<usize> {
+    let mut merged = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if keys[a[i]] <= keys[b[j]] {
+            merged.push(a[i]);
+            i += 1;
+        } else {
+            merged.push(b[j]);
+            j += 1;
+        }
+    }
+    merged.extend_from_slice(&a[i..]);
+    merged.extend_from_slice(&b[j..]);
+    merged
 }
 
 #[cfg(test)]
@@ -468,6 +554,107 @@ mod tests {
         assert_eq!(app.channels.len(), 3);
         assert_eq!(app.filtered, vec![0, 1, 2]);
         assert!(!app.loading);
+    }
+
+    /// Reads back channel names in `app.filtered` order.
+    fn filtered_names(app: &App) -> Vec<&str> {
+        app.filtered
+            .iter()
+            .map(|&i| app.channels[i].name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn channels_display_alphabetically_regardless_of_arrival_order() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![
+                channel("Zebra", None),
+                channel("apple", None),
+                channel("Mango", None),
+            ],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        // Case-insensitive: "apple" sorts before "Mango" despite the case.
+        assert_eq!(filtered_names(&app), ["apple", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn later_batches_merge_into_the_existing_alphabetical_order() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Mango", None), channel("Zebra", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("apple", None), channel("Kiwi", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        assert_eq!(filtered_names(&app), ["apple", "Kiwi", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn favorites_view_is_also_alphabetical() {
+        let (store, dir) = temp_store("fav-alpha");
+        let mut app = App::new("test.m3u".into(), Some(store));
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Zebra", None), channel("apple", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        // Favorite them out of alphabetical order: row 1 (Zebra) first,
+        // then row 0 (apple).
+        app.selected = 1;
+        app.handle_key(key(KeyCode::Char('f')));
+        app.selected = 0;
+        app.handle_key(key(KeyCode::Char('f')));
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.view, View::Favorites);
+        assert_eq!(filtered_names(&app), ["apple", "Zebra"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn group_popup_lists_groups_alphabetically() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("A", Some(0)), channel("B", Some(1))],
+            new_groups: vec!["Zeta".into(), "Alpha".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        let names: Vec<&str> = app
+            .sorted_groups
+            .iter()
+            .map(|&id| app.groups[id].as_str())
+            .collect();
+        assert_eq!(names, ["Alpha", "Zeta"]);
+    }
+
+    #[test]
+    fn group_cursor_finds_the_active_filter_after_reordering() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("A", Some(0)), channel("B", Some(1))],
+            // "Zeta" is group id 0 but sorts after "Alpha" (id 1).
+            new_groups: vec!["Zeta".into(), "Alpha".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.group_filter = Some(0); // Zeta
+        app.handle_key(key(KeyCode::Char('g')));
+        // Popup rows: 0 "(all groups)", 1 Alpha, 2 Zeta.
+        assert_eq!(app.group_cursor, 2);
     }
 
     #[test]

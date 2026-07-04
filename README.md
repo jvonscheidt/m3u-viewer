@@ -129,11 +129,13 @@ encrypted. Deleting the directory resets everything.
 #### Browsing & filtering
 
 - Main view: a scrollable channel list (virtualized — only visible rows are
-  rendered) showing channel name and group.
+  rendered) showing channel name and group, sorted alphabetically
+  (case-insensitive) rather than playlist order — including while a large
+  playlist is still streaming in.
 - `/` opens a filter prompt; matching is case-insensitive substring over
   channel name and group, updated on every keystroke (debounced ≤ 50 ms).
 - Group sidebar/selector: jump to or restrict the list to one
-  `group-title`.
+  `group-title`; groups are listed alphabetically too.
 - Filter and group restriction combine (AND).
 
 #### Playback (VLC)
