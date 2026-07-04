@@ -405,6 +405,13 @@ impl App {
         } else if self.selected >= self.offset + self.page_rows {
             self.offset = self.selected + 1 - self.page_rows;
         }
+        // Never scroll past the point where the last row sits at the bottom
+        // of the viewport: otherwise a stale (large) offset left over from a
+        // longer list — after a narrowing filter or a terminal enlarge —
+        // would render matching rows behind a band of blank lines.
+        self.offset = self
+            .offset
+            .min(self.filtered.len().saturating_sub(self.page_rows));
     }
 }
 
@@ -647,5 +654,60 @@ mod tests {
         app.handle_key(key(KeyCode::Home));
         app.ensure_visible(2);
         assert_eq!(app.offset, 0);
+    }
+
+    #[test]
+    fn narrowing_filter_does_not_strand_offset_below_the_list() {
+        // Regression: scrolling to the end of a long list left a large
+        // offset that a subsequent narrowing filter did not pull back up,
+        // hiding the matches behind blank rows.
+        let mut app = App::new("test.m3u".into(), None);
+        let channels = (0..1000)
+            .map(|i| channel(&format!("Channel {i}"), None))
+            .collect();
+        app.on_load_event(LoadEvent::Batch {
+            channels,
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        // Scroll to the bottom in a 20-row viewport.
+        app.handle_key(key(KeyCode::End));
+        app.ensure_visible(20);
+        assert_eq!(app.offset, 980);
+        // Filter down to the five "Channel 1", "10".."13"-style matches that
+        // start with "Channel 1" and are short — pick "Channel 999" only.
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "channel 999".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.filtered.len(), 1);
+        // Offset must fall back so the single match is visible, not stranded
+        // at row 980 with an empty viewport.
+        app.ensure_visible(20);
+        assert_eq!(app.offset, 0);
+    }
+
+    #[test]
+    fn enlarging_viewport_pulls_offset_up_to_fill_it() {
+        // Regression: growing the terminal must not leave the bottom rows
+        // anchored high with blank space beneath them.
+        let mut app = App::new("test.m3u".into(), None);
+        let channels = (0..100)
+            .map(|i| channel(&format!("Channel {i}"), None))
+            .collect();
+        app.on_load_event(LoadEvent::Batch {
+            channels,
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        app.handle_key(key(KeyCode::End));
+        app.ensure_visible(5); // small terminal
+        assert_eq!(app.offset, 95);
+        app.ensure_visible(40); // enlarged terminal
+        assert_eq!(app.offset, 60); // 100 rows - 40 visible
     }
 }
