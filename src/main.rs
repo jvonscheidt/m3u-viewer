@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use m3u_viewer::app::App;
+use m3u_viewer::config::{Config, XtreamConfig};
 use m3u_viewer::loader::{self, LoadEvent, Source};
 use m3u_viewer::player::{Player, PlayerError};
 use m3u_viewer::store::Store;
@@ -18,7 +19,8 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 const USAGE: &str = "usage: m3u-viewer <playlist.m3u> [--vlc <path>]\n       \
-     m3u-viewer --xtream <server> --username <user> --password <pass> [--vlc <path>]";
+     m3u-viewer --xtream <server> --username <user> --password <pass> [--vlc <path>] [--save-config]\n       \
+     m3u-viewer [--vlc <path>]   (uses saved Xtream credentials from config)";
 
 /// Parsed command line.
 struct Args {
@@ -26,14 +28,20 @@ struct Args {
     /// Status-bar caption: file name or `xtream:<host>`.
     display_name: String,
     vlc_override: Option<PathBuf>,
+    /// When true, persist the resolved credentials + VLC path to the config
+    /// file before starting.
+    save_config: bool,
 }
 
-fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Args> {
+/// Parses CLI arguments, filling in missing Xtream credentials and the VLC
+/// path from `config` when they are not provided on the command line.
+fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<Args> {
     let mut playlist: Option<PathBuf> = None;
     let mut vlc_override = None;
     let mut server: Option<String> = None;
     let mut username: Option<String> = None;
     let mut password: Option<String> = None;
+    let mut save_config = false;
 
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -51,11 +59,28 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Args> {
             username = Some(string_flag("--username")?);
         } else if arg == "--password" {
             password = Some(string_flag("--password")?);
+        } else if arg == "--save-config" {
+            save_config = true;
         } else if playlist.is_none() && server.is_none() {
             playlist = Some(PathBuf::from(arg));
         } else {
             bail!("unexpected argument: {}\n{USAGE}", arg.to_string_lossy());
         }
+    }
+
+    // Fill in Xtream credentials from config when --xtream was not given on
+    // the CLI and no playlist file was provided either.
+    if server.is_none()
+        && playlist.is_none()
+        && let Some(ref xtream_cfg) = config.xtream
+    {
+        server = Some(xtream_cfg.server.clone());
+        username = Some(xtream_cfg.username.clone());
+        password = Some(xtream_cfg.password.clone());
+    }
+    // VLC path from config only when --vlc was not given on the CLI.
+    if vlc_override.is_none() {
+        vlc_override.clone_from(&config.vlc_path);
     }
 
     match (playlist, server) {
@@ -72,6 +97,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Args> {
                 source: Source::File(path),
                 display_name,
                 vlc_override,
+                save_config,
             })
         }
         (None, Some(server)) => {
@@ -84,6 +110,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Args> {
                 source: Source::Xtream(account),
                 display_name,
                 vlc_override,
+                save_config,
             })
         }
         (None, None) => bail!("{USAGE}"),
@@ -91,12 +118,54 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Args> {
 }
 
 fn main() -> Result<()> {
-    let args = parse_args(std::env::args_os().skip(1))?;
+    let config_path = Config::default_path();
+    let config = if let Some(ref path) = config_path {
+        match Config::load(path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("warning: could not load config: {e}");
+                Config::default()
+            }
+        }
+    } else {
+        Config::default()
+    };
+
+    let args = parse_args(std::env::args_os().skip(1), &config)?;
+
     if let Source::File(path) = &args.source
         && !path.is_file()
     {
         bail!("not a readable file: {}", path.display());
     }
+
+    if args.save_config {
+        let xtream = match &args.source {
+            Source::Xtream(account) => {
+                let (server, username, password) = account.credentials();
+                Some(XtreamConfig {
+                    server: server.to_owned(),
+                    username: username.to_owned(),
+                    password: password.to_owned(),
+                })
+            }
+            // Preserve existing Xtream config when saving with a file source.
+            Source::File(_) => config.xtream,
+        };
+        let new_config = Config {
+            xtream,
+            vlc_path: args.vlc_override.clone(),
+        };
+        match config_path {
+            Some(ref path) => {
+                if let Err(e) = new_config.save(path) {
+                    eprintln!("warning: {e}");
+                }
+            }
+            None => eprintln!("warning: --save-config: no config directory on this platform"),
+        }
+    }
+
     // Discovery failure is not fatal: browsing works without VLC, and the
     // error surfaces in the status bar on the first play attempt.
     let player = Player::discover(args.vlc_override.as_deref());
@@ -154,10 +223,12 @@ fn run(
 // unwrap is fine in tests (see CLAUDE.md).
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use m3u_viewer::config::XtreamConfig;
+
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Args> {
-        parse_args(args.iter().map(OsString::from))
+        parse_args(args.iter().map(OsString::from), &Config::default())
     }
 
     #[test]
@@ -203,5 +274,59 @@ mod tests {
     fn no_source_prints_usage() {
         let error = parse(&[]).err().unwrap();
         assert!(error.to_string().contains("usage:"));
+    }
+
+    #[test]
+    fn config_xtream_fallback_when_no_cli_source() {
+        let config = Config {
+            xtream: Some(XtreamConfig {
+                server: "http://example.com".to_owned(),
+                username: "u".to_owned(),
+                password: "p".to_owned(),
+            }),
+            vlc_path: None,
+        };
+        let args = parse_args(std::iter::empty(), &config).unwrap();
+        assert!(matches!(args.source, Source::Xtream(_)));
+        assert_eq!(args.display_name, "xtream:example.com");
+    }
+
+    #[test]
+    fn config_vlc_path_fallback() {
+        let config = Config {
+            xtream: None,
+            vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
+        };
+        let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
+        assert_eq!(args.vlc_override, Some(PathBuf::from("/usr/bin/vlc")));
+    }
+
+    #[test]
+    fn cli_vlc_overrides_config() {
+        let config = Config {
+            xtream: None,
+            vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
+        };
+        let args = parse_args(
+            ["list.m3u", "--vlc", "/opt/vlc"].iter().map(OsString::from),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(args.vlc_override, Some(PathBuf::from("/opt/vlc")));
+    }
+
+    #[test]
+    fn save_config_flag_parsed() {
+        let args = parse(&[
+            "--xtream",
+            "example.com",
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--save-config",
+        ])
+        .unwrap();
+        assert!(args.save_config);
     }
 }
