@@ -3,7 +3,7 @@ name = "m3u-viewer"
 version = "0.3.0"
 edition = "2024"
 description = "Fast terminal viewer for large M3U playlists"
-license = "MIT"
+license = "GPL-2.0-only"
 repository = "https://github.com/jvonscheidt/m3u-viewer"
 
 [dependencies]
