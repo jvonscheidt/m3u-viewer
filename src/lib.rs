@@ -6,4 +6,5 @@ pub mod app;
 pub mod loader;
 pub mod player;
 pub mod playlist;
+pub mod store;
 pub mod ui;

@@ -4,10 +4,13 @@
 //! restriction, and the selection. Rendering lives in [`crate::ui`]; the
 //! binary's event loop feeds keys and [`LoadEvent`]s in here.
 
+use std::collections::HashMap;
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::loader::LoadEvent;
 use crate::playlist::{Channel, GroupId};
+use crate::store::Store;
 
 /// Input mode: decides how key presses are interpreted and what is drawn
 /// on top of the channel list.
@@ -21,6 +24,17 @@ pub enum Mode {
     Groups,
     /// Help overlay (entered with `?`).
     Help,
+}
+
+/// Which subset of the playlist the channel list shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// Every channel.
+    All,
+    /// Only favorites (in playlist order).
+    Favorites,
+    /// Only recently played channels, newest first.
+    Recents,
 }
 
 /// A channel the user asked to play, handed from [`App::handle_key`] to
@@ -62,14 +76,21 @@ pub struct App {
     /// Transient status-bar notice (playback confirmations and errors);
     /// cleared by the next key press.
     pub(crate) message: Option<String>,
+    pub(crate) view: View,
+    /// Favorites/recents persistence; `None` when the platform has no
+    /// config directory (the features degrade to a status message).
+    pub(crate) store: Option<Store>,
+    /// First channel index per URL, for resolving recents to rows.
+    url_index: HashMap<String, usize>,
     play_request: Option<PlayRequest>,
     quit: bool,
 }
 
 impl App {
     /// Creates the state for a freshly opened, still-loading playlist.
+    /// `store` carries persisted favorites/recents; `None` disables both.
     #[must_use]
-    pub fn new(file_name: String) -> Self {
+    pub fn new(file_name: String, store: Option<Store>) -> Self {
         Self {
             channels: Vec::new(),
             search_keys: Vec::new(),
@@ -89,6 +110,9 @@ impl App {
             file_name,
             group_cursor: 0,
             message: None,
+            view: View::All,
+            store,
+            url_index: HashMap::new(),
             play_request: None,
             quit: false,
         }
@@ -118,12 +142,23 @@ impl App {
                     self.search_keys.push(self.search_key(channel));
                 }
                 self.channels.extend(channels);
-                // Appending can't invalidate existing matches, so extend
-                // the filtered index list instead of recomputing it.
                 for index in start..self.channels.len() {
-                    if self.matches(index) {
-                        self.filtered.push(index);
+                    self.url_index
+                        .entry(self.channels[index].url.clone())
+                        .or_insert(index);
+                }
+                if self.view == View::All {
+                    // Appending can't invalidate existing matches, so
+                    // extend the filtered index list instead.
+                    for index in start..self.channels.len() {
+                        if self.matches(index) {
+                            self.filtered.push(index);
+                        }
                     }
+                } else {
+                    // Favorites/recents views need the store checks and
+                    // (for recents) store-defined ordering.
+                    self.recompute_filter();
                 }
             }
             LoadEvent::Finished => {
@@ -147,6 +182,25 @@ impl App {
     /// the status bar; the next key press clears it.
     pub fn set_message(&mut self, message: String) {
         self.message = Some(message);
+    }
+
+    /// Records a successful playback in the recents list.
+    pub fn record_played(&mut self, url: &str) {
+        if let Some(store) = &mut self.store {
+            if let Err(error) = store.push_recent(url) {
+                self.message = Some(format!("✗ recents: {error}"));
+            }
+            if self.view == View::Recents {
+                self.recompute_filter();
+            }
+        }
+    }
+
+    /// Whether the channel at `index` is a favorite.
+    pub(crate) fn is_favorite(&self, index: usize) -> bool {
+        self.store
+            .as_ref()
+            .is_some_and(|store| store.is_favorite(&self.channels[index].url))
     }
 
     /// Routes a key press according to the current [`Mode`].
@@ -182,6 +236,27 @@ impl App {
                 self.mode = Mode::Groups;
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('f') => self.toggle_favorite(),
+            KeyCode::Char('F') => {
+                // Pressing the view's key again returns to the full list.
+                self.switch_view(if self.view == View::Favorites {
+                    View::All
+                } else {
+                    View::Favorites
+                });
+            }
+            KeyCode::Char('R') => {
+                self.switch_view(if self.view == View::Recents {
+                    View::All
+                } else {
+                    View::Recents
+                });
+            }
+            KeyCode::Tab => self.switch_view(match self.view {
+                View::All => View::Favorites,
+                View::Favorites => View::Recents,
+                View::Recents => View::All,
+            }),
             KeyCode::Esc => {
                 self.filter.clear();
                 self.group_filter = None;
@@ -233,17 +308,65 @@ impl App {
         }
     }
 
+    /// Toggles favorite status of the selection and persists it.
+    fn toggle_favorite(&mut self) {
+        let Some(&index) = self.filtered.get(self.selected) else {
+            return;
+        };
+        let Some(store) = &mut self.store else {
+            self.message = Some("✗ favorites unavailable (no config directory)".to_owned());
+            return;
+        };
+        if let Err(error) = store.toggle_favorite(&self.channels[index].url) {
+            self.message = Some(format!("✗ favorites: {error}"));
+        }
+        if self.view == View::Favorites {
+            // The row may have just left this view.
+            self.recompute_filter();
+        }
+    }
+
+    fn switch_view(&mut self, target: View) {
+        if target != View::All && self.store.is_none() {
+            self.message = Some("✗ favorites/recents unavailable (no config directory)".to_owned());
+            return;
+        }
+        self.view = target;
+        self.selected = 0;
+        self.recompute_filter();
+    }
+
     /// Rebuilds the filtered index list from scratch and clamps the
     /// selection.
     fn recompute_filter(&mut self) {
         self.filter_lower = self.filter.to_lowercase();
-        self.filtered = (0..self.channels.len())
-            .filter(|&index| self.matches(index))
-            .collect();
+        self.filtered = match (self.view, &self.store) {
+            // Recents ordering comes from the store (newest first), not
+            // from playlist order.
+            (View::Recents, Some(store)) => store
+                .recents()
+                .iter()
+                .filter_map(|url| self.url_index.get(url).copied())
+                .filter(|&index| self.matches(index))
+                .collect(),
+            (View::All, _) => (0..self.channels.len())
+                .filter(|&index| self.matches(index))
+                .collect(),
+            (View::Favorites, Some(store)) => (0..self.channels.len())
+                .filter(|&index| {
+                    store.is_favorite(&self.channels[index].url) && self.matches(index)
+                })
+                .collect(),
+            // Unreachable via switch_view, but a storeless favorites or
+            // recents view must show nothing, not everything.
+            (View::Favorites | View::Recents, None) => Vec::new(),
+        };
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
         self.offset = self.offset.min(self.selected);
     }
 
+    /// Group restriction and text filter (view membership is handled in
+    /// [`Self::recompute_filter`]).
     fn matches(&self, index: usize) -> bool {
         let group_ok = self
             .group_filter
@@ -303,8 +426,20 @@ mod tests {
         }
     }
 
+    /// Unique temp dir for a store-backed test; second element is the dir
+    /// for cleanup.
+    fn temp_store(tag: &str) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("m3u-viewer-app-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Store::load(dir.clone()), dir)
+    }
+
     fn loaded_app() -> App {
-        let mut app = App::new("test.m3u".into());
+        loaded_app_with(None)
+    }
+
+    fn loaded_app_with(store: Option<Store>) -> App {
+        let mut app = App::new("test.m3u".into(), store);
         app.on_load_event(LoadEvent::Batch {
             channels: vec![
                 channel("BBC News", Some(0)),
@@ -421,7 +556,7 @@ mod tests {
 
     #[test]
     fn enter_on_empty_list_requests_nothing() {
-        let mut app = App::new("empty.m3u".into());
+        let mut app = App::new("empty.m3u".into(), None);
         app.handle_key(key(KeyCode::Enter));
         assert!(app.take_play_request().is_none());
     }
@@ -437,10 +572,67 @@ mod tests {
 
     #[test]
     fn failed_load_surfaces_error() {
-        let mut app = App::new("gone.m3u".into());
+        let mut app = App::new("gone.m3u".into(), None);
         app.on_load_event(LoadEvent::Failed("boom".into()));
         assert!(!app.loading);
         assert_eq!(app.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn favorite_toggle_and_favorites_view() {
+        let (store, dir) = temp_store("fav-view");
+        let mut app = loaded_app_with(Some(store));
+        // Favorite the first channel (BBC News), then open the view.
+        app.handle_key(key(KeyCode::Char('f')));
+        assert!(app.is_favorite(0));
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.view, View::Favorites);
+        assert_eq!(app.filtered, vec![0]);
+        // Unfavoriting inside the view empties it immediately.
+        app.handle_key(key(KeyCode::Char('f')));
+        assert!(app.filtered.is_empty());
+        // Pressing F again returns to the full list.
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.view, View::All);
+        assert_eq!(app.filtered.len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recents_view_is_newest_first() {
+        let (store, dir) = temp_store("rec-view");
+        let mut app = loaded_app_with(Some(store));
+        app.record_played("http://example.com/CNN");
+        app.record_played("http://example.com/BBC News");
+        app.handle_key(key(KeyCode::Char('R')));
+        assert_eq!(app.view, View::Recents);
+        assert_eq!(app.filtered, vec![0, 1]); // BBC (newest), then CNN
+        app.record_played("http://example.com/CNN");
+        assert_eq!(app.filtered, vec![1, 0]); // replay reorders
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tab_cycles_the_three_views() {
+        let (store, dir) = temp_store("tab");
+        let mut app = loaded_app_with(Some(store));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.view, View::Favorites);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.view, View::Recents);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.view, View::All);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn storeless_app_reports_unavailable_instead_of_switching() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.view, View::All);
+        assert!(app.message.as_deref().unwrap().contains("unavailable"));
+        app.handle_key(key(KeyCode::Char('f')));
+        assert!(app.message.as_deref().unwrap().contains("unavailable"));
     }
 
     #[test]
