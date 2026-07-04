@@ -29,7 +29,7 @@ while you browse (progress shows in the status bar).
 
 ```
 m3u-viewer <playlist.m3u> [--vlc <path>]
-m3u-viewer --xtream <server> --username <user> --password <pass> [--vlc <path>] [--save-config]
+m3u-viewer --xtream <server> --username <user> --password <pass> [--user-agent <ua>] [--vlc <path>] [--save-config]
 m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
 ```
 
@@ -41,11 +41,15 @@ m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
   the account's `get.php` endpoint and streams into the viewer while it
   arrives. Note that the credentials are visible in your shell history
   and process list.
-- `--save-config` — write the Xtream credentials and the VLC path (if
-  given) to `config.toml` in the config directory so you can omit them
-  on future invocations. Run once; then `m3u-viewer` with no arguments
-  picks up the saved credentials automatically. The file is created if it
-  does not exist yet.
+- `--user-agent <ua>` — send this `User-Agent` header when downloading
+  the playlist from the Xtream server. Some providers only answer to
+  known player user agents, e.g. `--user-agent "VLC/3.0.20 LibVLC/3.0.20"`.
+  Can also be set as `user_agent` in `config.toml`; the CLI value wins.
+- `--save-config` — write the Xtream credentials, the user agent, and
+  the VLC path (if given) to `config.toml` in the config directory so
+  you can omit them on future invocations. Run once; then `m3u-viewer`
+  with no arguments picks up the saved credentials automatically. The
+  file is created if it does not exist yet.
 - `--vlc <path>` — use this VLC executable instead of auto-detection.
   Without it, `vlc` is looked up on `PATH`, then in the standard install
   locations (e.g. `C:\Program Files\VideoLAN\VLC` on Windows,
@@ -73,7 +77,7 @@ macOS `~/Library/Application Support/m3u-viewer/`.
 
 | File | Contents |
 | --- | --- |
-| `config.toml` | Xtream credentials and VLC path (written by `--save-config`) |
+| `config.toml` | Xtream credentials, user agent, and VLC path (written by `--save-config`) |
 | `favorites.json` | Favorited channel URLs |
 | `recents.json` | Recently played channel URLs (newest first, capped at 50) |
 | `m3u-viewer.log` | Diagnostic log (startup, loading, playback); overwritten each run |

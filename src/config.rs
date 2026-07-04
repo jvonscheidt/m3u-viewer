@@ -25,6 +25,10 @@ pub struct Config {
     /// Path to the VLC executable, overriding auto-detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vlc_path: Option<PathBuf>,
+    /// `User-Agent` header for Xtream requests; some providers only
+    /// answer to known player user agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
 }
 
 /// Xtream Codes credentials stored in the config file.
@@ -137,6 +141,7 @@ mod tests {
                 password: "s3cr3t".to_owned(),
             }),
             vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
+            user_agent: Some("VLC/3.0.20".to_owned()),
         };
         config.save(&path).unwrap();
 
@@ -146,6 +151,7 @@ mod tests {
         assert_eq!(xtream.username, "user");
         assert_eq!(xtream.password, "s3cr3t");
         assert_eq!(loaded.vlc_path, Some(PathBuf::from("/usr/bin/vlc")));
+        assert_eq!(loaded.user_agent, Some("VLC/3.0.20".to_owned()));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -172,11 +178,13 @@ mod tests {
         let config = Config {
             xtream: None,
             vlc_path: Some(PathBuf::from("C:/tools/vlc.exe")),
+            user_agent: None,
         };
         config.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert!(loaded.xtream.is_none());
         assert_eq!(loaded.vlc_path, Some(PathBuf::from("C:/tools/vlc.exe")));
+        assert!(loaded.user_agent.is_none());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }
