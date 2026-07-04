@@ -2,12 +2,16 @@
 //!
 //! Instead of a local file, the playlist can come from an Xtream Codes
 //! server: `get.php?type=m3u_plus` returns the account's channels as a
-//! regular extended M3U, which streams through the normal parser. Only
-//! the download differs; everything downstream is shared.
+//! regular extended M3U, which streams through the normal parser. Some
+//! panels disable that M3U download; for those, [`Account`] also exposes
+//! the JSON player API (`player_api.php`) — [`Category`] and
+//! [`LiveStream`] lists from which the loader synthesizes the channel
+//! list itself.
 
 use std::io::Read;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use serde::Deserialize;
 use thiserror::Error;
 
 /// Why the playlist could not be fetched from the server.
@@ -19,6 +23,77 @@ pub enum XtreamError {
     /// The request itself failed (DNS, connect, TLS, …).
     #[error("request failed: {0}")]
     Http(#[from] Box<ureq::Error>),
+    /// The player API's JSON reply could not be parsed.
+    #[error("could not parse the server's reply: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// One live category from `player_api.php?action=get_live_categories`.
+#[derive(Deserialize)]
+pub struct Category {
+    /// Panel-assigned id, referenced by [`LiveStream::category_id`].
+    #[serde(rename = "category_id", deserialize_with = "required_scalar")]
+    pub id: String,
+    /// Human-readable name; becomes the channel group.
+    #[serde(rename = "category_name")]
+    pub name: String,
+}
+
+/// One live stream from `player_api.php?action=get_live_streams`.
+#[derive(Deserialize)]
+pub struct LiveStream {
+    /// Display name; `None` when the panel sent none.
+    #[serde(default, deserialize_with = "lenient_scalar")]
+    pub name: Option<String>,
+    /// Id from which [`Account::live_stream_url`] builds the URL.
+    #[serde(deserialize_with = "lenient_u64")]
+    pub stream_id: u64,
+    /// Category (group) of the stream, when the panel sets one.
+    #[serde(default, deserialize_with = "lenient_scalar")]
+    pub category_id: Option<String>,
+    /// EPG channel id (`tvg-id` equivalent), when set.
+    #[serde(default, deserialize_with = "lenient_scalar")]
+    pub epg_channel_id: Option<String>,
+}
+
+/// Panels are inconsistent about JSON scalar types — ids arrive as
+/// numbers or strings, optional fields as `null` or `""`. Normalizes all
+/// of that to an optional string.
+fn scalar_to_string(value: serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) if !text.is_empty() => Some(text),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn lenient_scalar<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(scalar_to_string(value))
+}
+
+fn required_scalar<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    scalar_to_string(value).ok_or_else(|| serde::de::Error::custom("expected a string or number"))
+}
+
+fn lenient_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match &value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| serde::de::Error::custom("expected an unsigned number"))
 }
 
 /// Credentials for one Xtream Codes account.
@@ -87,6 +162,26 @@ impl Account {
         )
     }
 
+    /// Issues a GET for `url` (custom user agent applied) and returns the
+    /// response only when it is a 2xx.
+    fn request(&self, url: String) -> Result<ureq::http::Response<ureq::Body>, XtreamError> {
+        let mut request = ureq::get(url);
+        if let Some(ref user_agent) = self.user_agent {
+            request = request.header("User-Agent", user_agent);
+        }
+        let response = match request.call() {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(code)) => return Err(XtreamError::Status(code)),
+            Err(other) => return Err(XtreamError::Http(Box::new(other))),
+        };
+        // ureq only turns 4xx/5xx into errors; panels answer with custom
+        // codes like 884, which must not pass for success either.
+        if !response.status().is_success() {
+            return Err(XtreamError::Status(response.status().as_u16()));
+        }
+        Ok(response)
+    }
+
     /// Requests the playlist, returning a streaming body reader and the
     /// total size, when the server announces one (many send chunked
     /// responses, so progress may be indeterminate).
@@ -96,15 +191,7 @@ impl Account {
     /// [`XtreamError::Status`] for a non-success HTTP response,
     /// [`XtreamError::Http`] when the request cannot be made at all.
     pub fn fetch(&self) -> Result<(impl Read + use<>, Option<u64>), XtreamError> {
-        let mut request = ureq::get(self.playlist_url());
-        if let Some(ref user_agent) = self.user_agent {
-            request = request.header("User-Agent", user_agent);
-        }
-        let response = match request.call() {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(code)) => return Err(XtreamError::Status(code)),
-            Err(other) => return Err(XtreamError::Http(Box::new(other))),
-        };
+        let response = self.request(self.playlist_url())?;
         let total = response
             .headers()
             .get("content-length")
@@ -126,6 +213,64 @@ impl Account {
             .limit(u64::MAX)
             .reader();
         Ok((reader, total))
+    }
+
+    /// The `player_api.php` URL for `action` (credentials percent-encoded).
+    fn api_url(&self, action: &str) -> String {
+        format!(
+            "{}/player_api.php?username={}&password={}&action={action}",
+            self.server,
+            utf8_percent_encode(&self.username, NON_ALPHANUMERIC),
+            utf8_percent_encode(&self.password, NON_ALPHANUMERIC),
+        )
+    }
+
+    /// Downloads and parses `action`'s JSON array from the player API.
+    fn fetch_api_list<T: serde::de::DeserializeOwned>(
+        &self,
+        action: &str,
+    ) -> Result<Vec<T>, XtreamError> {
+        let response = self.request(self.api_url(action))?;
+        // Unlimited body: full stream lists routinely exceed ureq's
+        // 10 MB default (55k streams ≈ 20 MB of JSON).
+        let reader = response
+            .into_body()
+            .into_with_config()
+            .limit(u64::MAX)
+            .reader();
+        Ok(serde_json::from_reader(std::io::BufReader::new(reader))?)
+    }
+
+    /// Fetches the live categories (channel groups) from the player API.
+    ///
+    /// # Errors
+    ///
+    /// [`XtreamError`] when the request fails, the server answers with a
+    /// non-2xx status, or the reply is not the expected JSON array.
+    pub fn fetch_live_categories(&self) -> Result<Vec<Category>, XtreamError> {
+        self.fetch_api_list("get_live_categories")
+    }
+
+    /// Fetches all live streams from the player API.
+    ///
+    /// # Errors
+    ///
+    /// [`XtreamError`] when the request fails, the server answers with a
+    /// non-2xx status, or the reply is not the expected JSON array.
+    pub fn fetch_live_streams(&self) -> Result<Vec<LiveStream>, XtreamError> {
+        self.fetch_api_list("get_live_streams")
+    }
+
+    /// Playable URL for a live stream id, in the layout every Xtream
+    /// panel serves: `/live/<user>/<pass>/<stream_id>.ts`.
+    #[must_use]
+    pub fn live_stream_url(&self, stream_id: u64) -> String {
+        format!(
+            "{}/live/{}/{}/{stream_id}.ts",
+            self.server,
+            utf8_percent_encode(&self.username, NON_ALPHANUMERIC),
+            utf8_percent_encode(&self.password, NON_ALPHANUMERIC),
+        )
     }
 }
 
@@ -213,6 +358,69 @@ mod tests {
         assert!(request.starts_with(
             "GET /get.php?username=user&password=pw&type=m3u_plus&output=ts HTTP/1.1"
         ));
+    }
+
+    #[test]
+    fn custom_status_codes_are_errors_not_success() {
+        // Panels use made-up codes like 884 to refuse the M3U download;
+        // ureq only rejects 4xx/5xx by itself.
+        let (port, server) = serve_once("HTTP/1.1 884 Blocked", "");
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let error = account.fetch().err().unwrap();
+        assert!(matches!(error, XtreamError::Status(884)));
+        let _ = server.join();
+    }
+
+    #[test]
+    fn live_categories_parse_with_lenient_ids() {
+        let body = r#"[{"category_id":1,"category_name":"News"},{"category_id":"2","category_name":"Sports"}]"#;
+        let (port, server) = serve_once("HTTP/1.1 200 OK", body);
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let categories = account.fetch_live_categories().unwrap();
+        let pairs: Vec<(&str, &str)> = categories
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str()))
+            .collect();
+        assert_eq!(pairs, [("1", "News"), ("2", "Sports")]);
+        let request = server.join().unwrap();
+        assert!(request.starts_with(
+            "GET /player_api.php?username=u&password=p&action=get_live_categories HTTP/1.1"
+        ));
+    }
+
+    #[test]
+    fn live_streams_parse_with_lenient_fields() {
+        // stream_id as string, category_id as number/null, epg id and
+        // name missing or empty — all real-world panel output.
+        let body = r#"[
+            {"name":"One","stream_id":11,"category_id":"7","epg_channel_id":"one.tv"},
+            {"name":"","stream_id":"22","category_id":8,"epg_channel_id":""},
+            {"stream_id":33,"category_id":null}
+        ]"#;
+        let (port, server) = serve_once("HTTP/1.1 200 OK", body);
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let streams = account.fetch_live_streams().unwrap();
+        let _ = server.join();
+        assert_eq!(streams.len(), 3);
+        assert_eq!(streams[0].name.as_deref(), Some("One"));
+        assert_eq!(streams[0].stream_id, 11);
+        assert_eq!(streams[0].category_id.as_deref(), Some("7"));
+        assert_eq!(streams[0].epg_channel_id.as_deref(), Some("one.tv"));
+        assert_eq!(streams[1].name, None);
+        assert_eq!(streams[1].stream_id, 22);
+        assert_eq!(streams[1].category_id.as_deref(), Some("8"));
+        assert_eq!(streams[1].epg_channel_id, None);
+        assert_eq!(streams[2].name, None);
+        assert_eq!(streams[2].category_id, None);
+    }
+
+    #[test]
+    fn live_stream_url_percent_encodes_credentials() {
+        let account = Account::new("example.com", "user name".into(), "p&ss".into());
+        assert_eq!(
+            account.live_stream_url(42),
+            "http://example.com/live/user%20name/p%26ss/42.ts"
+        );
     }
 
     #[test]
