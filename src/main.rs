@@ -163,7 +163,13 @@ fn main() -> Result<()> {
     let config = if let Some(ref path) = config_path {
         match Config::load(path) {
             Ok(cfg) => {
-                log::info!("config loaded from: {}", path.display());
+                // load() returns the default when the file is absent; don't
+                // log that as if credentials had been read.
+                if path.exists() {
+                    log::info!("config loaded from: {}", path.display());
+                } else {
+                    log::info!("no config file at: {}", path.display());
+                }
                 cfg
             }
             Err(e) => {
