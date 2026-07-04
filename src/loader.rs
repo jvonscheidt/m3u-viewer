@@ -1,20 +1,30 @@
 //! Background playlist loading.
 //!
-//! [`spawn`] starts a thread that streams a playlist file through
-//! [`PlaylistBuilder`], sending [`LoadEvent`]s over an mpsc channel so the
-//! UI can appear immediately and fill in while the file is still parsing.
+//! [`spawn`] starts a thread that streams a playlist — from a local file
+//! or straight from an Xtream Codes server — through [`PlaylistBuilder`],
+//! sending [`LoadEvent`]s over an mpsc channel so the UI can appear
+//! immediately and fill in while the data is still arriving.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 use crate::playlist::{Channel, PlaylistBuilder};
+use crate::xtream::Account;
 
 /// Channels per [`LoadEvent::Batch`]; small enough for a responsive first
 /// paint, large enough to keep channel overhead negligible.
 const BATCH_SIZE: usize = 4096;
+
+/// Where the playlist comes from.
+pub enum Source {
+    /// A local `.m3u`/`.m3u8` file.
+    File(PathBuf),
+    /// An Xtream Codes account (playlist downloaded via `get.php`).
+    Xtream(Account),
+}
 
 /// Progress message from the loader thread to the UI.
 pub enum LoadEvent {
@@ -28,39 +38,56 @@ pub enum LoadEvent {
         new_groups: Vec<String>,
         /// Total malformed entries skipped so far (cumulative).
         skipped: usize,
-        /// Rough progress through the file, 0–100.
-        percent: u8,
+        /// Rough progress, 0–100; `None` when the total size is unknown
+        /// (e.g. a chunked HTTP response).
+        percent: Option<u8>,
     },
-    /// The whole file was parsed successfully.
+    /// The whole playlist was parsed successfully.
     Finished,
-    /// Loading aborted (I/O error, unreadable file, …).
+    /// Loading aborted (I/O error, HTTP failure, bad credentials, …).
     Failed(String),
 }
 
-/// Spawns the loader thread for `path` and returns the event receiver.
+/// Spawns the loader thread for `source` and returns the event receiver.
 ///
 /// The thread finishes on its own; failures are reported as
 /// [`LoadEvent::Failed`] rather than panics.
 #[must_use]
-pub fn spawn(path: PathBuf) -> Receiver<LoadEvent> {
+pub fn spawn(source: Source) -> Receiver<LoadEvent> {
     let (tx, rx) = channel();
     thread::spawn(move || {
-        let result = load(&path, &tx);
+        let result = match source {
+            Source::File(path) => load_file(&path, &tx),
+            Source::Xtream(account) => load_xtream(&account, &tx),
+        };
         // A send failure just means the UI is gone; nothing left to do.
         let _ = match result {
             Ok(()) => tx.send(LoadEvent::Finished),
-            Err(err) => tx.send(LoadEvent::Failed(err.to_string())),
+            Err(message) => tx.send(LoadEvent::Failed(message)),
         };
     });
     rx
 }
 
-/// Streams `path` through the parser, flushing a batch every
+fn load_file(path: &Path, tx: &Sender<LoadEvent>) -> Result<(), String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let total = file.metadata().map(|meta| meta.len()).ok();
+    parse_stream(file, total, tx).map_err(|error| error.to_string())
+}
+
+fn load_xtream(account: &Account, tx: &Sender<LoadEvent>) -> Result<(), String> {
+    let (reader, total) = account.fetch().map_err(|error| error.to_string())?;
+    parse_stream(reader, total, tx).map_err(|error| error.to_string())
+}
+
+/// Streams `input` through the parser, flushing a batch every
 /// [`BATCH_SIZE`] channels.
-fn load(path: &Path, tx: &Sender<LoadEvent>) -> std::io::Result<()> {
-    let file = File::open(path)?;
-    let total_bytes = file.metadata()?.len();
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
+fn parse_stream(
+    input: impl Read,
+    total_bytes: Option<u64>,
+    tx: &Sender<LoadEvent>,
+) -> std::io::Result<()> {
+    let mut reader = BufReader::with_capacity(256 * 1024, input);
     let mut builder = PlaylistBuilder::new();
     let mut line = String::new();
     let mut bytes_read: u64 = 0;
@@ -91,7 +118,7 @@ fn load(path: &Path, tx: &Sender<LoadEvent>) -> std::io::Result<()> {
         channels: std::mem::take(&mut playlist.channels),
         new_groups: playlist.groups()[groups_sent..].to_vec(),
         skipped: playlist.skipped,
-        percent: 100,
+        percent: Some(100),
     });
     Ok(())
 }
@@ -100,7 +127,7 @@ fn load(path: &Path, tx: &Sender<LoadEvent>) -> std::io::Result<()> {
 fn flush(
     builder: &mut PlaylistBuilder,
     groups_sent: &mut usize,
-    percent: u8,
+    percent: Option<u8>,
     tx: &Sender<LoadEvent>,
 ) {
     let new_groups = builder.groups()[*groups_sent..].to_vec();
@@ -113,9 +140,8 @@ fn flush(
     });
 }
 
-/// Integer progress percentage, clamped to 0–100.
-fn percent(read: u64, total: u64) -> u8 {
-    read.saturating_mul(100)
-        .checked_div(total)
-        .map_or(100, |p| u8::try_from(p.min(100)).unwrap_or(100))
+/// Integer progress percentage, clamped to 0–100; `None` without a total.
+fn percent(read: u64, total: Option<u64>) -> Option<u8> {
+    let total = total.filter(|&t| t > 0)?;
+    Some(u8::try_from((read.saturating_mul(100) / total).min(100)).unwrap_or(100))
 }

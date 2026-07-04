@@ -89,10 +89,10 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             View::Recents => spans.push(Span::styled("  ↻ recents", Style::new().magenta())),
         }
         if app.loading {
-            spans.push(Span::styled(
-                format!("  loading {}%", app.percent),
-                Style::new().yellow(),
-            ));
+            let progress = app
+                .percent
+                .map_or_else(|| "  loading…".to_owned(), |p| format!("  loading {p}%"));
+            spans.push(Span::styled(progress, Style::new().yellow()));
         }
         if app.skipped > 0 {
             spans.push(Span::raw(format!("  {} skipped", app.skipped)));
@@ -194,7 +194,7 @@ mod tests {
             channels,
             new_groups: vec!["News".into()],
             skipped: 0,
-            percent: 100,
+            percent: Some(100),
         });
         app.on_load_event(LoadEvent::Finished);
         app
