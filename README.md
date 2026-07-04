@@ -39,7 +39,10 @@ m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
   `http://provider.example:8080`; `http://` is assumed if omitted).
   Requires `--username` and `--password`. The playlist is downloaded via
   the account's `get.php` endpoint and streams into the viewer while it
-  arrives. Note that the credentials are visible in your shell history
+  arrives. If the provider has disabled the M3U download (some panels
+  block `get.php` entirely), the live channel list is fetched through
+  the Xtream player API (`player_api.php`) instead, with categories as
+  groups. Note that the credentials are visible in your shell history
   and process list.
 - `--user-agent <ua>` — send this `User-Agent` header when downloading
   the playlist from the Xtream server. Some providers only answer to
