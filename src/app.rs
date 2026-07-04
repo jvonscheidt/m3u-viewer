@@ -1,0 +1,393 @@
+//! Application state and key handling for the TUI.
+//!
+//! [`App`] owns the (growing) channel list, the active filter and group
+//! restriction, and the selection. Rendering lives in [`crate::ui`]; the
+//! binary's event loop feeds keys and [`LoadEvent`]s in here.
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::loader::LoadEvent;
+use crate::playlist::{Channel, GroupId};
+
+/// Input mode: decides how key presses are interpreted and what is drawn
+/// on top of the channel list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Browsing the channel list.
+    Normal,
+    /// Editing the filter string (entered with `/`).
+    Filter,
+    /// Choosing a group restriction in the popup (entered with `g`).
+    Groups,
+    /// Help overlay (entered with `?`).
+    Help,
+}
+
+/// Top-level TUI state.
+pub struct App {
+    pub(crate) channels: Vec<Channel>,
+    /// Lowercase "name group" per channel, precomputed so a filter pass
+    /// over a million entries stays within the latency budget.
+    search_keys: Vec<String>,
+    pub(crate) groups: Vec<String>,
+    pub(crate) filter: String,
+    filter_lower: String,
+    pub(crate) group_filter: Option<GroupId>,
+    /// Indices into `channels` that pass the filter and group restriction.
+    pub(crate) filtered: Vec<usize>,
+    /// Selection as an index into `filtered`.
+    pub(crate) selected: usize,
+    /// First visible row (index into `filtered`).
+    pub(crate) offset: usize,
+    /// Rows in the channel viewport as of the last render; used for
+    /// PageUp/PageDown.
+    pub(crate) page_rows: usize,
+    pub(crate) mode: Mode,
+    pub(crate) loading: bool,
+    pub(crate) percent: u8,
+    pub(crate) skipped: usize,
+    pub(crate) error: Option<String>,
+    pub(crate) file_name: String,
+    /// Cursor in the group popup: 0 is "(all groups)", `n + 1` is group `n`.
+    pub(crate) group_cursor: usize,
+    quit: bool,
+}
+
+impl App {
+    /// Creates the state for a freshly opened, still-loading playlist.
+    #[must_use]
+    pub fn new(file_name: String) -> Self {
+        Self {
+            channels: Vec::new(),
+            search_keys: Vec::new(),
+            groups: Vec::new(),
+            filter: String::new(),
+            filter_lower: String::new(),
+            group_filter: None,
+            filtered: Vec::new(),
+            selected: 0,
+            offset: 0,
+            page_rows: 1,
+            mode: Mode::Normal,
+            loading: true,
+            percent: 0,
+            skipped: 0,
+            error: None,
+            file_name,
+            group_cursor: 0,
+            quit: false,
+        }
+    }
+
+    /// True once the user asked to exit.
+    #[must_use]
+    pub fn should_quit(&self) -> bool {
+        self.quit
+    }
+
+    /// Applies a loader event: appends channels/groups or records the end
+    /// of loading.
+    pub fn on_load_event(&mut self, event: LoadEvent) {
+        match event {
+            LoadEvent::Batch {
+                channels,
+                new_groups,
+                skipped,
+                percent,
+            } => {
+                self.groups.extend(new_groups);
+                self.skipped = skipped;
+                self.percent = percent;
+                let start = self.channels.len();
+                for channel in &channels {
+                    self.search_keys.push(self.search_key(channel));
+                }
+                self.channels.extend(channels);
+                // Appending can't invalidate existing matches, so extend
+                // the filtered index list instead of recomputing it.
+                for index in start..self.channels.len() {
+                    if self.matches(index) {
+                        self.filtered.push(index);
+                    }
+                }
+            }
+            LoadEvent::Finished => {
+                self.loading = false;
+                self.percent = 100;
+            }
+            LoadEvent::Failed(message) => {
+                self.loading = false;
+                self.error = Some(message);
+            }
+        }
+    }
+
+    /// Routes a key press according to the current [`Mode`].
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return;
+        }
+        match self.mode {
+            Mode::Normal => self.key_normal(key),
+            Mode::Filter => self.key_filter(key),
+            Mode::Groups => self.key_groups(key),
+            Mode::Help => self.mode = Mode::Normal,
+        }
+    }
+
+    fn key_normal(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('/') => self.mode = Mode::Filter,
+            KeyCode::Char('g') => {
+                self.group_cursor = self.group_filter.map_or(0, |id| id + 1);
+                self.mode = Mode::Groups;
+            }
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.group_filter = None;
+                self.recompute_filter();
+            }
+            KeyCode::Up => self.move_up(1),
+            KeyCode::Down => self.move_down(1),
+            KeyCode::PageUp => self.move_up(self.page_rows),
+            KeyCode::PageDown => self.move_down(self.page_rows),
+            KeyCode::Home => self.selected = 0,
+            KeyCode::End => self.selected = self.filtered.len().saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    fn key_filter(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.filter.clear();
+                self.mode = Mode::Normal;
+                self.recompute_filter();
+            }
+            KeyCode::Enter => self.mode = Mode::Normal,
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.recompute_filter();
+            }
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.recompute_filter();
+            }
+            _ => {}
+        }
+    }
+
+    fn key_groups(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Up => self.group_cursor = self.group_cursor.saturating_sub(1),
+            KeyCode::Down => {
+                self.group_cursor = (self.group_cursor + 1).min(self.groups.len());
+            }
+            KeyCode::Enter => {
+                self.group_filter = self.group_cursor.checked_sub(1);
+                self.mode = Mode::Normal;
+                self.recompute_filter();
+            }
+            _ => {}
+        }
+    }
+
+    /// Rebuilds the filtered index list from scratch and clamps the
+    /// selection.
+    fn recompute_filter(&mut self) {
+        self.filter_lower = self.filter.to_lowercase();
+        self.filtered = (0..self.channels.len())
+            .filter(|&index| self.matches(index))
+            .collect();
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+        self.offset = self.offset.min(self.selected);
+    }
+
+    fn matches(&self, index: usize) -> bool {
+        let group_ok = self
+            .group_filter
+            .is_none_or(|id| self.channels[index].group == Some(id));
+        group_ok
+            && (self.filter_lower.is_empty()
+                || self.search_keys[index].contains(&self.filter_lower))
+    }
+
+    /// Lowercase haystack for filtering: channel name plus group name.
+    fn search_key(&self, channel: &Channel) -> String {
+        let mut key = channel.name.to_lowercase();
+        if let Some(name) = channel.group.and_then(|id| self.groups.get(id)) {
+            key.push(' ');
+            key.push_str(&name.to_lowercase());
+        }
+        key
+    }
+
+    fn move_up(&mut self, by: usize) {
+        self.selected = self.selected.saturating_sub(by);
+    }
+
+    fn move_down(&mut self, by: usize) {
+        let last = self.filtered.len().saturating_sub(1);
+        self.selected = (self.selected + by).min(last);
+    }
+
+    /// Records the viewport height and scrolls `offset` so the selection
+    /// stays visible. Called from the renderer each frame.
+    pub(crate) fn ensure_visible(&mut self, rows: usize) {
+        self.page_rows = rows.max(1);
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + self.page_rows {
+            self.offset = self.selected + 1 - self.page_rows;
+        }
+    }
+}
+
+#[cfg(test)]
+// unwrap is fine in tests (see CLAUDE.md).
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn channel(name: &str, group: Option<GroupId>) -> Channel {
+        Channel {
+            name: name.to_owned(),
+            url: format!("http://example.com/{name}"),
+            tvg_id: None,
+            group,
+        }
+    }
+
+    fn loaded_app() -> App {
+        let mut app = App::new("test.m3u".into());
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![
+                channel("BBC News", Some(0)),
+                channel("CNN", Some(0)),
+                channel("Eurosport", Some(1)),
+            ],
+            new_groups: vec!["News".into(), "Sports".into()],
+            skipped: 0,
+            percent: 100,
+        });
+        app.on_load_event(LoadEvent::Finished);
+        app
+    }
+
+    #[test]
+    fn batches_extend_channels_and_filtered() {
+        let app = loaded_app();
+        assert_eq!(app.channels.len(), 3);
+        assert_eq!(app.filtered, vec![0, 1, 2]);
+        assert!(!app.loading);
+    }
+
+    #[test]
+    fn typed_filter_narrows_by_name_case_insensitively() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "bbc".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.mode, Mode::Filter);
+        assert_eq!(app.filtered, vec![0]);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn filter_also_matches_group_names() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "sports".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.filtered, vec![2]);
+    }
+
+    #[test]
+    fn group_selection_combines_with_filter() {
+        let mut app = loaded_app();
+        // Pick group "News" (cursor 1) in the popup.
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(0));
+        assert_eq!(app.filtered, vec![0, 1]);
+        // Add a text filter on top.
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.filtered, vec![0, 1]); // both contain 'c' ("bbc", "cnn")
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.filtered, vec![1]);
+    }
+
+    #[test]
+    fn escape_clears_filter_and_group() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.group_filter, None);
+        assert_eq!(app.filtered.len(), 3);
+    }
+
+    #[test]
+    fn navigation_clamps_to_bounds() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.selected, 0);
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.selected, 2);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.selected, 2);
+        app.handle_key(key(KeyCode::Home));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn appended_batches_respect_active_filter() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.filtered, vec![0, 1]);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Comedy Central", None), channel("Arte", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: 100,
+        });
+        // Only the matching newcomer joins the filtered list.
+        assert_eq!(app.filtered, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn failed_load_surfaces_error() {
+        let mut app = App::new("gone.m3u".into());
+        app.on_load_event(LoadEvent::Failed("boom".into()));
+        assert!(!app.loading);
+        assert_eq!(app.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn scrolling_keeps_selection_visible() {
+        let mut app = loaded_app();
+        app.ensure_visible(2);
+        assert_eq!(app.offset, 0);
+        app.handle_key(key(KeyCode::End));
+        app.ensure_visible(2);
+        assert_eq!(app.offset, 1); // rows 1..=2 visible, selection on 2
+        app.handle_key(key(KeyCode::Home));
+        app.ensure_visible(2);
+        assert_eq!(app.offset, 0);
+    }
+}

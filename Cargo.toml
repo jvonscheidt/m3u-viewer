@@ -8,6 +8,7 @@ repository = "https://github.com/jvonscheidt/m3u-viewer"
 
 [dependencies]
 anyhow = "1.0.103"
+ratatui = "0.30.2"
 thiserror = "2.0.18"
 
 [lints.rust]
