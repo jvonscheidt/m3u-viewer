@@ -19,7 +19,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 const USAGE: &str = "usage: m3u-viewer <playlist.m3u> [--vlc <path>]\n       \
-     m3u-viewer --xtream <server> --username <user> --password <pass> [--vlc <path>] [--save-config]\n       \
+     m3u-viewer --xtream <server> --username <user> --password <pass> [--user-agent <ua>] [--vlc <path>] [--save-config]\n       \
      m3u-viewer [--vlc <path>]   (uses saved Xtream credentials from config)";
 
 /// Parsed command line.
@@ -28,6 +28,9 @@ struct Args {
     /// Status-bar caption: file name or `xtream:<host>`.
     display_name: String,
     vlc_override: Option<PathBuf>,
+    /// `User-Agent` header for Xtream requests (CLI or config); kept here
+    /// so `--save-config` can persist it.
+    user_agent: Option<String>,
     /// When true, persist the resolved credentials + VLC path to the config
     /// file before starting.
     save_config: bool,
@@ -39,7 +42,7 @@ struct Args {
 fn looks_like_flag(arg: &OsStr) -> bool {
     matches!(
         arg.to_str(),
-        Some("--vlc" | "--xtream" | "--username" | "--password" | "--save-config")
+        Some("--vlc" | "--xtream" | "--username" | "--password" | "--user-agent" | "--save-config")
     )
 }
 
@@ -51,6 +54,7 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
     let mut server: Option<String> = None;
     let mut username: Option<String> = None;
     let mut password: Option<String> = None;
+    let mut user_agent: Option<String> = None;
     let mut save_config = false;
 
     let mut args = args;
@@ -72,6 +76,8 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
             username = Some(string_flag("--username")?);
         } else if arg == "--password" {
             password = Some(string_flag("--password")?);
+        } else if arg == "--user-agent" {
+            user_agent = Some(string_flag("--user-agent")?);
         } else if arg == "--save-config" {
             save_config = true;
         } else if playlist.is_none() && server.is_none() {
@@ -100,6 +106,10 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
     if vlc_override.is_none() {
         vlc_override.clone_from(&config.vlc_path);
     }
+    // Same for the user agent: CLI wins, config fills the gap.
+    if user_agent.is_none() {
+        user_agent.clone_from(&config.user_agent);
+    }
 
     match (playlist, server) {
         (Some(_), Some(_)) => bail!("give either a playlist file or --xtream, not both\n{USAGE}"),
@@ -115,6 +125,7 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
                 source: Source::File(path),
                 display_name,
                 vlc_override,
+                user_agent,
                 save_config,
             })
         }
@@ -122,12 +133,14 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
             let (Some(username), Some(password)) = (username, password) else {
                 bail!("--xtream needs --username and --password\n{USAGE}");
             };
-            let account = Account::new(&server, username, password);
+            let account =
+                Account::new(&server, username, password).with_user_agent(user_agent.clone());
             let display_name = account.display_name();
             Ok(Args {
                 source: Source::Xtream(account),
                 display_name,
                 vlc_override,
+                user_agent,
                 save_config,
             })
         }
@@ -206,6 +219,7 @@ fn main() -> Result<()> {
         let new_config = Config {
             xtream,
             vlc_path: args.vlc_override.clone(),
+            user_agent: args.user_agent.clone(),
         };
         match config_path {
             Some(ref path) => {
@@ -339,6 +353,7 @@ mod tests {
                 password: "p".to_owned(),
             }),
             vlc_path: None,
+            user_agent: None,
         };
         let args = parse_args(std::iter::empty(), &config).unwrap();
         assert!(matches!(args.source, Source::Xtream(_)));
@@ -350,6 +365,7 @@ mod tests {
         let config = Config {
             xtream: None,
             vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
+            user_agent: None,
         };
         let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
         assert_eq!(args.vlc_override, Some(PathBuf::from("/usr/bin/vlc")));
@@ -360,6 +376,7 @@ mod tests {
         let config = Config {
             xtream: None,
             vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
+            user_agent: None,
         };
         let args = parse_args(
             ["list.m3u", "--vlc", "/opt/vlc"].iter().map(OsString::from),
@@ -367,6 +384,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.vlc_override, Some(PathBuf::from("/opt/vlc")));
+    }
+
+    #[test]
+    fn user_agent_flag_parsed() {
+        let args = parse(&[
+            "--xtream",
+            "example.com",
+            "--username",
+            "u",
+            "--password",
+            "p",
+            "--user-agent",
+            "VLC/3.0.20",
+        ])
+        .unwrap();
+        assert_eq!(args.user_agent, Some("VLC/3.0.20".to_owned()));
+    }
+
+    #[test]
+    fn config_user_agent_fallback_and_cli_override() {
+        let config = Config {
+            xtream: None,
+            vlc_path: None,
+            user_agent: Some("FromConfig/1.0".to_owned()),
+        };
+        let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
+        assert_eq!(args.user_agent, Some("FromConfig/1.0".to_owned()));
+
+        let args = parse_args(
+            ["list.m3u", "--user-agent", "FromCli/2.0"]
+                .iter()
+                .map(OsString::from),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(args.user_agent, Some("FromCli/2.0".to_owned()));
     }
 
     #[test]
@@ -395,6 +448,7 @@ mod tests {
                 password: "stored-pw".to_owned(),
             }),
             vlc_path: None,
+            user_agent: None,
         };
         let args = parse_args(
             ["--username", "cli-user"].iter().map(OsString::from),

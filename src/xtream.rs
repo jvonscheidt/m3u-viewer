@@ -26,6 +26,8 @@ pub struct Account {
     server: String,
     username: String,
     password: String,
+    /// Custom `User-Agent` header; `None` keeps the HTTP client's default.
+    user_agent: Option<String>,
 }
 
 impl Account {
@@ -44,7 +46,17 @@ impl Account {
             server,
             username,
             password,
+            user_agent: None,
         }
+    }
+
+    /// Sends `user_agent` as the `User-Agent` header on playlist requests;
+    /// some providers only answer to known player user agents. `None`
+    /// keeps the HTTP client's default.
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
+        self.user_agent = user_agent;
+        self
     }
 
     /// Returns `(server, username, password)` for persisting to a config file.
@@ -84,7 +96,11 @@ impl Account {
     /// [`XtreamError::Status`] for a non-success HTTP response,
     /// [`XtreamError::Http`] when the request cannot be made at all.
     pub fn fetch(&self) -> Result<(impl Read + use<>, Option<u64>), XtreamError> {
-        let response = match ureq::get(self.playlist_url()).call() {
+        let mut request = ureq::get(self.playlist_url());
+        if let Some(ref user_agent) = self.user_agent {
+            request = request.header("User-Agent", user_agent);
+        }
+        let response = match request.call() {
             Ok(response) => response,
             Err(ureq::Error::StatusCode(code)) => return Err(XtreamError::Status(code)),
             Err(other) => return Err(XtreamError::Http(Box::new(other))),
@@ -197,6 +213,29 @@ mod tests {
         assert!(request.starts_with(
             "GET /get.php?username=user&password=pw&type=m3u_plus&output=ts HTTP/1.1"
         ));
+    }
+
+    #[test]
+    fn custom_user_agent_replaces_the_default() {
+        let (port, server) = serve_once("HTTP/1.1 200 OK", "#EXTM3U\n");
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into())
+            .with_user_agent(Some("VLC/3.0.20 LibVLC/3.0.20".into()));
+        let (mut reader, _) = account.fetch().unwrap();
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        let request = server.join().unwrap();
+        let user_agents: Vec<&str> = request
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+            .collect();
+        // Exactly one User-Agent header, and it is ours — the client must
+        // not append its own default next to the configured one.
+        assert_eq!(user_agents.len(), 1, "request was: {request}");
+        assert!(
+            user_agents[0].ends_with("VLC/3.0.20 LibVLC/3.0.20"),
+            "unexpected header: {}",
+            user_agents[0]
+        );
     }
 
     #[test]
