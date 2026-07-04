@@ -1,0 +1,2 @@
+# Default rustfmt style; add project-wide deviations here (see CLAUDE.md).
+newline_style = "Unix"
