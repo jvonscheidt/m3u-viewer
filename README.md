@@ -28,8 +28,9 @@ while you browse (progress shows in the status bar).
 ### Command line
 
 ```
-m3u-viewer <playlist.m3u> [--vlc <path-to-vlc>]
-m3u-viewer --xtream <server> --username <user> --password <pass> [--vlc <path>]
+m3u-viewer <playlist.m3u> [--vlc <path>]
+m3u-viewer --xtream <server> --username <user> --password <pass> [--vlc <path>] [--save-config]
+m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
 ```
 
 - `<playlist.m3u>` — the playlist to open (`.m3u` or `.m3u8`, UTF-8).
@@ -40,6 +41,11 @@ m3u-viewer --xtream <server> --username <user> --password <pass> [--vlc <path>]
   the account's `get.php` endpoint and streams into the viewer while it
   arrives. Note that the credentials are visible in your shell history
   and process list.
+- `--save-config` — write the Xtream credentials and the VLC path (if
+  given) to `config.toml` in the config directory so you can omit them
+  on future invocations. Run once; then `m3u-viewer` with no arguments
+  picks up the saved credentials automatically. The file is created if it
+  does not exist yet.
 - `--vlc <path>` — use this VLC executable instead of auto-detection.
   Without it, `vlc` is looked up on `PATH`, then in the standard install
   locations (e.g. `C:\Program Files\VideoLAN\VLC` on Windows,
@@ -61,12 +67,20 @@ Press `?` inside the viewer for the full list. The essentials:
 
 ### Where your data lives
 
-Favorites and recently played channels are stored as small JSON files in
-the per-user config directory — on Windows
+All persistent data lives in the per-user config directory — on Windows
 `%APPDATA%\m3u-viewer\config\`, on Linux `~/.config/m3u-viewer/`, on
-macOS `~/Library/Application Support/m3u-viewer/`. They are keyed by
-stream URL, so they survive playlist re-downloads and re-ordering.
-Deleting the directory simply resets both lists.
+macOS `~/Library/Application Support/m3u-viewer/`.
+
+| File | Contents |
+| --- | --- |
+| `config.toml` | Xtream credentials and VLC path (written by `--save-config`) |
+| `favorites.json` | Favorited channel URLs |
+| `recents.json` | Recently played channel URLs (newest first, capped at 50) |
+
+Favorites and recents are keyed by stream URL, so they survive playlist
+re-downloads and re-ordering. **`config.toml` stores Xtream credentials
+in plaintext** — the file is private to your user account but is not
+encrypted. Deleting the directory resets everything.
 
 ## Specification
 
@@ -94,6 +108,11 @@ Deleting the directory simply resets both lists.
   (`get.php?type=m3u_plus`) and streams it through the same parser;
   progress is indeterminate when the server does not announce a
   content length.
+- Config file (since 0.3.0): `--save-config` persists Xtream credentials
+  and the VLC path to `config.toml` in the platform config directory;
+  subsequent invocations with no arguments use the saved values
+  automatically. CLI arguments always take precedence over config. The
+  file stores credentials in plaintext.
 - Parses `#EXTINF` metadata: channel name, `tvg-id`, `tvg-logo` (ignored),
   `group-title`, and the stream URL on the following line.
 - Malformed entries are skipped, counted, and reported in the status bar —

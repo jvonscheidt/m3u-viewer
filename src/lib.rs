@@ -3,6 +3,7 @@
 //! these pieces to the terminal.
 
 pub mod app;
+pub mod config;
 pub mod loader;
 pub mod player;
 pub mod playlist;
