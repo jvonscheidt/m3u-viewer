@@ -47,6 +47,12 @@ impl Account {
         }
     }
 
+    /// Returns `(server, username, password)` for persisting to a config file.
+    #[must_use]
+    pub fn credentials(&self) -> (&str, &str, &str) {
+        (&self.server, &self.username, &self.password)
+    }
+
     /// Host portion of the server URL, for display in the status bar.
     #[must_use]
     pub fn display_name(&self) -> String {
