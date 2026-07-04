@@ -7,6 +7,8 @@ license = "MIT"
 repository = "https://github.com/jvonscheidt/m3u-viewer"
 
 [dependencies]
+anyhow = "1.0.103"
+thiserror = "2.0.18"
 
 [lints.rust]
 unsafe_code = "warn"
