@@ -94,6 +94,15 @@ impl Account {
             .get("content-length")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<unknown>");
+        log::info!(
+            "xtream server answered HTTP {}, content-type: {content_type}, content-length: {total:?}",
+            response.status()
+        );
         // Unlimited body: playlists routinely exceed ureq's 10 MB default.
         let reader = response
             .into_body()
