@@ -95,6 +95,12 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         if !app.filter.is_empty() {
             spans.push(Span::raw(format!("  filter:{}", app.filter)));
         }
+        if let Some(message) = &app.message {
+            spans.push(Span::styled(
+                format!("  {message}"),
+                Style::new().yellow().bold(),
+            ));
+        }
         spans.push(Span::styled(
             "  (/ filter · g groups · ? help · q quit)",
             Style::new().dim(),
@@ -122,13 +128,14 @@ fn draw_group_popup(frame: &mut Frame, app: &App) {
 fn draw_help_popup(frame: &mut Frame) {
     let lines = [
         "↑/↓ PgUp/PgDn Home/End  navigate",
+        "Enter                   play in VLC",
         "/                       filter channels",
         "g                       restrict to a group",
         "Esc                     clear filter and group",
         "?                       this help",
         "q / Ctrl+C              quit",
         "",
-        "Enter-to-play, favorites and recents are coming soon.",
+        "Favorites and recents are coming soon.",
     ];
     let area = centered(
         frame.area(),
