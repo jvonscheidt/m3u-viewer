@@ -62,76 +62,11 @@ impl Playlist {
     /// Returns [`ParseError::Io`] if the reader fails. Malformed content is
     /// skipped and counted in [`Playlist::skipped`] instead of erroring.
     pub fn from_reader<R: BufRead>(reader: R) -> Result<Self, ParseError> {
-        let mut playlist = Self::default();
-        let mut group_ids: HashMap<String, GroupId> = HashMap::new();
-        // Metadata of the #EXTINF line waiting for its URL line.
-        let mut pending: Option<ExtInf> = None;
-        // True after a malformed #EXTINF: its URL line is swallowed without
-        // producing a channel (the entry was already counted as skipped).
-        let mut pending_malformed = false;
-        let mut first_line = true;
-
+        let mut builder = PlaylistBuilder::new();
         for line in reader.lines() {
-            let line = line?;
-            let mut text = line.trim();
-            if first_line {
-                text = text.trim_start_matches('\u{feff}');
-                first_line = false;
-            }
-            if text.is_empty() {
-                continue;
-            }
-            if let Some(rest) = text.strip_prefix("#EXTINF:") {
-                if pending.take().is_some() {
-                    // Previous #EXTINF never got a URL line.
-                    playlist.skipped += 1;
-                }
-                pending_malformed = false;
-                if let Some(info) = parse_extinf(rest) {
-                    pending = Some(info);
-                } else {
-                    playlist.skipped += 1;
-                    pending_malformed = true;
-                }
-            } else if text.starts_with('#') {
-                // #EXTM3U header and unknown directives are ignored.
-            } else if pending_malformed {
-                pending_malformed = false;
-            } else {
-                let url = text.to_owned();
-                let channel = match pending.take() {
-                    Some(info) => {
-                        let name = if info.name.is_empty() {
-                            url.clone()
-                        } else {
-                            info.name
-                        };
-                        let group = info
-                            .group
-                            .map(|g| intern(&mut playlist.groups, &mut group_ids, g));
-                        Channel {
-                            name,
-                            url,
-                            tvg_id: info.tvg_id,
-                            group,
-                        }
-                    }
-                    None => Channel {
-                        // Plain M3U entry: the URL doubles as the name.
-                        name: url.clone(),
-                        url,
-                        tvg_id: None,
-                        group: None,
-                    },
-                };
-                playlist.channels.push(channel);
-            }
+            builder.push_line(&line?);
         }
-        if pending.is_some() {
-            // Trailing #EXTINF with no URL line.
-            playlist.skipped += 1;
-        }
-        Ok(playlist)
+        Ok(builder.finish())
     }
 
     /// All interned group names, in order of first appearance.
@@ -144,6 +79,122 @@ impl Playlist {
     #[must_use]
     pub fn group_name(&self, id: GroupId) -> Option<&str> {
         self.groups.get(id).map(String::as_str)
+    }
+}
+
+/// Incremental playlist parser: feed lines one at a time, drain parsed
+/// channels in batches (for streaming loads), then [`finish`](Self::finish).
+///
+/// [`Playlist::from_reader`] is a convenience wrapper around this type.
+#[derive(Default)]
+pub struct PlaylistBuilder {
+    playlist: Playlist,
+    group_ids: HashMap<String, GroupId>,
+    /// Metadata of the `#EXTINF` line waiting for its URL line.
+    pending: Option<ExtInf>,
+    /// True after a malformed `#EXTINF`: its URL line is swallowed without
+    /// producing a channel (the entry was already counted as skipped).
+    pending_malformed: bool,
+    seen_first_line: bool,
+}
+
+impl PlaylistBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consumes one line of playlist text (with or without the trailing
+    /// newline). Malformed input never fails; it is counted instead.
+    pub fn push_line(&mut self, line: &str) {
+        let mut text = line.trim();
+        if !self.seen_first_line {
+            text = text.trim_start_matches('\u{feff}');
+            self.seen_first_line = true;
+        }
+        if text.is_empty() {
+            return;
+        }
+        if let Some(rest) = text.strip_prefix("#EXTINF:") {
+            if self.pending.take().is_some() {
+                // Previous #EXTINF never got a URL line.
+                self.playlist.skipped += 1;
+            }
+            self.pending_malformed = false;
+            if let Some(info) = parse_extinf(rest) {
+                self.pending = Some(info);
+            } else {
+                self.playlist.skipped += 1;
+                self.pending_malformed = true;
+            }
+        } else if text.starts_with('#') {
+            // #EXTM3U header and unknown directives are ignored.
+        } else if self.pending_malformed {
+            self.pending_malformed = false;
+        } else {
+            let url = text.to_owned();
+            let channel = match self.pending.take() {
+                Some(info) => {
+                    let name = if info.name.is_empty() {
+                        url.clone()
+                    } else {
+                        info.name
+                    };
+                    let group = info
+                        .group
+                        .map(|g| intern(&mut self.playlist.groups, &mut self.group_ids, g));
+                    Channel {
+                        name,
+                        url,
+                        tvg_id: info.tvg_id,
+                        group,
+                    }
+                }
+                None => Channel {
+                    // Plain M3U entry: the URL doubles as the name.
+                    name: url.clone(),
+                    url,
+                    tvg_id: None,
+                    group: None,
+                },
+            };
+            self.playlist.channels.push(channel);
+        }
+    }
+
+    /// Removes and returns the channels parsed since the last drain.
+    /// Group ids in the returned channels keep referring to [`Self::groups`].
+    pub fn drain_channels(&mut self) -> Vec<Channel> {
+        std::mem::take(&mut self.playlist.channels)
+    }
+
+    /// Number of channels currently buffered (since the last drain).
+    #[must_use]
+    pub fn buffered_channels(&self) -> usize {
+        self.playlist.channels.len()
+    }
+
+    /// All interned group names seen so far, in order of first appearance.
+    #[must_use]
+    pub fn groups(&self) -> &[String] {
+        &self.playlist.groups
+    }
+
+    /// Number of malformed entries skipped so far.
+    #[must_use]
+    pub fn skipped(&self) -> usize {
+        self.playlist.skipped
+    }
+
+    /// Finalizes parsing (a trailing `#EXTINF` with no URL counts as
+    /// skipped) and returns the playlist with any undrained channels.
+    #[must_use]
+    pub fn finish(mut self) -> Playlist {
+        if self.pending.is_some() {
+            self.playlist.skipped += 1;
+        }
+        self.playlist
     }
 }
 
