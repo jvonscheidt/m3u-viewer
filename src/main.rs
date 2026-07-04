@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 use m3u_viewer::app::App;
 use m3u_viewer::loader::{self, LoadEvent};
 use m3u_viewer::player::{Player, PlayerError};
+use m3u_viewer::store::Store;
 use m3u_viewer::ui;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
@@ -57,10 +58,11 @@ fn main() -> Result<()> {
     // Discovery failure is not fatal: browsing works without VLC, and the
     // error surfaces in the status bar on the first play attempt.
     let player = Player::discover(args.vlc_override.as_deref());
+    let store = Store::default_dir().map(Store::load);
     let events = loader::spawn(args.playlist);
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &events, &player, file_name);
+    let result = run(&mut terminal, &events, &player, file_name, store);
     ratatui::restore();
     result
 }
@@ -72,8 +74,9 @@ fn run(
     events: &Receiver<LoadEvent>,
     player: &Result<Player, PlayerError>,
     file_name: String,
+    store: Option<Store>,
 ) -> Result<()> {
-    let mut app = App::new(file_name);
+    let mut app = App::new(file_name, store);
     loop {
         while let Ok(event) = events.try_recv() {
             app.on_load_event(event);
@@ -91,7 +94,12 @@ fn run(
             app.handle_key(key);
             if let Some(request) = app.take_play_request() {
                 match player.as_ref().map(|p| p.play(&request.url)) {
-                    Ok(Ok(())) => app.set_message(format!("▶ {} in VLC", request.name)),
+                    Ok(Ok(())) => {
+                        // Confirmation first: a failing recents save then
+                        // overrides it with its own error message.
+                        app.set_message(format!("▶ {} in VLC", request.name));
+                        app.record_played(&request.url);
+                    }
                     Ok(Err(error)) => app.set_message(format!("✗ {error}")),
                     Err(error) => app.set_message(format!("✗ {error}")),
                 }

@@ -7,7 +7,7 @@ use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table};
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, View};
 
 /// Draws one frame.
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -26,12 +26,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// materialized, so list size does not affect frame time.
 fn draw_channels(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.filtered.is_empty() {
-        let message = if app.loading {
-            "loading…"
-        } else if app.channels.is_empty() {
-            "playlist is empty"
-        } else {
-            "no channels match"
+        let message = match app.view {
+            View::Favorites => "no favorites yet — f toggles the selected channel",
+            View::Recents => "nothing played yet — Enter plays the selected channel",
+            View::All if app.loading => "loading…",
+            View::All if app.channels.is_empty() => "playlist is empty",
+            View::All => "no channels match",
         };
         frame.render_widget(Paragraph::new(message).dim().centered(), area);
         return;
@@ -48,12 +48,13 @@ fn draw_channels(frame: &mut Frame, area: Rect, app: &mut App) {
                 .group
                 .and_then(|id| app.groups.get(id))
                 .map_or("", String::as_str);
+            let star = if app.is_favorite(index) { "★ " } else { "  " };
             let row_style = if app.offset + row == app.selected {
                 Style::new().add_modifier(Modifier::REVERSED)
             } else {
                 Style::new()
             };
-            Row::new([channel.name.clone(), group.to_owned()]).style(row_style)
+            Row::new([format!("{star}{}", channel.name), group.to_owned()]).style(row_style)
         });
     let table = Table::new(rows, [Constraint::Fill(1), Constraint::Length(30)]).column_spacing(2);
     frame.render_widget(table, area);
@@ -80,6 +81,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Style::new().bold(),
         )];
+        match app.view {
+            View::All => {}
+            View::Favorites => {
+                spans.push(Span::styled("  ★ favorites", Style::new().magenta()));
+            }
+            View::Recents => spans.push(Span::styled("  ↻ recents", Style::new().magenta())),
+        }
         if app.loading {
             spans.push(Span::styled(
                 format!("  loading {}%", app.percent),
@@ -131,11 +139,11 @@ fn draw_help_popup(frame: &mut Frame) {
         "Enter                   play in VLC",
         "/                       filter channels",
         "g                       restrict to a group",
+        "f                       toggle favorite",
+        "F / R / Tab             favorites / recents / cycle views",
         "Esc                     clear filter and group",
         "?                       this help",
         "q / Ctrl+C              quit",
-        "",
-        "Favorites and recents are coming soon.",
     ];
     let area = centered(
         frame.area(),
@@ -173,7 +181,7 @@ mod tests {
     use crate::playlist::Channel;
 
     fn app_with_channels(count: usize) -> App {
-        let mut app = App::new("test.m3u".into());
+        let mut app = App::new("test.m3u".into(), None);
         let channels = (0..count)
             .map(|i| Channel {
                 name: format!("Channel {i}"),
