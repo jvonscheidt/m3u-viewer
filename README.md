@@ -145,6 +145,9 @@ encrypted. Deleting the directory resets everything.
 - Editing or saving playlists (read-only viewer).
 - Built-in media playback — VLC is the player.
 - Non-M3U playlist formats (XSPF, PLS).
+- Video on demand (VoD): Xtream VOD/series catalogs are not fetched —
+  live streams only. (VoD entries already present in an M3U file are
+  listed like any other channel.)
 
 ### Functional requirements
 
