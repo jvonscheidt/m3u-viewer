@@ -56,6 +56,11 @@ pub enum LoadEvent {
     /// playlist was shown first and the live fetch has now reached its
     /// first real batch of fresh data, replacing it.
     Reset,
+    /// The playlist's `#EXTM3U` header named an XMLTV guide (`url-tvg`).
+    /// Consumed by the event loop in `main`, which owns EPG loading; may
+    /// arrive more than once (cached copy, then the live refresh) and
+    /// every occurrence after the first is ignored there.
+    EpgUrl(String),
     /// The whole playlist was parsed successfully.
     Finished,
     /// Loading aborted (I/O error, HTTP failure, bad credentials, …).
@@ -434,6 +439,7 @@ fn parse_stream(
     let mut bytes_read: u64 = 0;
     let mut groups_sent = 0;
     let mut first_line: Option<String> = None;
+    let mut epg_url_sent = false;
 
     loop {
         line.clear();
@@ -461,6 +467,10 @@ fn parse_stream(
             }
         }
         builder.push_line(&line);
+        if !epg_url_sent && let Some(url) = builder.tvg_url() {
+            epg_url_sent = true;
+            let _ = tx.send(LoadEvent::EpgUrl(url.to_owned()));
+        }
         if builder.buffered_channels() >= BATCH_SIZE {
             *delivered += builder.buffered_channels();
             flush(
@@ -586,6 +596,7 @@ mod tests {
                 } => channels += batch.len(),
                 // Cached rows are being replaced by fresh ones.
                 LoadEvent::Reset => channels = 0,
+                LoadEvent::EpgUrl(_) => {}
                 LoadEvent::Finished => return (channels, None),
                 LoadEvent::Failed(message) => return (channels, Some(message)),
             }
@@ -665,6 +676,7 @@ mod tests {
                     groups.extend(new_groups);
                 }
                 LoadEvent::Reset => panic!("unexpected reset: no cache was primed"),
+                LoadEvent::EpgUrl(_) => {}
                 LoadEvent::Finished => break,
                 LoadEvent::Failed(message) => panic!("load failed: {message}"),
             }
@@ -813,6 +825,7 @@ mod tests {
                     }
                 }
                 LoadEvent::Reset => saw_reset = true,
+                LoadEvent::EpgUrl(_) => {}
                 LoadEvent::Finished => break,
                 LoadEvent::Failed(message) => panic!("load failed: {message}"),
             }
@@ -853,6 +866,30 @@ mod tests {
         assert!(cached_text.contains("group-title=\"News\""));
         assert!(cached_text.contains(",One\n"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_url_tvg_is_forwarded_as_an_epg_event() {
+        let dir =
+            std::env::temp_dir().join(format!("m3u-viewer-loader-epg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("with-epg.m3u");
+        std::fs::write(
+            &path,
+            "#EXTM3U url-tvg=\"http://example.com/epg.xml\"\n#EXTINF:-1,A\nhttp://u/a\n",
+        )
+        .unwrap();
+        let rx = spawn(Source::File(path), None);
+        let mut epg_urls = Vec::new();
+        for event in &rx {
+            match event {
+                LoadEvent::EpgUrl(url) => epg_urls.push(url),
+                LoadEvent::Finished | LoadEvent::Failed(_) => break,
+                LoadEvent::Batch { .. } | LoadEvent::Reset => {}
+            }
+        }
+        assert_eq!(epg_urls, ["http://example.com/epg.xml"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

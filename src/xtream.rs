@@ -239,6 +239,18 @@ impl Account {
         Ok((reader, total))
     }
 
+    /// The `xmltv.php` URL serving this account's EPG as an XMLTV
+    /// document (credentials percent-encoded).
+    #[must_use]
+    pub fn xmltv_url(&self) -> String {
+        format!(
+            "{}/xmltv.php?username={}&password={}",
+            self.server,
+            utf8_percent_encode(&self.username, NON_ALPHANUMERIC),
+            utf8_percent_encode(&self.password, NON_ALPHANUMERIC),
+        )
+    }
+
     /// The `player_api.php` URL for `action` (credentials percent-encoded).
     fn api_url(&self, action: &str) -> String {
         format!(
@@ -329,6 +341,15 @@ mod tests {
         assert_eq!(
             account.playlist_url(),
             "http://example.com/get.php?username=user%20name&password=p%26ss%3D1&type=m3u_plus&output=ts"
+        );
+    }
+
+    #[test]
+    fn xmltv_url_percent_encodes_credentials() {
+        let account = Account::new("example.com", "user name".into(), "p&ss".into());
+        assert_eq!(
+            account.xmltv_url(),
+            "http://example.com/xmltv.php?username=user%20name&password=p%26ss"
         );
     }
 
