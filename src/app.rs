@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
 
+use crate::epg::{EpgEvent, Guide};
 use crate::loader::LoadEvent;
 use crate::playlist::{Channel, GroupId};
 use crate::store::Store;
@@ -52,6 +53,18 @@ pub enum View {
     Recents,
 }
 
+/// State of the (optional) background EPG load.
+pub enum EpgState {
+    /// No EPG source was configured or discovered.
+    Absent,
+    /// A guide is being fetched and parsed in the background.
+    Loading,
+    /// The guide is ready for now/next lookups.
+    Ready(Guide),
+    /// Loading failed; the detailed error is in the log file.
+    Failed,
+}
+
 /// A channel the user asked to play, handed from [`App::handle_key`] to
 /// the event loop (which owns the external player).
 pub struct PlayRequest {
@@ -62,6 +75,10 @@ pub struct PlayRequest {
 }
 
 /// Top-level TUI state.
+// The bools are independent flags (filter mode, load progress, EPG
+// visibility, quit); folding them into one state machine would be false
+// structure.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub(crate) channels: Vec<Channel>,
     /// Lowercase "name group" per channel, precomputed so a filter pass
@@ -120,6 +137,11 @@ pub struct App {
     /// First channel index per URL, for resolving recents to rows.
     url_index: HashMap<String, usize>,
     play_request: Option<PlayRequest>,
+    /// Programme guide, once an EPG source was found and loaded.
+    pub(crate) epg: EpgState,
+    /// Whether EPG data is drawn (`e` toggles); meaningless until a
+    /// guide is ready.
+    pub(crate) epg_visible: bool,
     quit: bool,
 }
 
@@ -155,6 +177,8 @@ impl App {
             store,
             url_index: HashMap::new(),
             play_request: None,
+            epg: EpgState::Absent,
+            epg_visible: true,
             quit: false,
         }
     }
@@ -217,6 +241,8 @@ impl App {
                 self.group_filter = None;
                 self.recompute_filter();
             }
+            // Consumed by the event loop in `main`, which owns EPG loading.
+            LoadEvent::EpgUrl(_) => {}
             LoadEvent::Finished => {
                 self.loading = false;
                 self.percent = Some(100);
@@ -225,6 +251,27 @@ impl App {
                 self.loading = false;
                 self.error = Some(message);
             }
+        }
+    }
+
+    /// Marks that an EPG load has started (the status bar shows it).
+    pub fn set_epg_loading(&mut self) {
+        self.epg = EpgState::Loading;
+    }
+
+    /// Applies the result of a background EPG load.
+    pub fn on_epg_event(&mut self, event: EpgEvent) {
+        self.epg = match event {
+            EpgEvent::Loaded(guide) => EpgState::Ready(guide),
+            EpgEvent::Failed(_) => EpgState::Failed,
+        };
+    }
+
+    /// The loaded guide, when one is ready and EPG display is enabled.
+    pub(crate) fn visible_guide(&self) -> Option<&Guide> {
+        match &self.epg {
+            EpgState::Ready(guide) if self.epg_visible => Some(guide),
+            _ => None,
         }
     }
 
@@ -309,6 +356,13 @@ impl App {
                 self.mode = Mode::Groups;
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('e') => match self.epg {
+                EpgState::Absent => {
+                    self.message =
+                        Some("✗ no EPG source (--epg, url-tvg, or an Xtream account)".to_owned());
+                }
+                _ => self.epg_visible = !self.epg_visible,
+            },
             KeyCode::Char('f') => self.toggle_favorite(),
             KeyCode::Char('F') => {
                 // Pressing the view's key again returns to the full list.
@@ -1072,6 +1126,37 @@ mod tests {
         assert!(app.message.as_deref().unwrap().contains("unavailable"));
         app.handle_key(key(KeyCode::Char('f')));
         assert!(app.message.as_deref().unwrap().contains("unavailable"));
+    }
+
+    #[test]
+    fn epg_toggle_without_a_source_reports_instead_of_flipping() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(app.epg_visible);
+        assert!(app.message.as_deref().unwrap().contains("no EPG source"));
+    }
+
+    #[test]
+    fn epg_toggle_flips_visibility_once_a_guide_is_ready() {
+        let mut app = loaded_app();
+        app.set_epg_loading();
+        assert!(matches!(app.epg, EpgState::Loading));
+        assert!(app.visible_guide().is_none(), "loading is not ready");
+        app.on_epg_event(EpgEvent::Loaded(Guide::default()));
+        assert!(app.visible_guide().is_some());
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(app.visible_guide().is_none(), "toggled off");
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(app.visible_guide().is_some(), "toggled back on");
+    }
+
+    #[test]
+    fn failed_epg_load_is_recorded_without_a_guide() {
+        let mut app = loaded_app();
+        app.set_epg_loading();
+        app.on_epg_event(EpgEvent::Failed("boom".into()));
+        assert!(matches!(app.epg, EpgState::Failed));
+        assert!(app.visible_guide().is_none());
     }
 
     #[test]

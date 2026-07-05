@@ -29,6 +29,11 @@ pub struct Config {
     /// answer to known player user agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    /// XMLTV guide source (HTTP(S) URL or file path) used when `--epg` is
+    /// not given on the command line. Takes precedence over a `url-tvg`
+    /// header and the Xtream account's own guide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epg_url: Option<String>,
     /// Whether the channel filter (`/`) treats its input as a regular
     /// expression, falling back to plain substring matching when the
     /// pattern fails to compile. Enabled by default; set to `false` to
@@ -48,6 +53,7 @@ impl Default for Config {
             xtream: None,
             vlc_path: None,
             user_agent: None,
+            epg_url: None,
             regex_filter: default_regex_filter(),
             vlc_reuse_instance: false,
         }
@@ -169,6 +175,7 @@ mod tests {
             }),
             vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
             user_agent: Some("VLC/3.0.20".to_owned()),
+            epg_url: Some("http://example.com/epg.xml.gz".to_owned()),
             regex_filter: false,
             vlc_reuse_instance: true,
         };
@@ -181,6 +188,10 @@ mod tests {
         assert_eq!(xtream.password, "s3cr3t");
         assert_eq!(loaded.vlc_path, Some(PathBuf::from("/usr/bin/vlc")));
         assert_eq!(loaded.user_agent, Some("VLC/3.0.20".to_owned()));
+        assert_eq!(
+            loaded.epg_url,
+            Some("http://example.com/epg.xml.gz".to_owned())
+        );
         assert!(!loaded.regex_filter);
         assert!(loaded.vlc_reuse_instance);
 
@@ -209,17 +220,15 @@ mod tests {
     fn partial_config_round_trips() {
         let path = temp_path("partial");
         let config = Config {
-            xtream: None,
             vlc_path: Some(PathBuf::from("C:/tools/vlc.exe")),
-            user_agent: None,
-            regex_filter: true,
-            vlc_reuse_instance: false,
+            ..Config::default()
         };
         config.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert!(loaded.xtream.is_none());
         assert_eq!(loaded.vlc_path, Some(PathBuf::from("C:/tools/vlc.exe")));
         assert!(loaded.user_agent.is_none());
+        assert!(loaded.epg_url.is_none());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
