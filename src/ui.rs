@@ -80,12 +80,21 @@ fn draw_channels(frame: &mut Frame, area: Rect, app: &mut App) {
 /// One-line status bar; doubles as the filter input line in filter mode.
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let line = if app.mode == Mode::Filter {
-        Line::from(vec![
+        let mut spans = vec![
             Span::raw("/"),
             Span::raw(app.filter.clone()),
             Span::styled("█", Style::new().dim()),
-            Span::raw("  (Enter apply · Esc clear)"),
-        ])
+        ];
+        if app.filter_regex_invalid() {
+            spans.push(Span::styled(
+                "  invalid regex, using substring",
+                Style::new().yellow(),
+            ));
+        } else if app.filter_is_regex() {
+            spans.push(Span::styled("  [regex]", Style::new().dim()));
+        }
+        spans.push(Span::raw("  (Enter apply · Esc clear)"));
+        Line::from(spans)
     } else if let Some(error) = &app.error {
         Line::from(Span::styled(format!("error: {error}"), Style::new().red()))
     } else {
@@ -118,7 +127,12 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::raw(format!("  group:{name}")));
         }
         if !app.filter.is_empty() {
-            spans.push(Span::raw(format!("  filter:{}", app.filter)));
+            let tag = if app.filter_is_regex() {
+                " [regex]"
+            } else {
+                ""
+            };
+            spans.push(Span::raw(format!("  filter:{}{tag}", app.filter)));
         }
         if let Some(message) = &app.message {
             spans.push(Span::styled(
@@ -159,7 +173,7 @@ fn draw_help_popup(frame: &mut Frame) {
     let lines = [
         "↑/↓ PgUp/PgDn Home/End  navigate",
         "Enter                   play in VLC",
-        "/                       filter channels",
+        "/                       filter channels (regex)",
         "g                       restrict to a group",
         "f                       toggle favorite",
         "F / R / Tab             favorites / recents / cycle views",

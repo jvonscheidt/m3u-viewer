@@ -96,6 +96,14 @@ where
     .ok_or_else(|| serde::de::Error::custom("expected an unsigned number"))
 }
 
+/// Replaces anything that isn't ASCII alphanumeric with `_`, so the result
+/// is safe to use as a path component on every platform.
+fn sanitize_for_filename(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
 /// Credentials for one Xtream Codes account.
 pub struct Account {
     server: String,
@@ -138,6 +146,22 @@ impl Account {
     #[must_use]
     pub fn credentials(&self) -> (&str, &str, &str) {
         (&self.server, &self.username, &self.password)
+    }
+
+    /// Filesystem-safe key identifying this account for the on-disk
+    /// playlist cache: the server host and username (not the password),
+    /// with anything that isn't ASCII alphanumeric replaced by `_`.
+    #[must_use]
+    pub fn cache_key(&self) -> String {
+        let host = self
+            .server
+            .split_once("://")
+            .map_or(self.server.as_str(), |(_, rest)| rest);
+        format!(
+            "{}-{}",
+            sanitize_for_filename(host),
+            sanitize_for_filename(&self.username)
+        )
     }
 
     /// Host portion of the server URL, for display in the status bar.
@@ -312,6 +336,19 @@ mod tests {
     fn display_name_is_the_host() {
         let account = Account::new("https://example.com:8080", "u".into(), "p".into());
         assert_eq!(account.display_name(), "xtream:example.com:8080");
+    }
+
+    #[test]
+    fn cache_key_sanitizes_host_and_username_for_a_filename() {
+        let account = Account::new("https://example.com:8080", "user name".into(), "p".into());
+        assert_eq!(account.cache_key(), "example_com_8080-user_name");
+    }
+
+    #[test]
+    fn cache_key_ignores_the_password() {
+        let a = Account::new("example.com", "u".into(), "one".into());
+        let b = Account::new("example.com", "u".into(), "two".into());
+        assert_eq!(a.cache_key(), b.cache_key());
     }
 
     /// One-shot local HTTP server; returns the request it received.

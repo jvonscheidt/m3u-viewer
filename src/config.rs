@@ -17,7 +17,7 @@ use thiserror::Error;
 const CONFIG_FILE: &str = "config.toml";
 
 /// Top-level configuration file structure.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Config {
     /// Stored Xtream Codes account credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -29,6 +29,33 @@ pub struct Config {
     /// answer to known player user agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    /// Whether the channel filter (`/`) treats its input as a regular
+    /// expression, falling back to plain substring matching when the
+    /// pattern fails to compile. Enabled by default; set to `false` to
+    /// always use plain substring matching.
+    #[serde(default = "default_regex_filter")]
+    pub regex_filter: bool,
+    /// Whether playing a channel reuses a single running VLC instance
+    /// (via `--one-instance`) instead of opening a new window per channel.
+    /// Disabled by default.
+    #[serde(default)]
+    pub vlc_reuse_instance: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            xtream: None,
+            vlc_path: None,
+            user_agent: None,
+            regex_filter: default_regex_filter(),
+            vlc_reuse_instance: false,
+        }
+    }
+}
+
+fn default_regex_filter() -> bool {
+    true
 }
 
 /// Xtream Codes credentials stored in the config file.
@@ -142,6 +169,8 @@ mod tests {
             }),
             vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
             user_agent: Some("VLC/3.0.20".to_owned()),
+            regex_filter: false,
+            vlc_reuse_instance: true,
         };
         config.save(&path).unwrap();
 
@@ -152,6 +181,8 @@ mod tests {
         assert_eq!(xtream.password, "s3cr3t");
         assert_eq!(loaded.vlc_path, Some(PathBuf::from("/usr/bin/vlc")));
         assert_eq!(loaded.user_agent, Some("VLC/3.0.20".to_owned()));
+        assert!(!loaded.regex_filter);
+        assert!(loaded.vlc_reuse_instance);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -162,6 +193,8 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert!(config.xtream.is_none());
         assert!(config.vlc_path.is_none());
+        assert!(config.regex_filter);
+        assert!(!config.vlc_reuse_instance);
     }
 
     #[test]
@@ -179,12 +212,32 @@ mod tests {
             xtream: None,
             vlc_path: Some(PathBuf::from("C:/tools/vlc.exe")),
             user_agent: None,
+            regex_filter: true,
+            vlc_reuse_instance: false,
         };
         config.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert!(loaded.xtream.is_none());
         assert_eq!(loaded.vlc_path, Some(PathBuf::from("C:/tools/vlc.exe")));
         assert!(loaded.user_agent.is_none());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_written_before_vlc_reuse_instance_existed_defaults_to_disabled() {
+        let path = temp_path("pre-reuse-instance");
+        fs::write(&path, "vlc_path = \"/usr/bin/vlc\"\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(!loaded.vlc_reuse_instance);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_written_before_regex_filter_existed_defaults_to_enabled() {
+        let path = temp_path("pre-regex");
+        fs::write(&path, "vlc_path = \"/usr/bin/vlc\"\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.regex_filter);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

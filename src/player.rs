@@ -25,6 +25,10 @@ pub enum PlayerError {
 /// A resolved external player.
 pub struct Player {
     exe: PathBuf,
+    /// When set, playback requests are handed to VLC's single-instance IPC
+    /// (`--one-instance`) instead of spawning a separate player window per
+    /// channel.
+    reuse_instance: bool,
 }
 
 impl Player {
@@ -41,6 +45,7 @@ impl Player {
                 log::info!("using VLC override: {}", path.display());
                 Ok(Self {
                     exe: path.to_path_buf(),
+                    reuse_instance: false,
                 })
             } else {
                 log::warn!("VLC override is not a file: {}", path.display());
@@ -52,13 +57,24 @@ impl Player {
             .unwrap_or_default();
         let result = find_executable(path_dirs.iter().map(PathBuf::as_path))
             .or_else(|| find_executable(standard_dirs().iter().map(PathBuf::as_path)))
-            .map(|exe| Self { exe })
+            .map(|exe| Self {
+                exe,
+                reuse_instance: false,
+            })
             .ok_or(PlayerError::NotFound);
         match &result {
             Ok(player) => log::info!("VLC found: {}", player.exe.display()),
             Err(_) => log::warn!("VLC not found"),
         }
         result
+    }
+
+    /// Sets whether playback requests reuse a single running VLC instance
+    /// (via `--one-instance`) rather than opening a new window each time.
+    #[must_use]
+    pub fn with_reuse_instance(mut self, enabled: bool) -> Self {
+        self.reuse_instance = enabled;
+        self
     }
 
     /// Full path of the executable that will be launched.
@@ -71,12 +87,22 @@ impl Player {
     /// thread waits on the child so the viewer neither blocks nor leaves
     /// zombies behind.
     ///
+    /// When [`Self::with_reuse_instance`] is enabled, `--one-instance` and
+    /// `--no-playlist-enqueue` are passed so VLC hands the URL off to an
+    /// already-running instance and plays it immediately (replacing
+    /// whatever it was playing) instead of spawning a new window; the
+    /// first launch still starts VLC normally since no instance exists yet.
+    ///
     /// # Errors
     ///
     /// [`PlayerError::Spawn`] if the process cannot be started.
     pub fn play(&self, url: &str) -> Result<(), PlayerError> {
         log::info!("launching VLC for playback");
-        let mut child = Command::new(&self.exe)
+        let mut command = Command::new(&self.exe);
+        if self.reuse_instance {
+            command.arg("--one-instance").arg("--no-playlist-enqueue");
+        }
+        let mut child = command
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -158,6 +184,17 @@ mod tests {
         let exe = dir.join(if cfg!(windows) { "vlc.exe" } else { "vlc" });
         let player = Player::discover(Some(&exe)).unwrap();
         assert_eq!(player.exe(), exe);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reuse_instance_is_disabled_by_default_and_toggled_explicitly() {
+        let dir = fake_vlc_dir("reuse");
+        let exe = dir.join(if cfg!(windows) { "vlc.exe" } else { "vlc" });
+        let player = Player::discover(Some(&exe)).unwrap();
+        assert!(!player.reuse_instance);
+        let player = player.with_reuse_instance(true);
+        assert!(player.reuse_instance);
         fs::remove_dir_all(dir).unwrap();
     }
 

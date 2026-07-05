@@ -18,8 +18,8 @@ use m3u_viewer::xtream::Account;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-const USAGE: &str = "usage: m3u-viewer <playlist.m3u> [--vlc <path>]\n       \
-     m3u-viewer --xtream <server> --username <user> --password <pass> [--user-agent <ua>] [--vlc <path>] [--save-config]\n       \
+const USAGE: &str = "usage: m3u-viewer <playlist.m3u> [--vlc <path>] [--vlc-reuse-instance]\n       \
+     m3u-viewer --xtream <server> --username <user> --password <pass> [--user-agent <ua>] [--vlc <path>] [--vlc-reuse-instance] [--save-config]\n       \
      m3u-viewer [--vlc <path>]   (uses saved Xtream credentials from config)";
 
 /// Parsed command line.
@@ -31,6 +31,9 @@ struct Args {
     /// `User-Agent` header for Xtream requests (CLI or config); kept here
     /// so `--save-config` can persist it.
     user_agent: Option<String>,
+    /// Whether to hand playback requests to a single running VLC instance
+    /// (CLI or config; CLI can only turn it on, not override config off).
+    vlc_reuse_instance: bool,
     /// When true, persist the resolved credentials + VLC path to the config
     /// file before starting.
     save_config: bool,
@@ -42,7 +45,15 @@ struct Args {
 fn looks_like_flag(arg: &OsStr) -> bool {
     matches!(
         arg.to_str(),
-        Some("--vlc" | "--xtream" | "--username" | "--password" | "--user-agent" | "--save-config")
+        Some(
+            "--vlc"
+                | "--xtream"
+                | "--username"
+                | "--password"
+                | "--user-agent"
+                | "--vlc-reuse-instance"
+                | "--save-config"
+        )
     )
 }
 
@@ -55,6 +66,7 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
     let mut username: Option<String> = None;
     let mut password: Option<String> = None;
     let mut user_agent: Option<String> = None;
+    let mut vlc_reuse_instance = false;
     let mut save_config = false;
 
     let mut args = args;
@@ -78,6 +90,8 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
             password = Some(string_flag("--password")?);
         } else if arg == "--user-agent" {
             user_agent = Some(string_flag("--user-agent")?);
+        } else if arg == "--vlc-reuse-instance" {
+            vlc_reuse_instance = true;
         } else if arg == "--save-config" {
             save_config = true;
         } else if playlist.is_none() && server.is_none() {
@@ -110,6 +124,9 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
     if user_agent.is_none() {
         user_agent.clone_from(&config.user_agent);
     }
+    // A plain boolean flag can't express "off", so it only ever adds to
+    // what config already enabled.
+    vlc_reuse_instance |= config.vlc_reuse_instance;
 
     match (playlist, server) {
         (Some(_), Some(_)) => bail!("give either a playlist file or --xtream, not both\n{USAGE}"),
@@ -126,6 +143,7 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
                 display_name,
                 vlc_override,
                 user_agent,
+                vlc_reuse_instance,
                 save_config,
             })
         }
@@ -141,6 +159,7 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
                 display_name,
                 vlc_override,
                 user_agent,
+                vlc_reuse_instance,
                 save_config,
             })
         }
@@ -220,6 +239,8 @@ fn main() -> Result<()> {
             xtream,
             vlc_path: args.vlc_override.clone(),
             user_agent: args.user_agent.clone(),
+            regex_filter: config.regex_filter,
+            vlc_reuse_instance: args.vlc_reuse_instance,
         };
         match config_path {
             Some(ref path) => {
@@ -236,12 +257,20 @@ fn main() -> Result<()> {
 
     // Discovery failure is not fatal: browsing works without VLC, and the
     // error surfaces in the status bar on the first play attempt.
-    let player = Player::discover(args.vlc_override.as_deref());
+    let player = Player::discover(args.vlc_override.as_deref())
+        .map(|player| player.with_reuse_instance(args.vlc_reuse_instance));
     let store = Store::default_dir().map(Store::load);
-    let events = loader::spawn(args.source);
+    let events = loader::spawn(args.source, Store::default_dir());
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &events, &player, args.display_name, store);
+    let result = run(
+        &mut terminal,
+        &events,
+        &player,
+        args.display_name,
+        store,
+        config.regex_filter,
+    );
     ratatui::restore();
     result
 }
@@ -254,8 +283,10 @@ fn run(
     player: &Result<Player, PlayerError>,
     display_name: String,
     store: Option<Store>,
+    regex_filter: bool,
 ) -> Result<()> {
     let mut app = App::new(display_name, store);
+    app.set_regex_filter(regex_filter);
     loop {
         while let Ok(event) = events.try_recv() {
             app.on_load_event(event);
@@ -354,6 +385,8 @@ mod tests {
             }),
             vlc_path: None,
             user_agent: None,
+            regex_filter: true,
+            vlc_reuse_instance: false,
         };
         let args = parse_args(std::iter::empty(), &config).unwrap();
         assert!(matches!(args.source, Source::Xtream(_)));
@@ -366,6 +399,8 @@ mod tests {
             xtream: None,
             vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
             user_agent: None,
+            regex_filter: true,
+            vlc_reuse_instance: false,
         };
         let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
         assert_eq!(args.vlc_override, Some(PathBuf::from("/usr/bin/vlc")));
@@ -377,6 +412,8 @@ mod tests {
             xtream: None,
             vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
             user_agent: None,
+            regex_filter: true,
+            vlc_reuse_instance: false,
         };
         let args = parse_args(
             ["list.m3u", "--vlc", "/opt/vlc"].iter().map(OsString::from),
@@ -408,6 +445,8 @@ mod tests {
             xtream: None,
             vlc_path: None,
             user_agent: Some("FromConfig/1.0".to_owned()),
+            regex_filter: true,
+            vlc_reuse_instance: false,
         };
         let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
         assert_eq!(args.user_agent, Some("FromConfig/1.0".to_owned()));
@@ -420,6 +459,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.user_agent, Some("FromCli/2.0".to_owned()));
+    }
+
+    #[test]
+    fn vlc_reuse_instance_flag_parsed() {
+        let args = parse(&["list.m3u", "--vlc-reuse-instance"]).unwrap();
+        assert!(args.vlc_reuse_instance);
+    }
+
+    #[test]
+    fn vlc_reuse_instance_falls_back_to_config_and_cli_cannot_disable_it() {
+        let config = Config {
+            xtream: None,
+            vlc_path: None,
+            user_agent: None,
+            regex_filter: true,
+            vlc_reuse_instance: true,
+        };
+        let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
+        assert!(args.vlc_reuse_instance);
     }
 
     #[test]
@@ -449,6 +507,8 @@ mod tests {
             }),
             vlc_path: None,
             user_agent: None,
+            regex_filter: true,
+            vlc_reuse_instance: false,
         };
         let args = parse_args(
             ["--username", "cli-user"].iter().map(OsString::from),
