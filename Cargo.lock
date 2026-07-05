@@ -730,6 +730,7 @@ dependencies = [
  "log",
  "percent-encoding",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "simplelog",
