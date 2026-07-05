@@ -28,8 +28,8 @@ while you browse (progress shows in the status bar).
 ### Command line
 
 ```
-m3u-viewer <playlist.m3u> [--vlc <path>]
-m3u-viewer --xtream <server> --username <user> --password <pass> [--user-agent <ua>] [--vlc <path>] [--save-config]
+m3u-viewer <playlist.m3u> [--epg <url-or-file>] [--vlc <path>] [--vlc-reuse-instance]
+m3u-viewer --xtream <server> --username <user> --password <pass> [--epg <url-or-file>] [--user-agent <ua>] [--vlc <path>] [--vlc-reuse-instance] [--save-config]
 m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
 ```
 
@@ -44,19 +44,46 @@ m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
   the Xtream player API (`player_api.php`) instead, with categories as
   groups. Note that the credentials are visible in your shell history
   and process list.
+- `--epg <url-or-file>` — load an [XMLTV](https://wiki.xmltv.org)
+  programme guide (plain or gzipped) and show what's airing now and
+  next. Usually unnecessary: playlists that name a guide in their
+  `#EXTM3U url-tvg="…"` header and Xtream accounts (via `xmltv.php`)
+  get EPG automatically; this flag overrides both. Can also be set as
+  `epg_url` in `config.toml`; the CLI value wins.
 - `--user-agent <ua>` — send this `User-Agent` header when downloading
   the playlist from the Xtream server. Some providers only answer to
   known player user agents, e.g. `--user-agent "VLC/3.0.20 LibVLC/3.0.20"`.
   Can also be set as `user_agent` in `config.toml`; the CLI value wins.
-- `--save-config` — write the Xtream credentials, the user agent, and
-  the VLC path (if given) to `config.toml` in the config directory so
-  you can omit them on future invocations. Run once; then `m3u-viewer`
-  with no arguments picks up the saved credentials automatically. The
-  file is created if it does not exist yet.
+- `--save-config` — write the Xtream credentials, the user agent, the
+  EPG source, and the VLC path (if given) to `config.toml` in the
+  config directory so you can omit them on future invocations. Run
+  once; then `m3u-viewer` with no arguments picks up the saved
+  credentials automatically. The file is created if it does not exist
+  yet.
 - `--vlc <path>` — use this VLC executable instead of auto-detection.
   Without it, `vlc` is looked up on `PATH`, then in the standard install
   locations (e.g. `C:\Program Files\VideoLAN\VLC` on Windows,
   `/Applications/VLC.app` on macOS).
+- `--vlc-reuse-instance` — play channels in a single running VLC window
+  (VLC's `--one-instance`) instead of opening a new window per channel.
+  Can also be set as `vlc_reuse_instance = true` in `config.toml`.
+
+### Programme guide (EPG)
+
+When a guide is available — from `--epg`, the playlist's
+`url-tvg` header, or the Xtream account itself — the channel list
+gains a "now playing" column, and a line above the status bar shows
+now/next with times for the selected channel:
+
+```
+▶ 20:15–21:45 Breaking Stories & More  ·  next 21:45 Late Review
+```
+
+Channels are matched by `tvg-id`, falling back to the channel name.
+The guide loads in the background (`epg…` in the status bar; `epg ✗`
+plus a log entry if it fails) and never blocks browsing. Only a
+12-hour window around "now" is kept, so even multi-day guides for
+huge playlists stay cheap. `e` hides/shows the EPG display.
 
 ### Keys at a glance
 
@@ -69,6 +96,7 @@ Press `?` inside the viewer for the full list. The essentials:
 | `Enter` | play the selected channel in VLC |
 | `f` | mark/unmark as favorite (`★`) |
 | `F` / `R` / `Tab` | favorites view / recents view / cycle views |
+| `e` | toggle the EPG display |
 | `Esc` | clear filter and group |
 | `q` | quit |
 
@@ -80,9 +108,10 @@ macOS `~/Library/Application Support/m3u-viewer/`.
 
 | File | Contents |
 | --- | --- |
-| `config.toml` | Xtream credentials, user agent, and VLC path (written by `--save-config`) |
+| `config.toml` | Xtream credentials, user agent, EPG source, and VLC path (written by `--save-config`) |
 | `favorites.json` | Favorited channel URLs |
 | `recents.json` | Recently played channel URLs (newest first, capped at 50) |
+| `cache/` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs |
 | `m3u-viewer.log` | Diagnostic log (startup, loading, playback); overwritten each run |
 
 Favorites and recents are keyed by stream URL, so they survive playlist
@@ -104,7 +133,7 @@ encrypted. Deleting the directory resets everything.
 
 - Editing or saving playlists (read-only viewer).
 - Built-in media playback — VLC is the player.
-- Non-M3U formats (XSPF, PLS) and EPG/XMLTV data.
+- Non-M3U playlist formats (XSPF, PLS).
 
 ### Functional requirements
 
@@ -140,6 +169,23 @@ encrypted. Deleting the directory resets everything.
 - Group sidebar/selector: jump to or restrict the list to one
   `group-title`; groups are listed alphabetically too.
 - Filter and group restriction combine (AND).
+
+#### Programme guide (EPG, since 0.6.0)
+
+- XMLTV source resolution, in order: `--epg <url-or-file>` (or
+  `epg_url` in `config.toml`), the playlist's `#EXTM3U url-tvg` /
+  `x-tvg-url` header, and — for Xtream accounts — the panel's
+  `xmltv.php` endpoint. Gzipped feeds are detected by content, not
+  file name.
+- The guide loads and parses on a background thread; failures surface
+  as a status-bar marker plus a log entry, never as an aborted start.
+- Channels are matched by `tvg-id` first, then by display name
+  (case-insensitive). The list shows the current programme per
+  channel; a dedicated line shows now/next with times for the
+  selection.
+- Only programmes within a 12-hour window around load time are kept,
+  bounding memory even for multi-day guides over very large playlists.
+- `e` toggles the EPG display without discarding the loaded guide.
 
 #### Playback (VLC)
 
@@ -178,6 +224,7 @@ encrypted. Deleting the directory resets everything.
 | `F` | Favorites view |
 | `R` | Recent channels view |
 | `Tab` | Cycle views: all / favorites / recents |
+| `e` | Toggle EPG display |
 | `?` | Help overlay |
 | `q` | Quit |
 
