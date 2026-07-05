@@ -410,9 +410,11 @@ impl App {
         self.view = target;
         self.selected = 0;
         if target == View::Favorites {
-            // Opening favorites should show the whole list, not whatever
-            // text filter was left over from browsing another view.
+            // Opening favorites should show them all, not whatever text
+            // filter or group restriction was left over from browsing
+            // another view.
             self.filter.clear();
+            self.group_filter = None;
         }
         self.recompute_filter();
     }
@@ -1034,6 +1036,31 @@ mod tests {
         assert_eq!(app.view, View::Favorites);
         assert!(app.filter.is_empty());
         assert_eq!(filtered_names(&app), ["BBC News", "CNN"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opening_favorites_clears_a_leftover_group_restriction() {
+        // Regression: a group restriction (unlike the text filter) was
+        // carried into the favorites view, hiding favorites from every
+        // other group.
+        let (store, dir) = temp_store("fav-group-reset");
+        let mut app = loaded_app_with(Some(store));
+        // Favorite BBC News (News) and Eurosport (Sports).
+        app.selected = 0;
+        app.handle_key(key(KeyCode::Char('f')));
+        app.selected = 2;
+        app.handle_key(key(KeyCode::Char('f')));
+        // Restrict to the News group via the popup (row 1).
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(0));
+        // Opening favorites must show both favorites, not just News ones.
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.view, View::Favorites);
+        assert_eq!(app.group_filter, None);
+        assert_eq!(filtered_names(&app), ["BBC News", "Eurosport"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
