@@ -8,9 +8,12 @@ repository = "https://github.com/jvonscheidt/m3u-viewer"
 
 [dependencies]
 anyhow = "1.0.103"
+chrono = "0.4.42"
 directories = "6.0.0"
+flate2 = "1.1.5"
 log = "0.4.33"
 percent-encoding = "2.3.2"
+quick-xml = "0.41.0"
 ratatui = "0.30.2"
 regex = "1.12.4"
 serde = { version = "1.0.228", features = ["derive"] }

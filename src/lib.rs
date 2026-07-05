@@ -5,6 +5,7 @@
 pub mod app;
 mod cache;
 pub mod config;
+pub mod epg;
 pub mod loader;
 pub mod player;
 pub mod playlist;

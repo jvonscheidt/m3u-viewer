@@ -96,6 +96,8 @@ pub struct PlaylistBuilder {
     /// producing a channel (the entry was already counted as skipped).
     pending_malformed: bool,
     seen_first_line: bool,
+    /// Guide URL from the `#EXTM3U` header, when it carries one.
+    tvg_url: Option<String>,
 }
 
 impl PlaylistBuilder {
@@ -128,8 +130,16 @@ impl PlaylistBuilder {
                 self.playlist.skipped += 1;
                 self.pending_malformed = true;
             }
+        } else if let Some(rest) = text.strip_prefix("#EXTM3U") {
+            // The header may name an XMLTV guide (`url-tvg`, or the
+            // `x-tvg-url` spelling some generators use).
+            if self.tvg_url.is_none() {
+                self.tvg_url = attribute(rest, "url-tvg")
+                    .or_else(|| attribute(rest, "x-tvg-url"))
+                    .map(str::to_owned);
+            }
         } else if text.starts_with('#') {
-            // #EXTM3U header and unknown directives are ignored.
+            // Unknown directives are ignored.
         } else if self.pending_malformed {
             self.pending_malformed = false;
         } else {
@@ -185,6 +195,13 @@ impl PlaylistBuilder {
     #[must_use]
     pub fn skipped(&self) -> usize {
         self.playlist.skipped
+    }
+
+    /// The XMLTV guide URL from the `#EXTM3U` header (`url-tvg` /
+    /// `x-tvg-url`), once such a header line has been consumed.
+    #[must_use]
+    pub fn tvg_url(&self) -> Option<&str> {
+        self.tvg_url.as_deref()
     }
 
     /// Finalizes parsing (a trailing `#EXTINF` with no URL counts as
@@ -419,6 +436,35 @@ mod tests {
         // Exercised directly: a never-closed quote in the full payload is
         // rejected earlier (no separator comma), so this guards attribute().
         assert_eq!(attribute("-1 tvg-id=\"abc", "tvg-id"), None);
+    }
+
+    #[test]
+    fn header_url_tvg_is_captured() {
+        let mut builder = PlaylistBuilder::new();
+        builder.push_line("#EXTM3U url-tvg=\"http://example.com/epg.xml.gz\"");
+        builder.push_line("#EXTINF:-1,A");
+        builder.push_line("http://u/a");
+        assert_eq!(
+            builder.tvg_url(),
+            Some("http://example.com/epg.xml.gz"),
+            "url-tvg should be read from the header"
+        );
+    }
+
+    #[test]
+    fn header_x_tvg_url_spelling_is_accepted() {
+        let mut builder = PlaylistBuilder::new();
+        builder.push_line("#EXTM3U x-tvg-url=\"http://example.com/guide.xml\"");
+        assert_eq!(builder.tvg_url(), Some("http://example.com/guide.xml"));
+    }
+
+    #[test]
+    fn plain_header_yields_no_tvg_url() {
+        let mut builder = PlaylistBuilder::new();
+        builder.push_line("#EXTM3U");
+        builder.push_line("#EXTINF:-1,A");
+        builder.push_line("http://u/a");
+        assert_eq!(builder.tvg_url(), None);
     }
 
     #[test]
