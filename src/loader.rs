@@ -184,7 +184,7 @@ fn load_xtream(
         return Err(m3u_error);
     }
     log::warn!("M3U download failed ({m3u_error}); trying the player API instead");
-    match load_xtream_api(account, &mut reset_pending, tx) {
+    match load_xtream_api(account, &mut reset_pending, cache_path.as_deref(), tx) {
         Ok(()) => Ok(()),
         Err(api_error) => {
             let combined = format!("M3U download failed: {m3u_error}; player API: {api_error}");
@@ -250,10 +250,14 @@ fn load_xtream_m3u(
 }
 
 /// Builds the channel list from the player API: categories become
-/// groups, and each live stream's URL is synthesized from its id.
+/// groups, and each live stream's URL is synthesized from its id. Panels
+/// that don't serve `get.php` (see [`load_xtream_m3u`]) still get a
+/// working cache: every channel is mirrored into `cache_path` as it's
+/// built, in the same M3U form [`crate::playlist`] parses back.
 fn load_xtream_api(
     account: &Account,
     reset_pending: &mut bool,
+    cache_path: Option<&Path>,
     tx: &Sender<LoadEvent>,
 ) -> Result<(), String> {
     let categories = account
@@ -271,6 +275,17 @@ fn load_xtream_api(
         return Err("the player API returned no live streams".to_owned());
     }
 
+    let (mut cache_sink, tmp_path) = match cache_path.and_then(cache::create_temp) {
+        Some((mut file, tmp)) => {
+            if file.write_all(b"#EXTM3U\n").is_ok() {
+                (Some(file), Some(tmp))
+            } else {
+                (None, None)
+            }
+        }
+        None => (None, None),
+    };
+
     let category_names: HashMap<&str, &str> = categories
         .iter()
         .map(|category| (category.id.as_str(), category.name.as_str()))
@@ -281,20 +296,27 @@ fn load_xtream_api(
     let mut groups_sent = 0;
     let mut channels: Vec<Channel> = Vec::new();
     for (done, stream) in streams.into_iter().enumerate() {
-        let group = stream
+        let group_name = stream
             .category_id
             .as_deref()
-            .and_then(|id| category_names.get(id))
-            .map(|&name| match group_ids.entry(name.to_owned()) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    groups.push(name.to_owned());
-                    *entry.insert(groups.len() - 1)
-                }
-            });
+            .and_then(|id| category_names.get(id).copied());
+        let group = group_name.map(|name| match group_ids.entry(name.to_owned()) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                groups.push(name.to_owned());
+                *entry.insert(groups.len() - 1)
+            }
+        });
         let url = account.live_stream_url(stream.stream_id);
         // Panels without a stream name get the URL, like bare M3U entries.
         let name = stream.name.unwrap_or_else(|| url.clone());
+        write_m3u_entry(
+            &mut cache_sink,
+            &name,
+            &url,
+            stream.epg_channel_id.as_deref(),
+            group_name,
+        );
         channels.push(Channel {
             name,
             url,
@@ -323,7 +345,42 @@ fn load_xtream_api(
         0,
         Some(100),
     );
+    drop(cache_sink);
+    if let (Some(tmp), Some(path)) = (&tmp_path, cache_path) {
+        cache::promote(tmp, path);
+    }
     Ok(())
+}
+
+/// Appends one channel as an `#EXTINF`/URL pair to `sink`, if present. A
+/// write failure disables the sink for the rest of the load — mirroring
+/// the same file that's about to be shown to the user isn't worth
+/// failing over.
+fn write_m3u_entry(
+    sink: &mut Option<File>,
+    name: &str,
+    url: &str,
+    tvg_id: Option<&str>,
+    group: Option<&str>,
+) {
+    use std::fmt::Write as _;
+
+    let Some(file) = sink else { return };
+    let mut line = String::from("#EXTINF:-1");
+    if let Some(id) = tvg_id {
+        let _ = write!(line, " tvg-id=\"{id}\"");
+    }
+    if let Some(group) = group {
+        let _ = write!(line, " group-title=\"{group}\"");
+    }
+    line.push(',');
+    line.push_str(name);
+    line.push('\n');
+    line.push_str(url);
+    line.push('\n');
+    if file.write_all(line.as_bytes()).is_err() {
+        *sink = None;
+    }
 }
 
 /// Whether the input must start with the `#EXTM3U` header.
@@ -773,6 +830,28 @@ mod tests {
             !cached_text.contains("Cached"),
             "stale cache kept: {cached_text}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn player_api_fallback_also_writes_the_cache() {
+        // Regression: panels that always reject get.php (so every load
+        // falls back to load_xtream_api) never got a cache file written,
+        // since only the M3U download path mirrored to disk.
+        let dir = temp_cache_dir("api-fallback");
+        let port = serve_panel(3);
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let cache_key = account.cache_key();
+
+        let (channels, error) = drain(&spawn(Source::Xtream(account), Some(dir.clone())));
+        assert_eq!(channels, 3);
+        assert!(error.is_none());
+
+        let cached_text = fs::read_to_string(cache::path(&dir, &cache_key)).unwrap();
+        assert!(cached_text.starts_with("#EXTM3U\n"));
+        assert!(cached_text.contains("tvg-id=\"one.tv\""));
+        assert!(cached_text.contains("group-title=\"News\""));
+        assert!(cached_text.contains(",One\n"));
         let _ = fs::remove_dir_all(&dir);
     }
 
