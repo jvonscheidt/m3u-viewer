@@ -85,13 +85,24 @@ plus a log entry if it fails) and never blocks browsing. Only a
 12-hour window around "now" is kept, so even multi-day guides for
 huge playlists stay cheap. `e` hides/shows the EPG display.
 
+### Filtering
+
+`/` filters over channel name and group as you type. The pattern is a
+case-insensitive [regular expression](https://docs.rs/regex/latest/regex/#syntax)
+— `bbc|cnn` matches either channel, `^sky sports` anchors at the
+name's start. Text that doesn't (yet) compile as a regex — usually a
+pattern you're still typing — falls back to a plain substring match
+instead of showing "no matches", and the status bar says so. Set
+`regex_filter = false` in `config.toml` to always match literally
+(then `ESPN+` finds only `ESPN+`).
+
 ### Keys at a glance
 
 Press `?` inside the viewer for the full list. The essentials:
 
 | Key | Action |
 | --- | --- |
-| `/` + text | filter channels as you type |
+| `/` + text | filter channels as you type (regex) |
 | `g` | restrict to one group |
 | `Enter` | play the selected channel in VLC |
 | `f` | mark/unmark as favorite (`★`) |
@@ -108,7 +119,7 @@ macOS `~/Library/Application Support/m3u-viewer/`.
 
 | File | Contents |
 | --- | --- |
-| `config.toml` | Xtream credentials, user agent, EPG source, and VLC path (written by `--save-config`) |
+| `config.toml` | Xtream credentials, user agent, EPG source, and VLC path (written by `--save-config`); hand-edited toggles like `regex_filter` and `vlc_reuse_instance` |
 | `favorites.json` | Favorited channel URLs |
 | `recents.json` | Recently played channel URLs (newest first, capped at 50) |
 | `cache/` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs |
@@ -164,8 +175,13 @@ encrypted. Deleting the directory resets everything.
   rendered) showing channel name and group, sorted alphabetically
   (case-insensitive) rather than playlist order — including while a large
   playlist is still streaming in.
-- `/` opens a filter prompt; matching is case-insensitive substring over
-  channel name and group, updated on every keystroke (debounced ≤ 50 ms).
+- `/` opens a filter prompt; matching is over channel name and group,
+  updated on every keystroke (debounced ≤ 50 ms).
+- Filter syntax (since 0.5.0): the text is a case-insensitive regular
+  expression; input that fails to compile (typically a half-typed
+  pattern) degrades to a case-insensitive substring match rather than
+  an empty list, with an indicator in the status bar. `regex_filter =
+  false` in `config.toml` forces literal substring matching.
 - Group sidebar/selector: jump to or restrict the list to one
   `group-title`; groups are listed alphabetically too.
 - Filter and group restriction combine (AND).
