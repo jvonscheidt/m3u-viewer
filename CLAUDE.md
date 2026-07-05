@@ -59,7 +59,7 @@ Before declaring any change done, all three must pass locally:
 
 ## Git & GitHub
 
-- Default branch is `main`; never commit to it directly. Branch names:
+- Default branch is `main`; minor changes commit to it directly. Major changes get branched:
   `feat/<topic>`, `fix/<topic>`, `chore/<topic>`.
 - Conventional Commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`,
   `chore:`. Imperative subject ≤ 72 chars; body explains *why*, not *what*.
@@ -68,3 +68,4 @@ Before declaring any change done, all three must pass locally:
 - Use the `gh` CLI for GitHub work (`gh pr create`, `gh issue view`, …). Keep
   PRs small and single-purpose; CI (fmt check, clippy, tests) must be green
   before merge.
+- Update the README before tagging a new version.
