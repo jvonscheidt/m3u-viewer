@@ -7,10 +7,25 @@
 use std::collections::HashMap;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use regex::{Regex, RegexBuilder};
 
 use crate::loader::LoadEvent;
 use crate::playlist::{Channel, GroupId};
 use crate::store::Store;
+
+/// How the current filter text is matched against a channel's search key.
+/// Rebuilt by [`App::rebuild_filter_matcher`] whenever the filter text or
+/// the regex-filter setting changes.
+enum FilterMatcher {
+    /// No filter text: everything matches.
+    None,
+    /// Plain case-insensitive substring match — either regex mode is off,
+    /// or the typed text failed to compile as a regex (most often because
+    /// the user is still mid-way through typing a pattern).
+    Substring(String),
+    /// Case-insensitive regular expression match.
+    Regex(Regex),
+}
 
 /// Input mode: decides how key presses are interpreted and what is drawn
 /// on top of the channel list.
@@ -67,7 +82,15 @@ pub struct App {
     /// full resort here is cheap even at playlist scale.
     pub(crate) sorted_groups: Vec<GroupId>,
     pub(crate) filter: String,
-    filter_lower: String,
+    /// Compiled form of `filter`, rebuilt whenever it or `regex_filter`
+    /// changes; kept as state so a batch absorb doesn't recompile it per
+    /// channel.
+    filter_matcher: FilterMatcher,
+    /// Whether `filter` is interpreted as a regular expression (with a
+    /// substring fallback when it fails to compile). Mirrors
+    /// [`crate::config::Config::regex_filter`]; set once at startup via
+    /// [`Self::set_regex_filter`].
+    regex_filter: bool,
     pub(crate) group_filter: Option<GroupId>,
     /// Indices into `channels` that pass the filter and group restriction.
     pub(crate) filtered: Vec<usize>,
@@ -113,7 +136,8 @@ impl App {
             groups: Vec::new(),
             sorted_groups: Vec::new(),
             filter: String::new(),
-            filter_lower: String::new(),
+            filter_matcher: FilterMatcher::None,
+            regex_filter: true,
             group_filter: None,
             filtered: Vec::new(),
             selected: 0,
@@ -172,6 +196,27 @@ impl App {
                 }
                 self.absorb_channels(start);
             }
+            LoadEvent::Reset => {
+                self.channels.clear();
+                self.search_keys.clear();
+                self.name_keys.clear();
+                self.sorted_channels.clear();
+                self.groups.clear();
+                self.sorted_groups.clear();
+                self.url_index.clear();
+                self.skipped = 0;
+                self.percent = None;
+                self.selected = 0;
+                self.offset = 0;
+                // A GroupId is only meaningful for the batch of groups it
+                // was assigned alongside; group order depends on
+                // first-seen order, so a restriction chosen while a
+                // cached playlist was shown could silently point at the
+                // wrong group once fresh data replaces it. The text
+                // filter is a plain string and stays safe to keep.
+                self.group_filter = None;
+                self.recompute_filter();
+            }
             LoadEvent::Finished => {
                 self.loading = false;
                 self.percent = Some(100);
@@ -205,6 +250,21 @@ impl App {
                 self.recompute_filter();
             }
         }
+    }
+
+    /// Whether the filter text is currently applied as a compiled regex
+    /// (as opposed to a plain substring match).
+    #[must_use]
+    pub fn filter_is_regex(&self) -> bool {
+        matches!(self.filter_matcher, FilterMatcher::Regex(_))
+    }
+
+    /// Whether regex mode is on but the typed text does not currently
+    /// compile as a regex, so filtering has fallen back to a plain
+    /// substring match.
+    #[must_use]
+    pub fn filter_regex_invalid(&self) -> bool {
+        self.regex_filter && !self.filter.is_empty() && !self.filter_is_regex()
     }
 
     /// Whether the channel at `index` is a favorite.
@@ -349,13 +409,25 @@ impl App {
         }
         self.view = target;
         self.selected = 0;
+        if target == View::Favorites {
+            // Opening favorites should show the whole list, not whatever
+            // text filter was left over from browsing another view.
+            self.filter.clear();
+        }
+        self.recompute_filter();
+    }
+
+    /// Switches between regex and plain substring filtering (mirrors
+    /// [`crate::config::Config::regex_filter`]) and re-applies the filter.
+    pub fn set_regex_filter(&mut self, enabled: bool) {
+        self.regex_filter = enabled;
         self.recompute_filter();
     }
 
     /// Rebuilds the filtered index list from scratch and clamps the
     /// selection.
     fn recompute_filter(&mut self) {
-        self.filter_lower = self.filter.to_lowercase();
+        self.rebuild_filter_matcher();
         self.filtered = match (self.view, &self.store) {
             // Recents ordering comes from the store (newest first), not
             // alphabetically.
@@ -438,8 +510,34 @@ impl App {
             .group_filter
             .is_none_or(|id| self.channels[index].group == Some(id));
         group_ok
-            && (self.filter_lower.is_empty()
-                || self.search_keys[index].contains(&self.filter_lower))
+            && match &self.filter_matcher {
+                FilterMatcher::None => true,
+                FilterMatcher::Substring(needle) => self.search_keys[index].contains(needle),
+                FilterMatcher::Regex(re) => re.is_match(&self.search_keys[index]),
+            }
+    }
+
+    /// Recompiles [`Self::filter_matcher`] from the current filter text and
+    /// `regex_filter` setting. Search keys are already lowercased, so plain
+    /// substring matching stays a lowercase-needle `contains`; regex
+    /// patterns are compiled case-insensitively for the same effect. A
+    /// pattern that fails to compile — most often because the user is
+    /// still mid-way through typing it — falls back to a substring match
+    /// instead of showing "no matches" for a currently-invalid regex.
+    fn rebuild_filter_matcher(&mut self) {
+        self.filter_matcher = if self.filter.is_empty() {
+            FilterMatcher::None
+        } else if self.regex_filter {
+            RegexBuilder::new(&self.filter)
+                .case_insensitive(true)
+                .build()
+                .map_or_else(
+                    |_| FilterMatcher::Substring(self.filter.to_lowercase()),
+                    FilterMatcher::Regex,
+                )
+        } else {
+            FilterMatcher::Substring(self.filter.to_lowercase())
+        };
     }
 
     /// Lowercase haystack for filtering: `name_lower` plus the group name.
@@ -681,6 +779,80 @@ mod tests {
     }
 
     #[test]
+    fn regex_filter_supports_alternation() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "bbc|eurosport".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.filter_is_regex());
+        assert_eq!(app.filtered, vec![0, 2]);
+    }
+
+    #[test]
+    fn regex_metacharacters_are_interpreted_as_regex_by_default() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("ESPN+", None), channel("ESPN", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "espn+".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.filter_is_regex());
+        // "+" is a quantifier on "N" here, not a literal character, so both
+        // "ESPN" and "ESPN+" match.
+        assert_eq!(app.filtered.len(), 2);
+    }
+
+    #[test]
+    fn regex_filter_can_be_disabled_for_literal_substring_matching() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("ESPN+", None), channel("ESPN", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        app.set_regex_filter(false);
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "espn+".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(!app.filter_is_regex());
+        // Literal match: only the channel actually named "ESPN+" qualifies.
+        assert_eq!(app.filtered.len(), 1);
+    }
+
+    #[test]
+    fn invalid_regex_falls_back_to_substring_match() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("ESPN[HD]", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        app.handle_key(key(KeyCode::Char('/')));
+        // "espn[" does not compile as a regex (unterminated character
+        // class); this is the common case of typing a pattern that isn't
+        // finished yet, and must still narrow by literal substring instead
+        // of showing "no matches".
+        for c in "espn[".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.filter_regex_invalid());
+        assert!(!app.filter_is_regex());
+        assert_eq!(app.filtered, vec![0]);
+    }
+
+    #[test]
     fn group_selection_combines_with_filter() {
         let mut app = loaded_app();
         // Pick group "News" (cursor 1) in the popup.
@@ -738,6 +910,53 @@ mod tests {
     }
 
     #[test]
+    fn reset_event_keeps_the_text_filter_but_clears_the_group_restriction() {
+        // Regression: a cache-then-refresh Reset (see `crate::loader`)
+        // must drop the group restriction — its GroupId only makes sense
+        // for the batch of groups it was assigned alongside, and group
+        // order depends on first-seen order in the (now-replaced) data —
+        // but the plain-string text filter is safe to keep applying.
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "bbc".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        app.group_filter = Some(0);
+
+        app.on_load_event(LoadEvent::Reset);
+
+        assert!(app.channels.is_empty());
+        assert!(app.groups.is_empty());
+        assert!(app.filtered.is_empty());
+        assert_eq!(app.filter, "bbc");
+        assert_eq!(app.group_filter, None);
+    }
+
+    #[test]
+    fn reset_then_batch_replaces_cached_channels_with_fresh_ones() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Cached", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(filtered_names(&app), ["Cached"]);
+
+        app.on_load_event(LoadEvent::Reset);
+        assert!(app.channels.is_empty());
+
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Fresh", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(filtered_names(&app), ["Fresh"]);
+    }
+
+    #[test]
     fn enter_requests_playback_of_the_selection() {
         let mut app = loaded_app();
         app.handle_key(key(KeyCode::Down));
@@ -790,6 +1009,31 @@ mod tests {
         app.handle_key(key(KeyCode::Char('F')));
         assert_eq!(app.view, View::All);
         assert_eq!(app.filtered.len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opening_favorites_clears_a_leftover_text_filter() {
+        let (store, dir) = temp_store("fav-filter-reset");
+        let mut app = loaded_app_with(Some(store));
+        // Favorite BBC News and CNN.
+        app.selected = 0;
+        app.handle_key(key(KeyCode::Char('f')));
+        app.selected = 1;
+        app.handle_key(key(KeyCode::Char('f')));
+        // Narrow the All view down to Eurosport, which isn't a favorite.
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "eurosport".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.filter, "eurosport");
+        // Opening favorites must show both favorites, not the filtered
+        // (empty) subset carried over from the All view.
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.view, View::Favorites);
+        assert!(app.filter.is_empty());
+        assert_eq!(filtered_names(&app), ["BBC News", "CNN"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -4,15 +4,23 @@
 //! or straight from an Xtream Codes server — through [`PlaylistBuilder`],
 //! sending [`LoadEvent`]s over an mpsc channel so the UI can appear
 //! immediately and fill in while the data is still arriving.
+//!
+//! For Xtream sources, [`load_xtream`] additionally shows a cached copy of
+//! the last successful load first (if one exists in `cache_dir`), so the
+//! list is populated instantly instead of waiting on the network; the
+//! live fetch then runs as usual and, on arriving at its first real
+//! batch, a [`LoadEvent::Reset`] clears the cached rows before the fresh
+//! ones replace them. See [`crate::cache`] for the on-disk side of this.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
+use crate::cache;
 use crate::playlist::{Channel, GroupId, PlaylistBuilder};
 use crate::xtream::Account;
 
@@ -44,6 +52,10 @@ pub enum LoadEvent {
         /// (e.g. a chunked HTTP response).
         percent: Option<u8>,
     },
+    /// Discards everything loaded so far. Sent only when a cached
+    /// playlist was shown first and the live fetch has now reached its
+    /// first real batch of fresh data, replacing it.
+    Reset,
     /// The whole playlist was parsed successfully.
     Finished,
     /// Loading aborted (I/O error, HTTP failure, bad credentials, …).
@@ -52,10 +64,12 @@ pub enum LoadEvent {
 
 /// Spawns the loader thread for `source` and returns the event receiver.
 ///
+/// `cache_dir` is the app's config directory (see [`crate::store::Store::default_dir`]);
+/// `None` on platforms without one simply disables Xtream playlist caching.
 /// The thread finishes on its own; failures are reported as
 /// [`LoadEvent::Failed`] rather than panics.
 #[must_use]
-pub fn spawn(source: Source) -> Receiver<LoadEvent> {
+pub fn spawn(source: Source, cache_dir: Option<PathBuf>) -> Receiver<LoadEvent> {
     let (tx, rx) = channel();
     thread::spawn(move || {
         let result = match source {
@@ -65,7 +79,7 @@ pub fn spawn(source: Source) -> Receiver<LoadEvent> {
             }
             Source::Xtream(account) => {
                 log::info!("loading Xtream playlist: {}", account.display_name());
-                load_xtream(&account, &tx)
+                load_xtream(&account, cache_dir.as_deref(), &tx)
             }
         };
         // A send failure just means the UI is gone; nothing left to do.
@@ -88,18 +102,79 @@ fn load_file(path: &Path, tx: &Sender<LoadEvent>) -> Result<(), String> {
     let total = file.metadata().map(|meta| meta.len()).ok();
     // Local files stay lenient: plain M3U without the header is accepted.
     let mut delivered = 0;
-    let summary = parse_stream(file, total, Header::Optional, &mut delivered, tx)
-        .map_err(|e| e.to_string())?;
+    let summary = parse_stream(
+        file,
+        total,
+        Header::Optional,
+        &mut delivered,
+        &mut false,
+        &mut None,
+        tx,
+    )
+    .map_err(|e| e.to_string())?;
     log::info!("file playlist parsed: {} channels", summary.channels);
     Ok(())
 }
 
-/// Xtream loading: the M3U download (`get.php`) streams and is tried
-/// first; panels that disable it get the channel list rebuilt from the
-/// JSON player API instead.
-fn load_xtream(account: &Account, tx: &Sender<LoadEvent>) -> Result<(), String> {
+/// Shows the last cached playlist (if any) immediately, for a fast first
+/// paint while the live fetch below replaces it. Returns whether anything
+/// was actually shown, so the caller knows a later [`LoadEvent::Reset`]
+/// is needed once live data starts arriving.
+fn load_cached(path: &Path, tx: &Sender<LoadEvent>) -> bool {
+    let Some(file) = cache::open(path) else {
+        return false;
+    };
     let mut delivered = 0;
-    let m3u_error = match load_xtream_m3u(account, &mut delivered, tx) {
+    match parse_stream(
+        file,
+        None,
+        Header::Optional,
+        &mut delivered,
+        &mut false,
+        &mut None,
+        tx,
+    ) {
+        Ok(summary) if summary.channels > 0 => {
+            log::info!(
+                "showing {} cached channels while refreshing",
+                summary.channels
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            log::warn!("cached playlist unreadable ({error}); ignoring");
+            false
+        }
+    }
+}
+
+/// Xtream loading: a cached copy (if any) is shown first for an instant
+/// first paint, then the M3U download (`get.php`) is tried live; panels
+/// that disable it get the channel list rebuilt from the JSON player API
+/// instead. Either live path clears the cached rows (via
+/// [`LoadEvent::Reset`]) only once it actually has fresh data to replace
+/// them with, so a live fetch that never gets that far leaves the cached
+/// copy on screen instead of clearing it for nothing.
+fn load_xtream(
+    account: &Account,
+    cache_dir: Option<&Path>,
+    tx: &Sender<LoadEvent>,
+) -> Result<(), String> {
+    let cache_path = cache_dir.map(|dir| cache::path(dir, &account.cache_key()));
+    let cache_shown = cache_path
+        .as_deref()
+        .is_some_and(|path| load_cached(path, tx));
+    let mut reset_pending = cache_shown;
+
+    let mut delivered = 0;
+    let m3u_error = match load_xtream_m3u(
+        account,
+        &mut delivered,
+        &mut reset_pending,
+        cache_path.as_deref(),
+        tx,
+    ) {
         Ok(()) => return Ok(()),
         Err(error) => error,
     };
@@ -109,26 +184,66 @@ fn load_xtream(account: &Account, tx: &Sender<LoadEvent>) -> Result<(), String> 
         return Err(m3u_error);
     }
     log::warn!("M3U download failed ({m3u_error}); trying the player API instead");
-    load_xtream_api(account, tx)
-        .map_err(|api_error| format!("M3U download failed: {m3u_error}; player API: {api_error}"))
+    match load_xtream_api(account, &mut reset_pending, tx) {
+        Ok(()) => Ok(()),
+        Err(api_error) => {
+            let combined = format!("M3U download failed: {m3u_error}; player API: {api_error}");
+            if cache_shown {
+                // Both live paths failed before producing anything, so the
+                // cached copy was never cleared — keep showing it instead
+                // of replacing a working list with an error.
+                log::warn!("xtream refresh failed ({combined}); keeping cached playlist");
+                Ok(())
+            } else {
+                Err(combined)
+            }
+        }
+    }
 }
 
 fn load_xtream_m3u(
     account: &Account,
     delivered: &mut usize,
+    reset_pending: &mut bool,
+    cache_path: Option<&Path>,
     tx: &Sender<LoadEvent>,
 ) -> Result<(), String> {
     let (reader, total) = account.fetch().map_err(|error| error.to_string())?;
+    let (mut sink, tmp_path) = match cache_path.and_then(cache::create_temp) {
+        Some((file, tmp)) => (Some(file), Some(tmp)),
+        None => (None, None),
+    };
     // get.php always answers with extended M3U, so anything else (CDN
     // challenge page, HTML error, panel notice) must abort with a look at
     // the body rather than turn into junk channels or an empty list.
-    let summary = parse_stream(reader, total, Header::Required, delivered, tx)
-        .map_err(|error| error.to_string())?;
+    let summary = match parse_stream(
+        reader,
+        total,
+        Header::Required,
+        delivered,
+        reset_pending,
+        &mut sink,
+        tx,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            if let Some(tmp) = &tmp_path {
+                cache::discard_temp(tmp);
+            }
+            return Err(error.to_string());
+        }
+    };
     if summary.channels == 0 {
+        if let Some(tmp) = &tmp_path {
+            cache::discard_temp(tmp);
+        }
         return Err(match summary.first_line {
             Some(line) => format!("server sent a playlist with no channels (starts: {line:?})"),
             None => "server sent an empty response — check that the account is active".to_owned(),
         });
+    }
+    if let (Some(tmp), Some(path)) = (&tmp_path, cache_path) {
+        cache::promote(tmp, path);
     }
     log::info!("xtream playlist parsed: {} channels", summary.channels);
     Ok(())
@@ -136,7 +251,11 @@ fn load_xtream_m3u(
 
 /// Builds the channel list from the player API: categories become
 /// groups, and each live stream's URL is synthesized from its id.
-fn load_xtream_api(account: &Account, tx: &Sender<LoadEvent>) -> Result<(), String> {
+fn load_xtream_api(
+    account: &Account,
+    reset_pending: &mut bool,
+    tx: &Sender<LoadEvent>,
+) -> Result<(), String> {
     let categories = account
         .fetch_live_categories()
         .map_err(|error| error.to_string())?;
@@ -186,20 +305,24 @@ fn load_xtream_api(account: &Account, tx: &Sender<LoadEvent>) -> Result<(), Stri
             let new_groups = groups[groups_sent..].to_vec();
             groups_sent = groups.len();
             let percent = u8::try_from(((done + 1) * 100 / total).min(100)).unwrap_or(100);
-            let _ = tx.send(LoadEvent::Batch {
-                channels: std::mem::take(&mut channels),
+            send_batch(
+                reset_pending,
+                tx,
+                std::mem::take(&mut channels),
                 new_groups,
-                skipped: 0,
-                percent: Some(percent),
-            });
+                0,
+                Some(percent),
+            );
         }
     }
-    let _ = tx.send(LoadEvent::Batch {
+    send_batch(
+        reset_pending,
+        tx,
         channels,
-        new_groups: groups[groups_sent..].to_vec(),
-        skipped: 0,
-        percent: Some(100),
-    });
+        groups[groups_sent..].to_vec(),
+        0,
+        Some(100),
+    );
     Ok(())
 }
 
@@ -229,11 +352,23 @@ struct ParseSummary {
 /// With [`Header::Required`], input whose first non-blank line is not
 /// `#EXTM3U` fails as [`std::io::ErrorKind::InvalidData`] before any
 /// batch is sent.
+///
+/// `reset_pending` and `cache_sink` support the Xtream cache-then-refresh
+/// flow (see [`load_xtream`]): when `*reset_pending` is set, a
+/// [`LoadEvent::Reset`] is sent right before the first non-empty batch —
+/// not any earlier, so a fetch that never gets that far never clears a
+/// cached copy already on screen. When `cache_sink` holds a file, every
+/// line read is mirrored into it, so a stream that parses successfully
+/// leaves behind an exact copy to cache; the caller decides whether to
+/// keep it. A write failure just stops the mirroring silently — caching
+/// is never a reason to fail the load.
 fn parse_stream(
     input: impl Read,
     total_bytes: Option<u64>,
     header: Header,
     delivered: &mut usize,
+    reset_pending: &mut bool,
+    cache_sink: &mut Option<File>,
     tx: &Sender<LoadEvent>,
 ) -> std::io::Result<ParseSummary> {
     let mut reader = BufReader::with_capacity(256 * 1024, input);
@@ -250,6 +385,11 @@ fn parse_stream(
             break;
         }
         bytes_read += n as u64;
+        if let Some(sink) = cache_sink
+            && sink.write_all(line.as_bytes()).is_err()
+        {
+            *cache_sink = None;
+        }
         if first_line.is_none() {
             let trimmed = line.trim_start_matches('\u{feff}').trim();
             if !trimmed.is_empty() {
@@ -270,6 +410,7 @@ fn parse_stream(
                 &mut builder,
                 &mut groups_sent,
                 percent(bytes_read, total_bytes),
+                reset_pending,
                 tx,
             );
         }
@@ -279,12 +420,14 @@ fn parse_stream(
     // always send the tail batch even when it carries no channels.
     let mut playlist = builder.finish();
     *delivered += playlist.channels.len();
-    let _ = tx.send(LoadEvent::Batch {
-        channels: std::mem::take(&mut playlist.channels),
-        new_groups: playlist.groups()[groups_sent..].to_vec(),
-        skipped: playlist.skipped,
-        percent: Some(100),
-    });
+    send_batch(
+        reset_pending,
+        tx,
+        std::mem::take(&mut playlist.channels),
+        playlist.groups()[groups_sent..].to_vec(),
+        playlist.skipped,
+        Some(100),
+    );
     Ok(ParseSummary {
         channels: *delivered,
         first_line,
@@ -296,14 +439,41 @@ fn flush(
     builder: &mut PlaylistBuilder,
     groups_sent: &mut usize,
     percent: Option<u8>,
+    reset_pending: &mut bool,
     tx: &Sender<LoadEvent>,
 ) {
     let new_groups = builder.groups()[*groups_sent..].to_vec();
     *groups_sent = builder.groups().len();
-    let _ = tx.send(LoadEvent::Batch {
-        channels: builder.drain_channels(),
+    send_batch(
+        reset_pending,
+        tx,
+        builder.drain_channels(),
         new_groups,
-        skipped: builder.skipped(),
+        builder.skipped(),
+        percent,
+    );
+}
+
+/// Sends `channels` as a [`LoadEvent::Batch`], first sending
+/// [`LoadEvent::Reset`] if `*reset_pending` is set — but only when this
+/// batch actually carries channels, so an empty administrative batch
+/// (e.g. the always-sent tail of an otherwise-empty stream) never clears
+/// a cached copy for nothing. Consumes `reset_pending` on that first use.
+fn send_batch(
+    reset_pending: &mut bool,
+    tx: &Sender<LoadEvent>,
+    channels: Vec<Channel>,
+    new_groups: Vec<String>,
+    skipped: usize,
+    percent: Option<u8>,
+) {
+    if !channels.is_empty() && std::mem::take(reset_pending) {
+        let _ = tx.send(LoadEvent::Reset);
+    }
+    let _ = tx.send(LoadEvent::Batch {
+        channels,
+        new_groups,
+        skipped,
         percent,
     });
 }
@@ -318,6 +488,8 @@ fn percent(read: u64, total: Option<u64>) -> Option<u8> {
 // unwrap is fine in tests (see CLAUDE.md).
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     /// One-shot local HTTP server answering 200 OK with `body`.
@@ -355,6 +527,8 @@ mod tests {
                 LoadEvent::Batch {
                     channels: batch, ..
                 } => channels += batch.len(),
+                // Cached rows are being replaced by fresh ones.
+                LoadEvent::Reset => channels = 0,
                 LoadEvent::Finished => return (channels, None),
                 LoadEvent::Failed(message) => return (channels, Some(message)),
             }
@@ -420,7 +594,7 @@ mod tests {
     #[test]
     fn falls_back_to_player_api_when_m3u_download_is_blocked() {
         let port = serve_panel(3);
-        let rx = spawn(xtream_source(port));
+        let rx = spawn(xtream_source(port), None);
         let mut channels = Vec::new();
         let mut groups = Vec::new();
         for event in &rx {
@@ -433,6 +607,7 @@ mod tests {
                     channels.extend(batch);
                     groups.extend(new_groups);
                 }
+                LoadEvent::Reset => panic!("unexpected reset: no cache was primed"),
                 LoadEvent::Finished => break,
                 LoadEvent::Failed(message) => panic!("load failed: {message}"),
             }
@@ -467,7 +642,7 @@ mod tests {
         // is gone, so the player API fallback cannot connect — the final
         // error must name both failures.
         let port = serve_once("<html>blocked</html>\n");
-        let (channels, error) = drain(&spawn(xtream_source(port)));
+        let (channels, error) = drain(&spawn(xtream_source(port), None));
         assert_eq!(channels, 0);
         let error = error.unwrap();
         assert!(error.contains("M3U download failed"), "got: {error}");
@@ -479,7 +654,7 @@ mod tests {
         // Regression: a 200 response that is not a playlist (challenge
         // page, HTML error, …) used to load as junk channels.
         let port = serve_once("<html><body>Access denied</body></html>\n");
-        let (channels, error) = drain(&spawn(xtream_source(port)));
+        let (channels, error) = drain(&spawn(xtream_source(port), None));
         assert_eq!(channels, 0);
         let error = error.unwrap();
         assert!(error.contains("not send an M3U"), "unexpected: {error}");
@@ -489,7 +664,7 @@ mod tests {
     #[test]
     fn xtream_empty_response_fails() {
         let port = serve_once("");
-        let (channels, error) = drain(&spawn(xtream_source(port)));
+        let (channels, error) = drain(&spawn(xtream_source(port), None));
         assert_eq!(channels, 0);
         assert!(error.unwrap().contains("empty response"));
     }
@@ -498,7 +673,7 @@ mod tests {
     fn xtream_header_only_playlist_fails_but_names_the_header() {
         // An account with zero channels is still a failure worth explaining.
         let port = serve_once("#EXTM3U\n");
-        let (channels, error) = drain(&spawn(xtream_source(port)));
+        let (channels, error) = drain(&spawn(xtream_source(port), None));
         assert_eq!(channels, 0);
         assert!(error.unwrap().contains("#EXTM3U"));
     }
@@ -506,9 +681,99 @@ mod tests {
     #[test]
     fn xtream_valid_playlist_still_loads() {
         let port = serve_once("#EXTM3U\n#EXTINF:-1 group-title=\"News\",One\nhttp://u/1\n");
-        let (channels, error) = drain(&spawn(xtream_source(port)));
+        let (channels, error) = drain(&spawn(xtream_source(port), None));
         assert_eq!(channels, 1);
         assert!(error.is_none());
+    }
+
+    /// Unique temp dir to use as a cache directory, cleaned up by the
+    /// caller once the test is done with it.
+    fn temp_cache_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "m3u-viewer-loader-cache-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Pre-populates the on-disk cache for `cache_key` with `body`, as if
+    /// left behind by a previous successful load.
+    fn seed_cache(dir: &Path, cache_key: &str, body: &str) {
+        let path = cache::path(dir, cache_key);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+    }
+
+    #[test]
+    fn cached_playlist_survives_a_totally_failed_live_refresh() {
+        let dir = temp_cache_dir("survive");
+        // get.php answers with an HTML block page (M3U parse fails before
+        // any batch), then the listener is gone, so the player API
+        // fallback cannot connect either — both live paths fail before
+        // ever clearing the cache.
+        let port = serve_once("<html>blocked</html>\n");
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        seed_cache(
+            &dir,
+            &account.cache_key(),
+            "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
+        );
+
+        let (channels, error) = drain(&spawn(Source::Xtream(account), Some(dir.clone())));
+        assert_eq!(channels, 1, "the cached channel should still be showing");
+        assert!(
+            error.is_none(),
+            "expected success (cache kept), got: {error:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn successful_live_refresh_replaces_cache_and_updates_it_on_disk() {
+        let dir = temp_cache_dir("refresh");
+        let body = "#EXTM3U\n#EXTINF:-1 group-title=\"News\",Fresh\nhttp://u/fresh\n";
+        let port = serve_once(body);
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let cache_key = account.cache_key();
+        seed_cache(
+            &dir,
+            &cache_key,
+            "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
+        );
+
+        let rx = spawn(Source::Xtream(account), Some(dir.clone()));
+        let mut saw_cached_batch = false;
+        let mut saw_reset = false;
+        let mut names_after_reset = Vec::new();
+        for event in &rx {
+            match event {
+                LoadEvent::Batch { channels, .. } => {
+                    if saw_reset {
+                        names_after_reset.extend(channels.into_iter().map(|c| c.name));
+                    } else if channels.iter().any(|c| c.name == "Cached") {
+                        saw_cached_batch = true;
+                    }
+                }
+                LoadEvent::Reset => saw_reset = true,
+                LoadEvent::Finished => break,
+                LoadEvent::Failed(message) => panic!("load failed: {message}"),
+            }
+        }
+        assert!(saw_cached_batch, "cached channel should have shown first");
+        assert!(saw_reset, "live refresh should reset before replacing");
+        assert_eq!(names_after_reset, ["Fresh"]);
+
+        let cached_text = fs::read_to_string(cache::path(&dir, &cache_key)).unwrap();
+        assert!(
+            cached_text.contains("Fresh"),
+            "cache not updated: {cached_text}"
+        );
+        assert!(
+            !cached_text.contains("Cached"),
+            "stale cache kept: {cached_text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -519,7 +784,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("empty.m3u");
         std::fs::write(&path, "#EXTM3U\n").unwrap();
-        let (channels, error) = drain(&spawn(Source::File(path)));
+        let (channels, error) = drain(&spawn(Source::File(path), None));
         assert_eq!(channels, 0);
         assert!(error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
