@@ -9,6 +9,7 @@ pub mod epg;
 pub mod loader;
 pub mod player;
 pub mod playlist;
+mod private_file;
 pub mod store;
 pub mod ui;
 pub mod xtream;

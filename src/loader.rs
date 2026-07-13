@@ -368,24 +368,36 @@ fn write_m3u_entry(
     tvg_id: Option<&str>,
     group: Option<&str>,
 ) {
-    use std::fmt::Write as _;
-
     let Some(file) = sink else { return };
-    let mut line = String::from("#EXTINF:-1");
-    if let Some(id) = tvg_id {
-        let _ = write!(line, " tvg-id=\"{id}\"");
-    }
-    if let Some(group) = group {
-        let _ = write!(line, " group-title=\"{group}\"");
-    }
-    line.push(',');
-    line.push_str(name);
-    line.push('\n');
-    line.push_str(url);
-    line.push('\n');
+    let line = format_m3u_entry(name, url, tvg_id, group);
     if file.write_all(line.as_bytes()).is_err() {
         *sink = None;
     }
+}
+
+fn format_m3u_entry(name: &str, url: &str, tvg_id: Option<&str>, group: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    let mut line = String::from("#EXTINF:-1");
+    if let Some(id) = tvg_id {
+        let id = encode_m3u_text(id);
+        let _ = write!(line, " tvg-id=\"{id}\"");
+    }
+    if let Some(group) = group {
+        let group = encode_m3u_text(group);
+        let _ = write!(line, " group-title=\"{group}\"");
+    }
+    line.push(',');
+    line.push_str(&encode_m3u_text(name));
+    line.push('\n');
+    line.push_str(url);
+    line.push('\n');
+    line
+}
+
+fn encode_m3u_text(text: &str) -> String {
+    let single_line = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    quick_xml::escape::escape(&single_line).into_owned()
 }
 
 /// Whether the input must start with the `#EXTM3U` header.
@@ -866,6 +878,30 @@ mod tests {
         assert!(cached_text.contains("group-title=\"News\""));
         assert!(cached_text.contains(",One\n"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_cache_entries_round_trip_special_characters() {
+        let text = format!(
+            "#EXTM3U\n{}",
+            format_m3u_entry(
+                "One\r\n\"Prime\" & Live",
+                "http://u/one",
+                Some("one&\".tv"),
+                Some("Kids \"R\" & News\nLive"),
+            )
+        );
+
+        let playlist = crate::playlist::Playlist::from_reader(text.as_bytes()).unwrap();
+        assert_eq!(playlist.channels.len(), 1);
+        let channel = &playlist.channels[0];
+        assert_eq!(channel.name, "One \"Prime\" & Live");
+        assert_eq!(channel.url, "http://u/one");
+        assert_eq!(channel.tvg_id.as_deref(), Some("one&\".tv"));
+        assert_eq!(
+            playlist.group_name(channel.group.unwrap()),
+            Some("Kids \"R\" & News Live")
+        );
     }
 
     #[test]

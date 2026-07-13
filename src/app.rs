@@ -525,6 +525,7 @@ impl App {
     /// the same budget the previous plain-append approach spent, now
     /// spent keeping alphabetical order instead of arrival order.
     fn absorb_channels(&mut self, start: usize) {
+        let selected_channel = self.filtered.get(self.selected).copied();
         let mut new_indices: Vec<usize> = (start..self.channels.len()).collect();
         new_indices.sort_by(|&a, &b| self.name_keys[a].cmp(&self.name_keys[b]));
         self.sorted_channels = merge_by_key(&self.sorted_channels, &new_indices, &self.name_keys);
@@ -539,6 +540,14 @@ impl App {
             // Favorites/recents views need the store checks and (for
             // recents) store-defined ordering.
             self.recompute_filter();
+        }
+        if let Some(selected_channel) = selected_channel
+            && let Some(position) = self
+                .filtered
+                .iter()
+                .position(|&index| index == selected_channel)
+        {
+            self.selected = position;
         }
     }
 
@@ -753,6 +762,32 @@ mod tests {
         });
         app.on_load_event(LoadEvent::Finished);
         assert_eq!(filtered_names(&app), ["apple", "Kiwi", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn later_batches_preserve_the_selected_channel() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Mango", None), channel("Zebra", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.selected = 1;
+
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("apple", None), channel("Kiwi", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+
+        assert_eq!(app.selected, 3);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_play_request().unwrap().url,
+            "http://example.com/Zebra"
+        );
     }
 
     #[test]

@@ -14,6 +14,8 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
+use crate::private_file;
+
 /// Where an account's cached playlist lives under the app's config
 /// directory, keyed by [`crate::xtream::Account::cache_key`].
 #[must_use]
@@ -26,7 +28,7 @@ pub fn path(config_dir: &Path, account_key: &str) -> PathBuf {
 /// Opens the cached playlist for reading, if it exists.
 #[must_use]
 pub fn open(path: &Path) -> Option<File> {
-    File::open(path).ok()
+    private_file::open(path).ok()
 }
 
 /// Opens a fresh temp file beside `path` to stream a new cache into
@@ -36,9 +38,9 @@ pub fn open(path: &Path) -> Option<File> {
 #[must_use]
 pub fn create_temp(path: &Path) -> Option<(File, PathBuf)> {
     let parent = path.parent()?;
-    fs::create_dir_all(parent).ok()?;
+    private_file::create_dir_all(parent).ok()?;
     let tmp = unique_tmp(path);
-    let file = File::create(&tmp).ok()?;
+    let file = private_file::create(&tmp).ok()?;
     Some((file, tmp))
 }
 

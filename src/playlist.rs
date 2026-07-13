@@ -134,9 +134,7 @@ impl PlaylistBuilder {
             // The header may name an XMLTV guide (`url-tvg`, or the
             // `x-tvg-url` spelling some generators use).
             if self.tvg_url.is_none() {
-                self.tvg_url = attribute(rest, "url-tvg")
-                    .or_else(|| attribute(rest, "x-tvg-url"))
-                    .map(str::to_owned);
+                self.tvg_url = attribute(rest, "url-tvg").or_else(|| attribute(rest, "x-tvg-url"));
             }
         } else if text.starts_with('#') {
             // Unknown directives are ignored.
@@ -231,9 +229,9 @@ struct ExtInf {
 fn parse_extinf(payload: &str) -> Option<ExtInf> {
     let (meta, name) = split_at_unquoted_comma(payload)?;
     Some(ExtInf {
-        name: name.trim().to_owned(),
-        tvg_id: attribute(meta, "tvg-id").map(str::to_owned),
-        group: attribute(meta, "group-title").map(str::to_owned),
+        name: decode_text(name.trim()),
+        tvg_id: attribute(meta, "tvg-id"),
+        group: attribute(meta, "group-title"),
     })
 }
 
@@ -256,8 +254,10 @@ fn split_at_unquoted_comma(s: &str) -> Option<(&str, &str)> {
 /// any tokens that are not `name="value"` pairs are skipped), so `key`
 /// matches only as a whole attribute name — never as a substring of another
 /// name (`x-tvg-id`) and never inside another attribute's quoted value.
-/// Attributes without a closing quote are treated as absent.
-fn attribute<'a>(meta: &'a str, key: &str) -> Option<&'a str> {
+/// Attributes without a closing quote are treated as absent. XML entities
+/// are decoded because generated and third-party M3U files commonly use them
+/// to represent quotes and ampersands inside values.
+fn attribute(meta: &str, key: &str) -> Option<String> {
     let bytes = meta.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -288,12 +288,16 @@ fn attribute<'a>(meta: &'a str, key: &str) -> Option<&'a str> {
                 let value = &meta[value_start..i];
                 i += 1; // Consume the closing quote.
                 if name == key {
-                    return Some(value);
+                    return Some(decode_text(value));
                 }
             }
         }
     }
     None
+}
+
+fn decode_text(text: &str) -> String {
+    quick_xml::escape::unescape(text).map_or_else(|_| text.to_owned(), std::borrow::Cow::into_owned)
 }
 
 /// Interns `name`, returning the id of an existing entry when possible.
@@ -386,6 +390,20 @@ mod tests {
         assert_eq!(
             playlist.group_name(channel.group.unwrap()),
             Some("News, Local")
+        );
+    }
+
+    #[test]
+    fn decodes_xml_entities_in_metadata_and_names() {
+        let playlist = parse(
+            "#EXTINF:-1 tvg-id=\"one&amp;&quot;.tv\" group-title=\"Kids &quot;R&quot; Us\",A &amp; B\nhttp://u\n",
+        );
+        let channel = &playlist.channels[0];
+        assert_eq!(channel.name, "A & B");
+        assert_eq!(channel.tvg_id.as_deref(), Some("one&\".tv"));
+        assert_eq!(
+            playlist.group_name(channel.group.unwrap()),
+            Some("Kids \"R\" Us")
         );
     }
 

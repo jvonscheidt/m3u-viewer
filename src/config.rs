@@ -5,14 +5,17 @@
 //! recents), returning [`Config::default`] when the file does not exist yet.
 //! CLI arguments always take precedence over stored values.
 //!
-//! **Security note:** Xtream credentials are written in plaintext. The file
-//! lives in the user's private config directory; treat it accordingly.
+//! **Security note:** Xtream credentials are written in plaintext. Persistent
+//! files are protected by the user's filesystem access controls and use mode
+//! `0600` on Unix, but they are not encrypted.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::private_file;
 
 const CONFIG_FILE: &str = "config.toml";
 
@@ -104,7 +107,7 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = fs::read_to_string(path)?;
+        let text = private_file::read_to_string(path)?;
         Ok(toml::from_str(&text)?)
     }
 
@@ -118,10 +121,11 @@ impl Config {
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let text = toml::to_string_pretty(self).map_err(|e| ConfigError::Write(e.to_string()))?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ConfigError::Write(e.to_string()))?;
+            private_file::create_dir_all(parent).map_err(|e| ConfigError::Write(e.to_string()))?;
         }
         let tmp = unique_tmp(path);
-        let write_and_rename = fs::write(&tmp, &text).and_then(|()| fs::rename(&tmp, path));
+        let write_and_rename =
+            private_file::write(&tmp, text.as_bytes()).and_then(|()| fs::rename(&tmp, path));
         if let Err(e) = write_and_rename {
             let _ = fs::remove_file(&tmp);
             return Err(ConfigError::Write(e.to_string()));
