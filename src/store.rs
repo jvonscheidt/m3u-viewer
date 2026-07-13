@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::private_file;
+
 /// Maximum number of remembered recently played channels.
 pub const RECENTS_CAP: usize = 50;
 
@@ -106,7 +108,7 @@ impl Store {
     }
 
     fn save(&self, file: &str, list: &[String]) -> Result<(), StoreError> {
-        fs::create_dir_all(&self.dir)?;
+        private_file::create_dir_all(&self.dir)?;
         let json = serde_json::to_string_pretty(list)?;
         atomic_write(&self.dir.join(file), &json)?;
         Ok(())
@@ -118,7 +120,7 @@ const RECENTS_FILE: &str = "recents.json";
 
 /// Reads a JSON string array, treating any problem as "empty".
 fn read_list(path: &Path) -> Vec<String> {
-    fs::read_to_string(path)
+    private_file::read_to_string(path)
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default()
@@ -130,7 +132,8 @@ fn read_list(path: &Path) -> Vec<String> {
 /// other's temp file before their renames.
 fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
     let tmp = unique_tmp(path);
-    let result = fs::write(&tmp, contents).and_then(|()| fs::rename(&tmp, path));
+    let result =
+        private_file::write(&tmp, contents.as_bytes()).and_then(|()| fs::rename(&tmp, path));
     if result.is_err() {
         // Best effort: don't leave the temp file behind on failure.
         let _ = fs::remove_file(&tmp);

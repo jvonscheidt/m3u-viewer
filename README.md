@@ -126,9 +126,11 @@ macOS `~/Library/Application Support/m3u-viewer/`.
 | `m3u-viewer.log` | Diagnostic log (startup, loading, playback); overwritten each run |
 
 Favorites and recents are keyed by stream URL, so they survive playlist
-re-downloads and re-ordering. **`config.toml` stores Xtream credentials
-in plaintext** — the file is private to your user account but is not
-encrypted. Deleting the directory resets everything.
+re-downloads and re-ordering. **Xtream credentials are stored in plaintext**
+in `config.toml` and in stream URLs inside the cache, favorites, and recents
+files. These files are protected by the user account's filesystem access
+controls (and created with mode `0600` on Unix), but they are not encrypted.
+Deleting the directory resets everything.
 
 ## Specification
 
