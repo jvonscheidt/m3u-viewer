@@ -67,3 +67,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: gh release upload "${{ github.ref_name }}" "m3u-viewer-${{ github.ref_name }}-${{ matrix.target }}".* --clobber
+
+  publish-winget:
+    name: publish to winget-pkgs
+    needs: build
+    # winget-create is only supported on Windows
+    runs-on: windows-latest
+    # winget-create will read this environment variable to access the GitHub
+    # token needed for submitting a PR. See https://aka.ms/winget-create-token
+    env:
+      WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+    steps:
+      - name: Submit package using wingetcreate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $packageId = "jvonscheidt.m3u-viewer"
+          $packageVersion = "${{ github.ref_name }}".TrimStart("v")
+
+          $installerUrl = gh release view "${{ github.ref_name }}" `
+            --repo "${{ github.repository }}" `
+            --json assets `
+            --jq '.assets[] | select(.name | endswith("x86_64-pc-windows-msvc.zip")) | .url'
+
+          curl.exe -JLO https://aka.ms/wingetcreate/latest
+          .\wingetcreate.exe update $packageId `
+            --version $packageVersion `
+            --urls "$installerUrl" `
+            --submit
