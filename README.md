@@ -31,6 +31,7 @@ while you browse (progress shows in the status bar).
 m3u-viewer <playlist.m3u> [--epg <url-or-file>] [--vlc <path>] [--vlc-reuse-instance]
 m3u-viewer --xtream <server> --username <user> --password <pass> [--epg <url-or-file>] [--user-agent <ua>] [--vlc <path>] [--vlc-reuse-instance] [--save-config]
 m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
+m3u-viewer --version
 ```
 
 - `<playlist.m3u>` — the playlist to open (`.m3u` or `.m3u8`, UTF-8).
@@ -67,6 +68,7 @@ m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
 - `--vlc-reuse-instance` — play channels in a single running VLC window
   (VLC's `--one-instance`) instead of opening a new window per channel.
   Can also be set as `vlc_reuse_instance = true` in `config.toml`.
+- `--version`, `-V` — print the application version and exit.
 
 ### Programme guide (EPG)
 
