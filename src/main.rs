@@ -21,7 +21,18 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 const USAGE: &str = "usage: m3u-viewer <playlist.m3u> [--epg <url-or-file>] [--vlc <path>] [--vlc-reuse-instance]\n       \
      m3u-viewer --xtream <server> --username <user> --password <pass> [--epg <url-or-file>] [--user-agent <ua>] [--vlc <path>] [--vlc-reuse-instance] [--save-config]\n       \
-     m3u-viewer [--vlc <path>]   (uses saved Xtream credentials from config)";
+     m3u-viewer [--vlc <path>]   (uses saved Xtream credentials from config)\n       \
+     m3u-viewer --version";
+
+const VERSION: &str = concat!("m3u-viewer ", env!("CARGO_PKG_VERSION"));
+
+fn version_requested(args: &[OsString]) -> Result<bool> {
+    let has_version = args.iter().any(|arg| arg == "--version" || arg == "-V");
+    if has_version && args.len() != 1 {
+        bail!("--version cannot be combined with other arguments\n{USAGE}");
+    }
+    Ok(has_version)
+}
 
 /// Parsed command line.
 struct Args {
@@ -58,6 +69,8 @@ fn looks_like_flag(arg: &OsStr) -> bool {
                 | "--epg"
                 | "--vlc-reuse-instance"
                 | "--save-config"
+                | "--version"
+                | "-V"
         )
     )
 }
@@ -224,6 +237,12 @@ fn init_logger(path: Option<&Path>) {
 }
 
 fn main() -> Result<()> {
+    let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
+    if version_requested(&raw_args)? {
+        println!("{VERSION}");
+        return Ok(());
+    }
+
     let config_path = Config::default_path();
     let log_path = config_path
         .as_ref()
@@ -253,7 +272,7 @@ fn main() -> Result<()> {
         Config::default()
     };
 
-    let args = parse_args(std::env::args_os().skip(1), &config)?;
+    let args = parse_args(raw_args.into_iter(), &config)?;
 
     if let Source::File(path) = &args.source
         && !path.is_file()
@@ -625,5 +644,18 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("--username needs a value"));
+    }
+
+    #[test]
+    fn version_flags_are_recognized_without_a_source() {
+        assert!(version_requested(&[OsString::from("--version")]).unwrap());
+        assert!(version_requested(&[OsString::from("-V")]).unwrap());
+    }
+
+    #[test]
+    fn version_flag_cannot_be_combined_with_other_arguments() {
+        let error = version_requested(&[OsString::from("--version"), OsString::from("list.m3u")])
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"));
     }
 }
