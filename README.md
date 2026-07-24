@@ -4,6 +4,14 @@ A fast terminal viewer for large M3U/M3U8 playlists, written in Rust.
 Browse, filter, and play IPTV channel lists that are far too big for a
 text editor — smoothly, even at 100 MB.
 
+## Installation
+
+On Windows, install with [WinGet](https://learn.microsoft.com/windows/package-manager/winget/):
+
+```console
+winget install --id jvonscheidt.m3u-viewer --exact
+```
+
 ## Usage
 
 ### Build & run
