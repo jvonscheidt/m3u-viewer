@@ -238,6 +238,19 @@ fn init_logger(path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Loads favorites and recents, disabling persistence rather than risking
+/// overwriting an unreadable store.
+fn load_store() -> Option<Store> {
+    match Store::default_dir().map(Store::load).transpose() {
+        Ok(store) => store,
+        Err(error) => {
+            log::warn!("persistent store disabled: {error}");
+            eprintln!("warning: persistent favorites/recents disabled: {error}");
+            None
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
     if version_requested(&raw_args)? {
@@ -319,14 +332,7 @@ fn main() -> Result<()> {
     // error surfaces in the status bar on the first play attempt.
     let player = Player::discover(args.vlc_override.as_deref())
         .map(|player| player.with_reuse_instance(args.vlc_reuse_instance));
-    let store = match Store::default_dir().map(Store::load).transpose() {
-        Ok(store) => store,
-        Err(error) => {
-            log::warn!("persistent store disabled: {error}");
-            eprintln!("warning: persistent favorites/recents disabled: {error}");
-            None
-        }
-    };
+    let store = load_store();
     // An explicit --epg/config source wins; an Xtream account brings its
     // own guide endpoint. Plain files without either may still name one
     // in their #EXTM3U header — handled inside the event loop, where the
