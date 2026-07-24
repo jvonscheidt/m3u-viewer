@@ -5,6 +5,7 @@
 //! written atomically (temp file + rename) on every change.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,22 @@ pub const RECENTS_CAP: usize = 50;
 /// Failure to persist a change (the in-memory state is still updated).
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// Reading a persisted list failed.
+    #[error("could not read {}: {source}", path.display())]
+    Read {
+        /// File that could not be read.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        source: io::Error,
+    },
+    /// A persisted list was not valid JSON.
+    #[error("could not parse {}: {source}", path.display())]
+    Decode {
+        /// File containing invalid data.
+        path: PathBuf,
+        /// Underlying JSON error.
+        source: serde_json::Error,
+    },
     /// Writing the JSON file failed.
     #[error("could not save: {0}")]
     Io(#[from] io::Error),
@@ -35,6 +52,16 @@ pub struct Store {
     recents: Vec<String>,
 }
 
+impl fmt::Debug for Store {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Store")
+            .field("favorites", &self.favorites.len())
+            .field("recents", &self.recents.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Store {
     /// The default per-user config directory, if the platform has one.
     #[must_use]
@@ -45,20 +72,24 @@ impl Store {
 
     /// Opens the store in `dir`, reading whatever state exists there.
     ///
-    /// Missing or unreadable files simply yield an empty store: favorites
-    /// are a convenience, never a reason to refuse to start.
-    #[must_use]
-    pub fn load(dir: PathBuf) -> Self {
-        let favorites = read_list(&dir.join(FAVORITES_FILE))
+    /// Missing files yield empty lists.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Read`] or [`StoreError::Decode`] when an existing file
+    /// cannot be read or decoded. Callers should disable persistence rather
+    /// than replace unreadable data with an empty list.
+    pub fn load(dir: PathBuf) -> Result<Self, StoreError> {
+        let favorites = read_list(&dir.join(FAVORITES_FILE))?
             .into_iter()
             .collect::<HashSet<_>>();
-        let mut recents = read_list(&dir.join(RECENTS_FILE));
+        let mut recents = read_list(&dir.join(RECENTS_FILE))?;
         recents.truncate(RECENTS_CAP);
-        Self {
+        Ok(Self {
             dir,
             favorites,
             recents,
-        }
+        })
     }
 
     /// Whether `url` is currently a favorite.
@@ -118,12 +149,22 @@ impl Store {
 const FAVORITES_FILE: &str = "favorites.json";
 const RECENTS_FILE: &str = "recents.json";
 
-/// Reads a JSON string array, treating any problem as "empty".
-fn read_list(path: &Path) -> Vec<String> {
-    private_file::read_to_string(path)
-        .ok()
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
+/// Reads a JSON string array, treating only a missing file as empty.
+fn read_list(path: &Path) -> Result<Vec<String>, StoreError> {
+    let json = match private_file::read_to_string(path) {
+        Ok(json) => json,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(StoreError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    serde_json::from_str(&json).map_err(|source| StoreError::Decode {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Writes via a sibling temp file and rename, so a crash mid-write can
@@ -163,7 +204,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("m3u-viewer-store-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        Store::load(dir)
+        Store::load(dir).unwrap()
     }
 
     #[test]
@@ -174,11 +215,11 @@ mod tests {
         assert!(store.is_favorite("http://u/1"));
 
         // A fresh load from the same directory sees the favorite.
-        let reloaded = Store::load(store.dir.clone());
+        let reloaded = Store::load(store.dir.clone()).unwrap();
         assert!(reloaded.is_favorite("http://u/1"));
 
         assert!(!store.toggle_favorite("http://u/1").unwrap());
-        let reloaded = Store::load(store.dir.clone());
+        let reloaded = Store::load(store.dir.clone()).unwrap();
         assert!(!reloaded.is_favorite("http://u/1"));
         let _ = fs::remove_dir_all(&store.dir);
     }
@@ -204,21 +245,24 @@ mod tests {
             1
         );
 
-        let reloaded = Store::load(store.dir.clone());
+        let reloaded = Store::load(store.dir.clone()).unwrap();
         assert_eq!(reloaded.recents(), store.recents());
         let _ = fs::remove_dir_all(&store.dir);
     }
 
     #[test]
-    fn corrupt_files_load_as_empty() {
+    fn corrupt_files_return_an_error_without_overwriting_data() {
         let dir =
             std::env::temp_dir().join(format!("m3u-viewer-store-corrupt-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(FAVORITES_FILE), "not json at all").unwrap();
         fs::write(dir.join(RECENTS_FILE), "{\"wrong\": \"shape\"}").unwrap();
-        let store = Store::load(dir.clone());
-        assert!(store.recents().is_empty());
-        assert!(!store.is_favorite("anything"));
+        let error = Store::load(dir.clone()).unwrap_err();
+        assert!(matches!(error, StoreError::Decode { .. }));
+        assert_eq!(
+            fs::read_to_string(dir.join(FAVORITES_FILE)).unwrap(),
+            "not json at all"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

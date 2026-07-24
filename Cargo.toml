@@ -5,6 +5,8 @@ edition = "2024"
 description = "Fast terminal viewer for large M3U playlists"
 license = "Apache-2.0"
 repository = "https://github.com/jvonscheidt/m3u-viewer"
+keywords = ["m3u", "iptv", "playlist", "tui", "vlc"]
+categories = ["command-line-utilities", "multimedia"]
 
 [dependencies]
 anyhow = "1.0.103"

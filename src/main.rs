@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use m3u_viewer::app::App;
 use m3u_viewer::config::{Config, XtreamConfig};
 use m3u_viewer::epg::{self, EpgEvent, EpgSource};
@@ -138,28 +138,28 @@ impl CliFlags {
         // and no playlist file was provided either.
         if self.server.is_none()
             && self.playlist.is_none()
-            && let Some(ref xtream_cfg) = config.xtream
+            && let Some(xtream_cfg) = config.xtream()
         {
-            self.server = Some(xtream_cfg.server.clone());
+            self.server = Some(xtream_cfg.server().to_owned());
             if self.username.is_none() {
-                self.username = Some(xtream_cfg.username.clone());
+                self.username = Some(xtream_cfg.username().to_owned());
             }
             if self.password.is_none() {
-                self.password = Some(xtream_cfg.password.clone());
+                self.password = Some(xtream_cfg.password().to_owned());
             }
         }
         if self.vlc_override.is_none() {
-            self.vlc_override.clone_from(&config.vlc_path);
+            self.vlc_override = config.vlc_path().map(Path::to_path_buf);
         }
         if self.user_agent.is_none() {
-            self.user_agent.clone_from(&config.user_agent);
+            self.user_agent = config.user_agent().map(str::to_owned);
         }
         if self.epg.is_none() {
-            self.epg.clone_from(&config.epg_url);
+            self.epg = config.epg_url().map(str::to_owned);
         }
         // A plain boolean flag can't express "off", so it only ever adds
         // to what config already enabled.
-        self.vlc_reuse_instance |= config.vlc_reuse_instance;
+        self.vlc_reuse_instance |= config.vlc_reuse_instance();
     }
 }
 
@@ -220,20 +220,22 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
 }
 
 /// Initialises file-only logging to `path`, truncating any previous run's
-/// log. Silently does nothing if `path` is `None` or the file cannot be
-/// created.
-fn init_logger(path: Option<&Path>) {
-    let Some(path) = path else { return };
+/// log. A missing platform log path disables logging.
+fn init_logger(path: Option<&Path>) -> Result<()> {
+    let Some(path) = path else { return Ok(()) };
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create log directory {}", parent.display()))?;
     }
-    if let Ok(file) = std::fs::File::create(path) {
-        let _ = simplelog::WriteLogger::init(
-            simplelog::LevelFilter::Info,
-            simplelog::Config::default(),
-            file,
-        );
-    }
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("could not create log file {}", path.display()))?;
+    simplelog::WriteLogger::init(
+        simplelog::LevelFilter::Info,
+        simplelog::Config::default(),
+        file,
+    )
+    .map_err(|_| anyhow!("could not register file logger"))?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -247,7 +249,7 @@ fn main() -> Result<()> {
     let log_path = config_path
         .as_ref()
         .map(|p| p.with_file_name("m3u-viewer.log"));
-    init_logger(log_path.as_deref());
+    init_logger(log_path.as_deref())?;
     log::info!("m3u-viewer {} starting", env!("CARGO_PKG_VERSION"));
 
     let config = if let Some(ref path) = config_path {
@@ -284,23 +286,22 @@ fn main() -> Result<()> {
         let xtream = match &args.source {
             Source::Xtream(account) => {
                 let (server, username, password) = account.credentials();
-                Some(XtreamConfig {
-                    server: server.to_owned(),
-                    username: username.to_owned(),
-                    password: password.to_owned(),
-                })
+                Some(XtreamConfig::new(
+                    server.to_owned(),
+                    username.to_owned(),
+                    password.to_owned(),
+                ))
             }
             // Preserve existing Xtream config when saving with a file source.
-            Source::File(_) => config.xtream,
+            Source::File(_) => config.xtream().cloned(),
         };
-        let new_config = Config {
-            xtream,
-            vlc_path: args.vlc_override.clone(),
-            user_agent: args.user_agent.clone(),
-            epg_url: args.epg.clone(),
-            regex_filter: config.regex_filter,
-            vlc_reuse_instance: args.vlc_reuse_instance,
-        };
+        let new_config = Config::default()
+            .with_xtream(xtream)
+            .with_vlc_path(args.vlc_override.clone())
+            .with_user_agent(args.user_agent.clone())
+            .with_epg_url(args.epg.clone())
+            .with_regex_filter(config.regex_filter())
+            .with_vlc_reuse_instance(args.vlc_reuse_instance);
         match config_path {
             Some(ref path) => {
                 if let Err(e) = new_config.save(path) {
@@ -318,7 +319,14 @@ fn main() -> Result<()> {
     // error surfaces in the status bar on the first play attempt.
     let player = Player::discover(args.vlc_override.as_deref())
         .map(|player| player.with_reuse_instance(args.vlc_reuse_instance));
-    let store = Store::default_dir().map(Store::load);
+    let store = match Store::default_dir().map(Store::load).transpose() {
+        Ok(store) => store,
+        Err(error) => {
+            log::warn!("persistent store disabled: {error}");
+            eprintln!("warning: persistent favorites/recents disabled: {error}");
+            None
+        }
+    };
     // An explicit --epg/config source wins; an Xtream account brings its
     // own guide endpoint. Plain files without either may still name one
     // in their #EXTM3U header — handled inside the event loop, where the
@@ -343,7 +351,7 @@ fn main() -> Result<()> {
         &player,
         args.display_name,
         store,
-        config.regex_filter,
+        config.regex_filter(),
         epg_runtime,
     );
     ratatui::restore();
@@ -408,12 +416,12 @@ fn run(
         {
             app.handle_key(key);
             if let Some(request) = app.take_play_request() {
-                match player.as_ref().map(|p| p.play(&request.url)) {
+                match player.as_ref().map(|p| p.play(request.url())) {
                     Ok(Ok(())) => {
                         // Confirmation first: a failing recents save then
                         // overrides it with its own error message.
-                        app.set_message(format!("▶ {} in VLC", request.name));
-                        app.record_played(&request.url);
+                        app.set_message(format!("▶ {} in VLC", request.name()));
+                        app.record_played(request.url());
                     }
                     Ok(Err(error)) => app.set_message(format!("✗ {error}")),
                     Err(error) => app.set_message(format!("✗ {error}")),
@@ -482,14 +490,11 @@ mod tests {
 
     #[test]
     fn config_xtream_fallback_when_no_cli_source() {
-        let config = Config {
-            xtream: Some(XtreamConfig {
-                server: "http://example.com".to_owned(),
-                username: "u".to_owned(),
-                password: "p".to_owned(),
-            }),
-            ..Config::default()
-        };
+        let config = Config::default().with_xtream(Some(XtreamConfig::new(
+            "http://example.com".to_owned(),
+            "u".to_owned(),
+            "p".to_owned(),
+        )));
         let args = parse_args(std::iter::empty(), &config).unwrap();
         assert!(matches!(args.source, Source::Xtream(_)));
         assert_eq!(args.display_name, "xtream:example.com");
@@ -497,20 +502,14 @@ mod tests {
 
     #[test]
     fn config_vlc_path_fallback() {
-        let config = Config {
-            vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
-            ..Config::default()
-        };
+        let config = Config::default().with_vlc_path(Some(PathBuf::from("/usr/bin/vlc")));
         let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
         assert_eq!(args.vlc_override, Some(PathBuf::from("/usr/bin/vlc")));
     }
 
     #[test]
     fn cli_vlc_overrides_config() {
-        let config = Config {
-            vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
-            ..Config::default()
-        };
+        let config = Config::default().with_vlc_path(Some(PathBuf::from("/usr/bin/vlc")));
         let args = parse_args(
             ["list.m3u", "--vlc", "/opt/vlc"].iter().map(OsString::from),
             &config,
@@ -537,10 +536,7 @@ mod tests {
 
     #[test]
     fn config_user_agent_fallback_and_cli_override() {
-        let config = Config {
-            user_agent: Some("FromConfig/1.0".to_owned()),
-            ..Config::default()
-        };
+        let config = Config::default().with_user_agent(Some("FromConfig/1.0".to_owned()));
         let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
         assert_eq!(args.user_agent, Some("FromConfig/1.0".to_owned()));
 
@@ -562,10 +558,7 @@ mod tests {
 
     #[test]
     fn config_epg_fallback_and_cli_override() {
-        let config = Config {
-            epg_url: Some("http://config/epg.xml".to_owned()),
-            ..Config::default()
-        };
+        let config = Config::default().with_epg_url(Some("http://config/epg.xml".to_owned()));
         let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
         assert_eq!(args.epg, Some("http://config/epg.xml".to_owned()));
 
@@ -587,10 +580,7 @@ mod tests {
 
     #[test]
     fn vlc_reuse_instance_falls_back_to_config_and_cli_cannot_disable_it() {
-        let config = Config {
-            vlc_reuse_instance: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_vlc_reuse_instance(true);
         let args = parse_args(["list.m3u"].iter().map(OsString::from), &config).unwrap();
         assert!(args.vlc_reuse_instance);
     }
@@ -614,14 +604,11 @@ mod tests {
     fn cli_credentials_override_config() {
         // Regression: partial CLI credentials must win over stored ones
         // rather than being silently replaced by the whole config block.
-        let config = Config {
-            xtream: Some(XtreamConfig {
-                server: "http://example.com".to_owned(),
-                username: "stored".to_owned(),
-                password: "stored-pw".to_owned(),
-            }),
-            ..Config::default()
-        };
+        let config = Config::default().with_xtream(Some(XtreamConfig::new(
+            "http://example.com".to_owned(),
+            "stored".to_owned(),
+            "stored-pw".to_owned(),
+        )));
         let args = parse_args(
             ["--username", "cli-user"].iter().map(OsString::from),
             &config,

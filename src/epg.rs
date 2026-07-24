@@ -4,13 +4,14 @@
 //! panel's `xmltv.php` — is parsed in one streaming pass into a [`Guide`]:
 //! programme lists per channel id plus a display-name index for playlist
 //! entries without a `tvg-id`. Only programmes overlapping a bounded
-//! window around "now" are kept (see [`KEEP_AHEAD_SECS`]), so multi-day
+//! 12-hour window around "now" are kept, so multi-day
 //! guides for very large playlists stay small in memory. [`spawn`] runs
 //! the fetch and parse on a background thread, mirroring how the playlist
 //! itself is loaded, and delivers a single [`EpgEvent`] over a channel.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -49,11 +50,31 @@ pub enum EpgError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Programme {
     /// Start time, seconds since the Unix epoch.
-    pub start: i64,
+    pub(crate) start: i64,
     /// End time, seconds since the Unix epoch.
-    pub stop: i64,
+    pub(crate) stop: i64,
     /// Programme title.
-    pub title: String,
+    pub(crate) title: String,
+}
+
+impl Programme {
+    /// Start time in Unix seconds.
+    #[must_use]
+    pub fn start(&self) -> i64 {
+        self.start
+    }
+
+    /// End time in Unix seconds.
+    #[must_use]
+    pub fn stop(&self) -> i64 {
+        self.stop
+    }
+
+    /// Programme title.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
 }
 
 /// A parsed guide: per-channel programme lists keyed by XMLTV channel id,
@@ -126,7 +147,7 @@ enum TextTarget {
 }
 
 /// Parses an XMLTV document, keeping only programmes that overlap the
-/// window from `now` to `now + `[`KEEP_AHEAD_SECS`]. Programmes with
+/// window from `now` through the configured 12-hour lookahead. Programmes with
 /// missing or malformed attributes are skipped, not errors.
 ///
 /// # Errors
@@ -308,6 +329,18 @@ pub enum EpgSource {
     Url(String),
 }
 
+impl fmt::Debug for EpgSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File(path) => formatter.debug_tuple("File").field(path).finish(),
+            Self::Url(_) => formatter
+                .debug_tuple("Url")
+                .field(&"<redacted URL>")
+                .finish(),
+        }
+    }
+}
+
 impl EpgSource {
     /// Interprets a CLI/config value: anything with an `http(s)://`
     /// scheme is a URL, everything else a local file path.
@@ -331,6 +364,7 @@ impl EpgSource {
 }
 
 /// Result of a background EPG load; exactly one is sent per [`spawn`].
+#[derive(Debug)]
 pub enum EpgEvent {
     /// The guide was fetched and parsed.
     Loaded(Guide),

@@ -8,6 +8,7 @@
 //! [`LiveStream`] lists from which the loader synthesizes the channel
 //! list itself.
 
+use std::fmt;
 use std::io::Read;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -29,31 +30,71 @@ pub enum XtreamError {
 }
 
 /// One live category from `player_api.php?action=get_live_categories`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Category {
     /// Panel-assigned id, referenced by [`LiveStream::category_id`].
     #[serde(rename = "category_id", deserialize_with = "required_scalar")]
-    pub id: String,
+    pub(crate) id: String,
     /// Human-readable name; becomes the channel group.
     #[serde(rename = "category_name")]
-    pub name: String,
+    pub(crate) name: String,
+}
+
+impl Category {
+    /// Panel-assigned category identifier.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Human-readable category name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// One live stream from `player_api.php?action=get_live_streams`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct LiveStream {
     /// Display name; `None` when the panel sent none.
     #[serde(default, deserialize_with = "lenient_scalar")]
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
     /// Id from which [`Account::live_stream_url`] builds the URL.
     #[serde(deserialize_with = "lenient_u64")]
-    pub stream_id: u64,
+    pub(crate) stream_id: u64,
     /// Category (group) of the stream, when the panel sets one.
     #[serde(default, deserialize_with = "lenient_scalar")]
-    pub category_id: Option<String>,
+    pub(crate) category_id: Option<String>,
     /// EPG channel id (`tvg-id` equivalent), when set.
     #[serde(default, deserialize_with = "lenient_scalar")]
-    pub epg_channel_id: Option<String>,
+    pub(crate) epg_channel_id: Option<String>,
+}
+
+impl LiveStream {
+    /// Display name supplied by the panel.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Panel-assigned stream identifier.
+    #[must_use]
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    /// Category identifier supplied by the panel.
+    #[must_use]
+    pub fn category_id(&self) -> Option<&str> {
+        self.category_id.as_deref()
+    }
+
+    /// XMLTV channel identifier supplied by the panel.
+    #[must_use]
+    pub fn epg_channel_id(&self) -> Option<&str> {
+        self.epg_channel_id.as_deref()
+    }
 }
 
 /// Panels are inconsistent about JSON scalar types — ids arrive as
@@ -111,6 +152,18 @@ pub struct Account {
     password: String,
     /// Custom `User-Agent` header; `None` keeps the HTTP client's default.
     user_agent: Option<String>,
+}
+
+impl fmt::Debug for Account {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Account")
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("user_agent", &self.user_agent)
+            .finish()
+    }
 }
 
 impl Account {

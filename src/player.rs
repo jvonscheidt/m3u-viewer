@@ -23,6 +23,7 @@ pub enum PlayerError {
 }
 
 /// A resolved external player.
+#[derive(Debug)]
 pub struct Player {
     exe: PathBuf,
     /// When set, playback requests are handed to VLC's single-instance IPC

@@ -5,15 +5,16 @@
 //! sending [`LoadEvent`]s over an mpsc channel so the UI can appear
 //! immediately and fill in while the data is still arriving.
 //!
-//! For Xtream sources, [`load_xtream`] additionally shows a cached copy of
+//! For Xtream sources, `load_xtream` additionally shows a cached copy of
 //! the last successful load first (if one exists in `cache_dir`), so the
 //! list is populated instantly instead of waiting on the network; the
 //! live fetch then runs as usual and, on arriving at its first real
 //! batch, a [`LoadEvent::Reset`] clears the cached rows before the fresh
-//! ones replace them. See [`crate::cache`] for the on-disk side of this.
+//! ones replace them. The private cache module handles the on-disk side.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ use crate::xtream::Account;
 const BATCH_SIZE: usize = 4096;
 
 /// Where the playlist comes from.
+#[derive(Debug)]
 pub enum Source {
     /// A local `.m3u`/`.m3u8` file.
     File(PathBuf),
@@ -65,6 +67,32 @@ pub enum LoadEvent {
     Finished,
     /// Loading aborted (I/O error, HTTP failure, bad credentials, …).
     Failed(String),
+}
+
+impl fmt::Debug for LoadEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Batch {
+                channels,
+                new_groups,
+                skipped,
+                percent,
+            } => formatter
+                .debug_struct("Batch")
+                .field("channels", &channels.len())
+                .field("new_groups", &new_groups)
+                .field("skipped", skipped)
+                .field("percent", percent)
+                .finish(),
+            Self::Reset => formatter.write_str("Reset"),
+            Self::EpgUrl(_) => formatter
+                .debug_tuple("EpgUrl")
+                .field(&"<redacted URL>")
+                .finish(),
+            Self::Finished => formatter.write_str("Finished"),
+            Self::Failed(message) => formatter.debug_tuple("Failed").field(message).finish(),
+        }
+    }
 }
 
 /// Spawns the loader thread for `source` and returns the event receiver.

@@ -9,6 +9,7 @@
 //! files are protected by the user's filesystem access controls and use mode
 //! `0600` on Unix, but they are not encrypted.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,34 +21,61 @@ use crate::private_file;
 const CONFIG_FILE: &str = "config.toml";
 
 /// Top-level configuration file structure.
-#[derive(Serialize, Deserialize)]
+///
+/// # Example
+///
+/// ```
+/// use m3u_viewer::config::Config;
+///
+/// let config = Config::default()
+///     .with_regex_filter(false)
+///     .with_vlc_reuse_instance(true);
+///
+/// assert!(!config.regex_filter());
+/// assert!(config.vlc_reuse_instance());
+/// ```
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Stored Xtream Codes account credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub xtream: Option<XtreamConfig>,
+    pub(crate) xtream: Option<XtreamConfig>,
     /// Path to the VLC executable, overriding auto-detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vlc_path: Option<PathBuf>,
+    pub(crate) vlc_path: Option<PathBuf>,
     /// `User-Agent` header for Xtream requests; some providers only
     /// answer to known player user agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_agent: Option<String>,
+    pub(crate) user_agent: Option<String>,
     /// XMLTV guide source (HTTP(S) URL or file path) used when `--epg` is
     /// not given on the command line. Takes precedence over a `url-tvg`
     /// header and the Xtream account's own guide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub epg_url: Option<String>,
+    pub(crate) epg_url: Option<String>,
     /// Whether the channel filter (`/`) treats its input as a regular
     /// expression, falling back to plain substring matching when the
     /// pattern fails to compile. Enabled by default; set to `false` to
     /// always use plain substring matching.
     #[serde(default = "default_regex_filter")]
-    pub regex_filter: bool,
+    pub(crate) regex_filter: bool,
     /// Whether playing a channel reuses a single running VLC instance
     /// (via `--one-instance`) instead of opening a new window per channel.
     /// Disabled by default.
     #[serde(default)]
-    pub vlc_reuse_instance: bool,
+    pub(crate) vlc_reuse_instance: bool,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("xtream", &self.xtream)
+            .field("vlc_path", &self.vlc_path)
+            .field("user_agent", &self.user_agent)
+            .field("epg_url", &self.epg_url.as_ref().map(|_| "<redacted URL>"))
+            .field("regex_filter", &self.regex_filter)
+            .field("vlc_reuse_instance", &self.vlc_reuse_instance)
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -71,14 +99,25 @@ fn default_regex_filter() -> bool {
 ///
 /// Not `Debug`-derived to prevent accidental password exposure in logs or
 /// error messages.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct XtreamConfig {
     /// Provider base URL, e.g. `http://provider.example:8080`.
-    pub server: String,
+    server: String,
     /// Account username.
-    pub username: String,
+    username: String,
     /// Account password (stored in plaintext).
-    pub password: String,
+    password: String,
+}
+
+impl fmt::Debug for XtreamConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("XtreamConfig")
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Errors that can occur while loading or saving the config file.
@@ -96,6 +135,84 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// Sets the persisted Xtream account.
+    #[must_use]
+    pub fn with_xtream(mut self, xtream: Option<XtreamConfig>) -> Self {
+        self.xtream = xtream;
+        self
+    }
+
+    /// Sets the VLC executable override.
+    #[must_use]
+    pub fn with_vlc_path(mut self, vlc_path: Option<PathBuf>) -> Self {
+        self.vlc_path = vlc_path;
+        self
+    }
+
+    /// Sets the HTTP user agent.
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+
+    /// Sets the EPG source.
+    #[must_use]
+    pub fn with_epg_url(mut self, epg_url: Option<String>) -> Self {
+        self.epg_url = epg_url;
+        self
+    }
+
+    /// Sets whether channel filters use regular expressions.
+    #[must_use]
+    pub fn with_regex_filter(mut self, enabled: bool) -> Self {
+        self.regex_filter = enabled;
+        self
+    }
+
+    /// Sets whether VLC playback reuses one running instance.
+    #[must_use]
+    pub fn with_vlc_reuse_instance(mut self, enabled: bool) -> Self {
+        self.vlc_reuse_instance = enabled;
+        self
+    }
+
+    /// Stored Xtream account, when configured.
+    #[must_use]
+    pub fn xtream(&self) -> Option<&XtreamConfig> {
+        self.xtream.as_ref()
+    }
+
+    /// Configured VLC executable path.
+    #[must_use]
+    pub fn vlc_path(&self) -> Option<&Path> {
+        self.vlc_path.as_deref()
+    }
+
+    /// Configured HTTP user agent.
+    #[must_use]
+    pub fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
+    }
+
+    /// Configured EPG source.
+    #[must_use]
+    pub fn epg_url(&self) -> Option<&str> {
+        self.epg_url.as_deref()
+    }
+
+    /// Whether channel filters use regular expressions.
+    #[must_use]
+    pub fn regex_filter(&self) -> bool {
+        self.regex_filter
+    }
+
+    /// Whether VLC playback reuses one running instance.
+    #[must_use]
+    pub fn vlc_reuse_instance(&self) -> bool {
+        self.vlc_reuse_instance
+    }
+
     /// Loads config from `path`, returning [`Config::default`] when the file
     /// does not exist.
     ///
@@ -107,6 +224,7 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
+
         let text = private_file::read_to_string(path)?;
         Ok(toml::from_str(&text)?)
     }
@@ -139,6 +257,36 @@ impl Config {
     pub fn default_path() -> Option<PathBuf> {
         directories::ProjectDirs::from("", "", "m3u-viewer")
             .map(|dirs| dirs.config_dir().join(CONFIG_FILE))
+    }
+}
+
+impl XtreamConfig {
+    /// Creates persisted Xtream credentials.
+    #[must_use]
+    pub fn new(server: String, username: String, password: String) -> Self {
+        Self {
+            server,
+            username,
+            password,
+        }
+    }
+
+    /// Provider base URL.
+    #[must_use]
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// Account username.
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Account password.
+    #[must_use]
+    pub fn password(&self) -> &str {
+        &self.password
     }
 }
 

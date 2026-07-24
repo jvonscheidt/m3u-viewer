@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::io::BufRead;
 
 use thiserror::Error;
@@ -27,30 +28,79 @@ pub enum ParseError {
 pub type GroupId = usize;
 
 /// A single playlist entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Channel {
     /// Display name: the text after the comma in `#EXTINF`, or the URL
     /// itself for bare-URL entries and empty names.
-    pub name: String,
+    pub(crate) name: String,
     /// Stream URL (or file path) of the entry.
-    pub url: String,
+    pub(crate) url: String,
     /// `tvg-id` attribute, if present.
-    pub tvg_id: Option<String>,
+    pub(crate) tvg_id: Option<String>,
     /// Interned `group-title` attribute, if present.
-    pub group: Option<GroupId>,
+    pub(crate) group: Option<GroupId>,
+}
+
+impl fmt::Debug for Channel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Channel")
+            .field("name", &self.name)
+            .field("url", &"<redacted URL>")
+            .field("tvg_id", &self.tvg_id)
+            .field("group", &self.group)
+            .finish()
+    }
+}
+
+impl Channel {
+    /// Display name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Stream URL or path.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// XMLTV channel identifier.
+    #[must_use]
+    pub fn tvg_id(&self) -> Option<&str> {
+        self.tvg_id.as_deref()
+    }
+
+    /// Interned group identifier.
+    #[must_use]
+    pub fn group(&self) -> Option<GroupId> {
+        self.group
+    }
 }
 
 /// A parsed playlist: a flat channel list plus interned group names.
 #[derive(Debug, Default)]
 pub struct Playlist {
     /// All successfully parsed channels, in file order.
-    pub channels: Vec<Channel>,
+    pub(crate) channels: Vec<Channel>,
     /// Number of malformed entries that were skipped.
-    pub skipped: usize,
+    pub(crate) skipped: usize,
     groups: Vec<String>,
 }
 
 impl Playlist {
+    /// Successfully parsed channels in file order.
+    #[must_use]
+    pub fn channels(&self) -> &[Channel] {
+        &self.channels
+    }
+
+    /// Number of malformed entries skipped during parsing.
+    #[must_use]
+    pub fn skipped(&self) -> usize {
+        self.skipped
+    }
     /// Parses a playlist from a buffered reader in a single streaming pass.
     ///
     /// Accepts extended M3U (`#EXTINF` metadata followed by a URL line) as
@@ -86,7 +136,7 @@ impl Playlist {
 /// channels in batches (for streaming loads), then [`finish`](Self::finish).
 ///
 /// [`Playlist::from_reader`] is a convenience wrapper around this type.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct PlaylistBuilder {
     playlist: Playlist,
     group_ids: HashMap<String, GroupId>,
@@ -214,6 +264,7 @@ impl PlaylistBuilder {
 }
 
 /// Metadata carried by one `#EXTINF` directive.
+#[derive(Debug)]
 struct ExtInf {
     name: String,
     tvg_id: Option<String>,

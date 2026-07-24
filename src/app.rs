@@ -5,6 +5,7 @@
 //! binary's event loop feeds keys and [`LoadEvent`]s in here.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
@@ -17,6 +18,7 @@ use crate::store::Store;
 /// How the current filter text is matched against a channel's search key.
 /// Rebuilt by [`App::rebuild_filter_matcher`] whenever the filter text or
 /// the regex-filter setting changes.
+#[derive(Debug)]
 enum FilterMatcher {
     /// No filter text: everything matches.
     None,
@@ -54,6 +56,7 @@ pub enum View {
 }
 
 /// State of the (optional) background EPG load.
+#[derive(Debug)]
 pub enum EpgState {
     /// No EPG source was configured or discovered.
     Absent,
@@ -69,9 +72,33 @@ pub enum EpgState {
 /// the event loop (which owns the external player).
 pub struct PlayRequest {
     /// Display name, for the status-bar confirmation.
-    pub name: String,
+    pub(crate) name: String,
     /// Stream URL to hand to the player.
-    pub url: String,
+    pub(crate) url: String,
+}
+
+impl fmt::Debug for PlayRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlayRequest")
+            .field("name", &self.name)
+            .field("url", &"<redacted URL>")
+            .finish()
+    }
+}
+
+impl PlayRequest {
+    /// Channel display name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Stream URL to pass to the player.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
 }
 
 /// Top-level TUI state.
@@ -143,6 +170,27 @@ pub struct App {
     /// guide is ready.
     pub(crate) epg_visible: bool,
     quit: bool,
+}
+
+impl fmt::Debug for App {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("App")
+            .field("channels", &self.channels.len())
+            .field("groups", &self.groups.len())
+            .field("filtered", &self.filtered.len())
+            .field("selected", &self.selected)
+            .field("mode", &self.mode)
+            .field("loading", &self.loading)
+            .field("percent", &self.percent)
+            .field("skipped", &self.skipped)
+            .field("view", &self.view)
+            .field("store", &self.store)
+            .field("epg", &self.epg)
+            .field("epg_visible", &self.epg_visible)
+            .field("quit", &self.quit)
+            .finish_non_exhaustive()
+    }
 }
 
 impl App {
@@ -688,7 +736,7 @@ mod tests {
     fn temp_store(tag: &str) -> (Store, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("m3u-viewer-app-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        (Store::load(dir.clone()), dir)
+        (Store::load(dir.clone()).unwrap(), dir)
     }
 
     fn loaded_app() -> App {
