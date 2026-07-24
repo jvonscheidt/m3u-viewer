@@ -1,6 +1,6 @@
 [package]
 name = "m3u-viewer"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "Fast terminal viewer for large M3U playlists"
 license = "Apache-2.0"
