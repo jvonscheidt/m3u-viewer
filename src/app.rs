@@ -40,6 +40,8 @@ pub enum Mode {
     Filter,
     /// Choosing a group restriction in the popup (entered with `g`).
     Groups,
+    /// Editing the group search string from the group popup.
+    GroupSearch,
     /// Help overlay (entered with `?`).
     Help,
 }
@@ -152,8 +154,14 @@ pub struct App {
     pub(crate) skipped: usize,
     pub(crate) error: Option<String>,
     pub(crate) file_name: String,
-    /// Cursor in the group popup: 0 is "(all groups)", `n + 1` is group `n`.
+    /// Cursor in the visible group popup rows.
     pub(crate) group_cursor: usize,
+    /// Case-insensitive substring search applied inside the group popup.
+    pub(crate) group_search: String,
+    /// Group ids matching `group_search`, kept in alphabetical order.
+    pub(crate) visible_groups: Vec<GroupId>,
+    /// Rows in the group popup as of the last render; used for fast scrolling.
+    pub(crate) group_page_rows: usize,
     /// Transient status-bar notice (playback confirmations and errors);
     /// cleared by the next key press.
     pub(crate) message: Option<String>,
@@ -220,6 +228,9 @@ impl App {
             error: None,
             file_name,
             group_cursor: 0,
+            group_search: String::new(),
+            visible_groups: Vec::new(),
+            group_page_rows: 1,
             message: None,
             view: View::All,
             store,
@@ -275,6 +286,8 @@ impl App {
                 self.sorted_channels.clear();
                 self.groups.clear();
                 self.sorted_groups.clear();
+                self.visible_groups.clear();
+                self.group_search.clear();
                 self.url_index.clear();
                 self.skipped = 0;
                 self.percent = None;
@@ -380,6 +393,7 @@ impl App {
             Mode::Normal => self.key_normal(key),
             Mode::Filter => self.key_filter(key),
             Mode::Groups => self.key_groups(key),
+            Mode::GroupSearch => self.key_group_search(key),
             Mode::Help => self.mode = Mode::Normal,
         }
     }
@@ -398,6 +412,8 @@ impl App {
             }
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char('g') => {
+                self.group_search.clear();
+                self.rebuild_visible_groups();
                 self.group_cursor = self
                     .group_filter
                     .map_or(0, |id| self.group_display_position(id) + 1);
@@ -470,20 +486,56 @@ impl App {
     fn key_groups(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Char('/') => self.mode = Mode::GroupSearch,
             KeyCode::Up => self.group_cursor = self.group_cursor.saturating_sub(1),
             KeyCode::Down => {
-                self.group_cursor = (self.group_cursor + 1).min(self.groups.len());
+                self.move_group_down(1);
             }
-            KeyCode::Enter => {
-                self.group_filter = self
-                    .group_cursor
-                    .checked_sub(1)
-                    .map(|position| self.sorted_groups[position]);
-                self.mode = Mode::Normal;
-                self.recompute_filter();
+            KeyCode::PageUp => {
+                self.group_cursor = self.group_cursor.saturating_sub(self.group_page_rows);
+            }
+            KeyCode::PageDown => self.move_group_down(self.group_page_rows),
+            KeyCode::Home => self.group_cursor = 0,
+            KeyCode::End => self.group_cursor = self.group_item_count().saturating_sub(1),
+            KeyCode::Enter => self.select_group(),
+            _ => {}
+        }
+    }
+
+    fn key_group_search(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.group_search.clear();
+                self.rebuild_visible_groups();
+                self.mode = Mode::Groups;
+            }
+            KeyCode::Enter => self.select_group(),
+            KeyCode::Backspace => {
+                self.group_search.pop();
+                self.rebuild_visible_groups();
+            }
+            KeyCode::Char(c) => {
+                self.group_search.push(c);
+                self.rebuild_visible_groups();
             }
             _ => {}
         }
+    }
+
+    fn select_group(&mut self) {
+        let selected = if self.group_search.is_empty() {
+            self.group_cursor
+                .checked_sub(1)
+                .and_then(|position| self.visible_groups.get(position).copied())
+        } else {
+            self.visible_groups.get(self.group_cursor).copied()
+        };
+        if !self.group_search.is_empty() && selected.is_none() {
+            return;
+        }
+        self.group_filter = selected;
+        self.mode = Mode::Normal;
+        self.recompute_filter();
     }
 
     /// Toggles favorite status of the selection and persists it.
@@ -605,6 +657,22 @@ impl App {
         let groups = &self.groups;
         self.sorted_groups
             .sort_by(|&a, &b| groups[a].to_lowercase().cmp(&groups[b].to_lowercase()));
+        self.rebuild_visible_groups();
+    }
+
+    fn rebuild_visible_groups(&mut self) {
+        if self.group_search.is_empty() {
+            self.visible_groups.clone_from(&self.sorted_groups);
+        } else {
+            let needle = self.group_search.to_lowercase();
+            self.visible_groups = self
+                .sorted_groups
+                .iter()
+                .copied()
+                .filter(|&id| self.groups[id].to_lowercase().contains(&needle))
+                .collect();
+        }
+        self.group_cursor = 0;
     }
 
     /// Row of `id` in the group popup (its position in
@@ -670,6 +738,20 @@ impl App {
     fn move_down(&mut self, by: usize) {
         let last = self.filtered.len().saturating_sub(1);
         self.selected = (self.selected + by).min(last);
+    }
+
+    fn group_item_count(&self) -> usize {
+        self.visible_groups.len() + usize::from(self.group_search.is_empty())
+    }
+
+    fn move_group_down(&mut self, by: usize) {
+        let last = self.group_item_count().saturating_sub(1);
+        self.group_cursor = self.group_cursor.saturating_add(by).min(last);
+    }
+
+    /// Records the group popup viewport height for PageUp/PageDown.
+    pub(crate) fn set_group_page_rows(&mut self, rows: usize) {
+        self.group_page_rows = rows.max(1);
     }
 
     /// Records the viewport height and scrolls `offset` so the selection
@@ -892,6 +974,62 @@ mod tests {
         app.handle_key(key(KeyCode::Char('g')));
         // Popup rows: 0 "(all groups)", 1 Alpha, 2 Zeta.
         assert_eq!(app.group_cursor, 2);
+    }
+
+    #[test]
+    fn group_search_filters_case_insensitively_and_selects_match() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("A", Some(0)), channel("B", Some(1))],
+            new_groups: vec!["News".into(), "Sports".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "PORT".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.mode, Mode::GroupSearch);
+        assert_eq!(app.visible_groups, [1]);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.group_filter, Some(1));
+        assert_eq!(app.filtered, [1]);
+    }
+
+    #[test]
+    fn group_search_escape_clears_search_without_closing_picker() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Groups);
+        assert!(app.group_search.is_empty());
+        assert_eq!(app.visible_groups, app.sorted_groups);
+    }
+
+    #[test]
+    fn group_picker_supports_fast_scrolling() {
+        let mut app = App::new("test.m3u".into(), None);
+        let groups = (0..30).map(|i| format!("Group {i:02}")).collect();
+        app.on_load_event(LoadEvent::Batch {
+            channels: Vec::new(),
+            new_groups: groups,
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.handle_key(key(KeyCode::Char('g')));
+        app.set_group_page_rows(10);
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.group_cursor, 10);
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.group_cursor, 30);
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.group_cursor, 20);
+        app.handle_key(key(KeyCode::Home));
+        assert_eq!(app.group_cursor, 0);
     }
 
     #[test]

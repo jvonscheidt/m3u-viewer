@@ -35,7 +35,7 @@ fn draw_at(frame: &mut Frame, app: &mut App, now: i64) {
         draw_status(frame, status_area, app);
     }
     match app.mode {
-        Mode::Groups => draw_group_popup(frame, app),
+        Mode::Groups | Mode::GroupSearch => draw_group_popup(frame, app),
         Mode::Help => draw_help_popup(frame),
         Mode::Normal | Mode::Filter => {}
     }
@@ -242,21 +242,40 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Centered popup listing "(all groups)" plus every interned group, in
 /// alphabetical order.
-fn draw_group_popup(frame: &mut Frame, app: &App) {
-    let area = centered(frame.area(), 44, 16);
-    let items = std::iter::once(ListItem::new("(all groups)"))
-        .chain(
-            app.sorted_groups
-                .iter()
-                .map(|&id| ListItem::new(app.groups[id].clone())),
-        )
-        .collect::<Vec<_>>();
+fn draw_group_popup(frame: &mut Frame, app: &mut App) {
+    let area = centered(frame.area(), 48, 17);
+    let [list_area, search_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    let items = if app.group_search.is_empty() {
+        std::iter::once(ListItem::new("(all groups)"))
+            .chain(
+                app.visible_groups
+                    .iter()
+                    .map(|&id| ListItem::new(app.groups[id].clone())),
+            )
+            .collect::<Vec<_>>()
+    } else if app.visible_groups.is_empty() {
+        vec![ListItem::new("(no matching groups)").style(Style::new().dim())]
+    } else {
+        app.visible_groups
+            .iter()
+            .map(|&id| ListItem::new(app.groups[id].clone()))
+            .collect()
+    };
     let list = List::new(items)
-        .block(Block::bordered().title(" group (Enter select · Esc close) "))
+        .block(Block::bordered().title(" group (Enter select · / search · PgUp/PgDn · Esc close) "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected(Some(app.group_cursor));
+    let cursor = if app.mode == Mode::GroupSearch {
+        "█"
+    } else {
+        ""
+    };
+    let search = Paragraph::new(format!("/{}{cursor}", app.group_search));
+    app.set_group_page_rows(usize::from(list_area.height.saturating_sub(2)));
     frame.render_widget(Clear, area);
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(search, search_area);
 }
 
 /// Centered static help overlay.
@@ -367,6 +386,20 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         let screen = render(&mut app);
         assert!(screen.contains("(all groups)"));
+        assert!(screen.contains("/ search"));
+    }
+
+    #[test]
+    fn renders_group_search_input_and_empty_result() {
+        let mut app = app_with_channels(3);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for c in "sports".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let screen = render(&mut app);
+        assert!(screen.contains("/sports█"));
+        assert!(screen.contains("(no matching groups)"));
     }
 
     #[test]
