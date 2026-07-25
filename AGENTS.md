@@ -59,4 +59,5 @@ Before done, all three must pass: `cargo fmt --check`, clippy above, `cargo test
 - Update branches `git pull --rebase`; never force-push shared branch.
 - Use `gh` CLI for GitHub work (`gh pr create`, `gh issue view`, …). Keep PRs
   small, single-purpose; CI (fmt check, clippy, tests) green before merge.
-- Update README before tag new version.
+- For releases, update README, validate winget manifest, tag new version.
+- Once PR for winget is opened by Actions, complete the checklist and CLA.
