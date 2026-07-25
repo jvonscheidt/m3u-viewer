@@ -121,6 +121,13 @@ pub struct App {
     /// [`Self::absorb_channels`]. The source of iteration order for both
     /// the "all channels" and favorites views.
     sorted_channels: Vec<usize>,
+    /// Reused merge destinations for [`Self::absorb_channels`], swapped in
+    /// place of `sorted_channels`/`filtered` each batch so folding a batch
+    /// into the running order reuses one growing allocation instead of
+    /// allocating a fresh Vec per batch (the difference between O(n) and
+    /// O(n²) allocation traffic across a large streaming load).
+    sorted_scratch: Vec<usize>,
+    filtered_scratch: Vec<usize>,
     pub(crate) groups: Vec<String>,
     /// `groups` ids in alphabetical order, for the group popup. Rebuilt
     /// from scratch whenever groups change: the interned group table
@@ -211,6 +218,8 @@ impl App {
             search_keys: Vec::new(),
             name_keys: Vec::new(),
             sorted_channels: Vec::new(),
+            sorted_scratch: Vec::new(),
+            filtered_scratch: Vec::new(),
             groups: Vec::new(),
             sorted_groups: Vec::new(),
             filter: String::new(),
@@ -628,14 +637,26 @@ impl App {
         let selected_channel = self.filtered.get(self.selected).copied();
         let mut new_indices: Vec<usize> = (start..self.channels.len()).collect();
         new_indices.sort_by(|&a, &b| self.name_keys[a].cmp(&self.name_keys[b]));
-        self.sorted_channels = merge_by_key(&self.sorted_channels, &new_indices, &self.name_keys);
+        merge_by_key_into(
+            &mut self.sorted_scratch,
+            &self.sorted_channels,
+            &new_indices,
+            &self.name_keys,
+        );
+        std::mem::swap(&mut self.sorted_channels, &mut self.sorted_scratch);
         if self.view == View::All {
             let matching: Vec<usize> = new_indices
                 .iter()
                 .copied()
                 .filter(|&index| self.matches(index))
                 .collect();
-            self.filtered = merge_by_key(&self.filtered, &matching, &self.name_keys);
+            merge_by_key_into(
+                &mut self.filtered_scratch,
+                &self.filtered,
+                &matching,
+                &self.name_keys,
+            );
+            std::mem::swap(&mut self.filtered, &mut self.filtered_scratch);
         } else {
             // Favorites/recents views need the store checks and (for
             // recents) store-defined ordering.
@@ -774,24 +795,29 @@ impl App {
 }
 
 /// Merges two channel-index lists, each already sorted by `keys[index]`,
-/// into one sorted list — the linear-time counterpart to re-sorting the
+/// into `out` — the linear-time counterpart to re-sorting the
 /// concatenation, used to fold a newly arrived batch into a running
 /// alphabetical order without re-touching the entries already placed.
-fn merge_by_key(a: &[usize], b: &[usize], keys: &[String]) -> Vec<usize> {
-    let mut merged = Vec::with_capacity(a.len() + b.len());
+///
+/// `out` is cleared first and must be distinct from `a` and `b`; the
+/// caller passes a reused scratch buffer and swaps it into place, so a
+/// streaming load reuses one growing allocation rather than allocating a
+/// fresh Vec per batch.
+fn merge_by_key_into(out: &mut Vec<usize>, a: &[usize], b: &[usize], keys: &[String]) {
+    out.clear();
+    out.reserve(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         if keys[a[i]] <= keys[b[j]] {
-            merged.push(a[i]);
+            out.push(a[i]);
             i += 1;
         } else {
-            merged.push(b[j]);
+            out.push(b[j]);
             j += 1;
         }
     }
-    merged.extend_from_slice(&a[i..]);
-    merged.extend_from_slice(&b[j..]);
-    merged
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
 }
 
 #[cfg(test)]
