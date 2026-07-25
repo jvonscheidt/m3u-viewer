@@ -116,7 +116,7 @@ Press `?` inside the viewer for the full list. The essentials:
 | Key | Action |
 | --- | --- |
 | `/` + text | filter channels as you type (regex) |
-| `g` | restrict to one group |
+| `g` | restrict to one group (searchable selector) |
 | `Enter` | play the selected channel in VLC |
 | `f` | mark/unmark as favorite (`★`) |
 | `F` / `R` / `Tab` | favorites view / recents view / cycle views |
@@ -200,8 +200,11 @@ Deleting the directory resets everything.
   pattern) degrades to a case-insensitive substring match rather than
   an empty list, with an indicator in the status bar. `regex_filter =
   false` in `config.toml` forces literal substring matching.
-- Group sidebar/selector: jump to or restrict the list to one
-  `group-title`; groups are listed alphabetically too.
+- Group selector: jump to or restrict the list to one `group-title`;
+  groups are listed alphabetically too. Searchable since 0.7.0 — inside
+  the selector, `/` filters the group list as you type and
+  `PgUp`/`PgDn`/`Home`/`End` page through it, for accounts with hundreds
+  of groups.
 - Filter and group restriction combine (AND).
 
 #### Programme guide (EPG, since 0.6.0)
@@ -261,6 +264,10 @@ Deleting the directory resets everything.
 | `e` | Toggle EPG display |
 | `?` | Help overlay |
 | `q` | Quit |
+
+Inside the group selector (`g`): `/` searches the group list,
+`PgUp`/`PgDn`/`Home`/`End` page through it, `Enter` selects, and `Esc`
+closes it.
 
 ### Performance targets (100 MB playlist)
 
