@@ -1,6 +1,6 @@
 ## Project
 
-m3u-viewer — TUI viewer, big M3U playlists, Rust.
+m3u-viewer — TUI viewer, big M3U playlists, Rust. Use sub-agents or tools wherever possible.
 
 ## Toolchain & commands
 
