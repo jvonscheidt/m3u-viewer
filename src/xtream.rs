@@ -7,13 +7,36 @@
 //! the JSON player API (`player_api.php`) — [`Category`] and
 //! [`LiveStream`] lists from which the loader synthesizes the channel
 //! list itself.
+//!
+//! Xtream embeds credentials in request URLs. Those URLs must never be
+//! logged; diagnostics report only status, content metadata, and redirect
+//! destination origins.
 
 use std::fmt;
 use std::io::Read;
+use std::time::Duration;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use thiserror::Error;
+use ureq::ResponseExt as _;
+
+#[cfg(not(test))]
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const RESPONSE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const PLAYLIST_TIMEOUT: Duration = Duration::from_mins(1);
+#[cfg(test)]
+const PLAYLIST_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const API_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Why the playlist could not be fetched from the server.
 #[derive(Debug, Error)]
@@ -27,6 +50,12 @@ pub enum XtreamError {
     /// The player API's JSON reply could not be parsed.
     #[error("could not parse the server's reply: {0}")]
     Json(#[from] serde_json::Error),
+    /// The panel reported that these credentials are not authorized.
+    #[error("Xtream authentication failed — check username, password, and account status")]
+    AuthFailed,
+    /// The player API returned valid JSON, but not the requested list.
+    #[error("player API returned an unexpected reply instead of a channel list")]
+    UnexpectedApiReply,
 }
 
 /// One live category from `player_api.php?action=get_live_categories`.
@@ -145,6 +174,31 @@ fn sanitize_for_filename(text: &str) -> String {
         .collect()
 }
 
+/// Stable non-cryptographic identity suffix preventing sanitized-name collisions.
+fn cache_identity_hash(host: &str, username: &str) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    host.bytes()
+        .chain(std::iter::once(0))
+        .chain(username.bytes())
+        .fold(OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
+}
+
+fn http_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+        .timeout_recv_body(Some(RESPONSE_TIMEOUT))
+        .max_redirects(3)
+        .max_redirects_will_error(true)
+        .save_redirect_history(true)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
 /// Credentials for one Xtream Codes account.
 pub struct Account {
     server: String,
@@ -152,6 +206,7 @@ pub struct Account {
     password: String,
     /// Custom `User-Agent` header; `None` keeps the HTTP client's default.
     user_agent: Option<String>,
+    agent: ureq::Agent,
 }
 
 impl fmt::Debug for Account {
@@ -162,7 +217,7 @@ impl fmt::Debug for Account {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("user_agent", &self.user_agent)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -183,6 +238,7 @@ impl Account {
             username,
             password,
             user_agent: None,
+            agent: http_agent(),
         }
     }
 
@@ -203,18 +259,21 @@ impl Account {
 
     /// Filesystem-safe key identifying this account for the on-disk
     /// playlist cache: the server host and username (not the password),
-    /// with anything that isn't ASCII alphanumeric replaced by `_`.
+    /// with anything that isn't ASCII alphanumeric replaced by `_`, plus
+    /// a stable hash of the unsanitized values to prevent collisions.
     #[must_use]
     pub fn cache_key(&self) -> String {
         let host = self
             .server
             .split_once("://")
             .map_or(self.server.as_str(), |(_, rest)| rest);
-        format!(
+        let readable = format!(
             "{}-{}",
             sanitize_for_filename(host),
             sanitize_for_filename(&self.username)
-        )
+        );
+        let hash = cache_identity_hash(host, &self.username);
+        format!("{readable}-{hash:016x}")
     }
 
     /// Host portion of the server URL, for display in the status bar.
@@ -231,22 +290,30 @@ impl Account {
     /// extended M3U (credentials percent-encoded).
     #[must_use]
     pub fn playlist_url(&self) -> String {
+        let (username, password) = self.encoded_credentials();
         format!(
             "{}/get.php?username={}&password={}&type=m3u_plus&output=ts",
-            self.server,
-            utf8_percent_encode(&self.username, NON_ALPHANUMERIC),
-            utf8_percent_encode(&self.password, NON_ALPHANUMERIC),
+            self.server, username, password,
         )
     }
 
     /// Issues a GET for `url` (custom user agent applied) and returns the
     /// response only when it is a 2xx.
-    fn request(&self, url: String) -> Result<ureq::http::Response<ureq::Body>, XtreamError> {
-        let mut request = ureq::get(url);
+    fn request(
+        &self,
+        url: String,
+        timeout: Duration,
+    ) -> Result<ureq::http::Response<ureq::Body>, XtreamError> {
+        let mut request = self.agent.get(url);
         if let Some(ref user_agent) = self.user_agent {
             request = request.header("User-Agent", user_agent);
         }
-        let response = match request.call() {
+        let response = match request
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
+            .call()
+        {
             Ok(response) => response,
             Err(ureq::Error::StatusCode(code)) => return Err(XtreamError::Status(code)),
             Err(other) => return Err(XtreamError::Http(Box::new(other))),
@@ -256,6 +323,7 @@ impl Account {
         if !response.status().is_success() {
             return Err(XtreamError::Status(response.status().as_u16()));
         }
+        log_redirect(&response);
         Ok(response)
     }
 
@@ -268,7 +336,7 @@ impl Account {
     /// [`XtreamError::Status`] for a non-success HTTP response,
     /// [`XtreamError::Http`] when the request cannot be made at all.
     pub fn fetch(&self) -> Result<(impl Read + use<>, Option<u64>), XtreamError> {
-        let response = self.request(self.playlist_url())?;
+        let response = self.request(self.playlist_url(), PLAYLIST_TIMEOUT)?;
         let total = response
             .headers()
             .get("content-length")
@@ -296,21 +364,19 @@ impl Account {
     /// document (credentials percent-encoded).
     #[must_use]
     pub fn xmltv_url(&self) -> String {
+        let (username, password) = self.encoded_credentials();
         format!(
             "{}/xmltv.php?username={}&password={}",
-            self.server,
-            utf8_percent_encode(&self.username, NON_ALPHANUMERIC),
-            utf8_percent_encode(&self.password, NON_ALPHANUMERIC),
+            self.server, username, password,
         )
     }
 
     /// The `player_api.php` URL for `action` (credentials percent-encoded).
     fn api_url(&self, action: &str) -> String {
+        let (username, password) = self.encoded_credentials();
         format!(
             "{}/player_api.php?username={}&password={}&action={action}",
-            self.server,
-            utf8_percent_encode(&self.username, NON_ALPHANUMERIC),
-            utf8_percent_encode(&self.password, NON_ALPHANUMERIC),
+            self.server, username, password,
         )
     }
 
@@ -319,7 +385,7 @@ impl Account {
         &self,
         action: &str,
     ) -> Result<Vec<T>, XtreamError> {
-        let response = self.request(self.api_url(action))?;
+        let response = self.request(self.api_url(action), API_TIMEOUT)?;
         // Unlimited body: full stream lists routinely exceed ureq's
         // 10 MB default (55k streams ≈ 20 MB of JSON).
         let reader = response
@@ -327,7 +393,14 @@ impl Account {
             .into_with_config()
             .limit(u64::MAX)
             .reader();
-        Ok(serde_json::from_reader(std::io::BufReader::new(reader))?)
+        let value: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(reader))?;
+        match &value {
+            serde_json::Value::Array(_) => Ok(serde_json::from_value(value)?),
+            serde_json::Value::Object(object) if api_auth_failed(object) => {
+                Err(XtreamError::AuthFailed)
+            }
+            _ => Err(XtreamError::UnexpectedApiReply),
+        }
     }
 
     /// Fetches the live categories (channel groups) from the player API.
@@ -354,13 +427,51 @@ impl Account {
     /// panel serves: `/live/<user>/<pass>/<stream_id>.ts`.
     #[must_use]
     pub fn live_stream_url(&self, stream_id: u64) -> String {
+        let (username, password) = self.encoded_credentials();
         format!(
             "{}/live/{}/{}/{stream_id}.ts",
-            self.server,
-            utf8_percent_encode(&self.username, NON_ALPHANUMERIC),
-            utf8_percent_encode(&self.password, NON_ALPHANUMERIC),
+            self.server, username, password,
         )
     }
+
+    fn encoded_credentials(&self) -> (String, String) {
+        (
+            utf8_percent_encode(&self.username, NON_ALPHANUMERIC).to_string(),
+            utf8_percent_encode(&self.password, NON_ALPHANUMERIC).to_string(),
+        )
+    }
+}
+
+fn api_auth_failed(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(auth) = object
+        .get("user_info")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|user_info| user_info.get("auth"))
+    else {
+        return false;
+    };
+    matches!(auth, serde_json::Value::Bool(false))
+        || auth.as_u64() == Some(0)
+        || auth.as_str() == Some("0")
+}
+
+fn log_redirect(response: &ureq::http::Response<ureq::Body>) {
+    let Some(history) = response.get_redirect_history() else {
+        return;
+    };
+    if history.is_empty() {
+        return;
+    }
+    let final_uri = response.get_uri();
+    let destination = match (final_uri.scheme_str(), final_uri.authority()) {
+        (Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
+        (_, Some(authority)) => authority.to_string(),
+        _ => "<relative URI>".to_owned(),
+    };
+    log::warn!(
+        "xtream request followed {} redirect(s) to {destination}",
+        history.len()
+    );
 }
 
 #[cfg(test)]
@@ -415,7 +526,17 @@ mod tests {
     #[test]
     fn cache_key_sanitizes_host_and_username_for_a_filename() {
         let account = Account::new("https://example.com:8080", "user name".into(), "p".into());
-        assert_eq!(account.cache_key(), "example_com_8080-user_name");
+        let key = account.cache_key();
+        let hash = key.strip_prefix("example_com_8080-user_name-").unwrap();
+        assert_eq!(hash.len(), 16);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn cache_key_distinguishes_sanitization_collisions() {
+        let punctuation = Account::new("a.b.com", "u-1".into(), "p".into());
+        let underscores = Account::new("a_b_com", "u_1".into(), "p".into());
+        assert_ne!(punctuation.cache_key(), underscores.cache_key());
     }
 
     #[test]
@@ -500,6 +621,39 @@ mod tests {
     }
 
     #[test]
+    fn player_api_auth_object_has_an_actionable_error() {
+        let body = r#"{"user_info":{"auth":0},"server_info":{}}"#;
+        let (port, server) = serve_once("HTTP/1.1 200 OK", body);
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "wrong".into());
+        let error = account.fetch_live_categories().unwrap_err();
+        assert!(matches!(error, XtreamError::AuthFailed));
+        assert!(error.to_string().contains("password"));
+        let _ = server.join();
+    }
+
+    #[test]
+    fn player_api_auth_failure_accepts_common_panel_scalar_types() {
+        for auth in [
+            serde_json::Value::Bool(false),
+            serde_json::Value::Number(0.into()),
+            serde_json::Value::String("0".into()),
+        ] {
+            let object = serde_json::json!({"user_info": {"auth": auth}});
+            assert!(api_auth_failed(object.as_object().unwrap()));
+        }
+    }
+
+    #[test]
+    fn unexpected_player_api_object_is_not_reported_as_invalid_json() {
+        let body = r#"{"error":"maintenance"}"#;
+        let (port, server) = serve_once("HTTP/1.1 200 OK", body);
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let error = account.fetch_live_categories().unwrap_err();
+        assert!(matches!(error, XtreamError::UnexpectedApiReply));
+        let _ = server.join();
+    }
+
+    #[test]
     fn live_streams_parse_with_lenient_fields() {
         // stream_id as string, category_id as number/null, epg id and
         // name missing or empty — all real-world panel output.
@@ -568,6 +722,20 @@ mod tests {
                 .to_string()
                 .contains("check server URL and credentials")
         );
+        let _ = server.join();
+    }
+
+    #[test]
+    fn stalled_server_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(PLAYLIST_TIMEOUT + Duration::from_millis(250));
+        });
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let error = account.fetch().err().unwrap();
+        assert!(matches!(error, XtreamError::Http(_)));
         let _ = server.join();
     }
 }

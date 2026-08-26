@@ -10,7 +10,6 @@
 //! `0600` on Unix, but they are not encrypted.
 
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -241,14 +240,8 @@ impl Config {
         if let Some(parent) = path.parent() {
             private_file::create_dir_all(parent).map_err(|e| ConfigError::Write(e.to_string()))?;
         }
-        let tmp = unique_tmp(path);
-        let write_and_rename =
-            private_file::write(&tmp, text.as_bytes()).and_then(|()| fs::rename(&tmp, path));
-        if let Err(e) = write_and_rename {
-            let _ = fs::remove_file(&tmp);
-            return Err(ConfigError::Write(e.to_string()));
-        }
-        Ok(())
+        private_file::atomic_write(path, text.as_bytes())
+            .map_err(|error| ConfigError::Write(error.to_string()))
     }
 
     /// Returns the default config file path, or `None` on platforms without a
@@ -288,17 +281,6 @@ impl XtreamConfig {
     pub fn password(&self) -> &str {
         &self.password
     }
-}
-
-/// A sibling temp path unique to this process and moment, so concurrent
-/// writers cannot clobber each other's temp file before their renames.
-fn unique_tmp(path: &Path) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp.{}.{nanos}", std::process::id()));
-    path.with_file_name(name)
 }
 
 #[cfg(test)]

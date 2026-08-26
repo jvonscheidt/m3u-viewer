@@ -23,13 +23,15 @@
 //! ```
 
 pub mod app;
-mod cache;
 pub mod config;
 pub mod epg;
 pub mod loader;
 pub mod player;
 pub mod playlist;
-mod private_file;
 pub mod store;
 pub mod ui;
 pub mod xtream;
+
+// Persistence implementation details are intentionally not public API.
+mod cache;
+mod private_file;

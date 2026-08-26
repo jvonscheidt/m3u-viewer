@@ -145,7 +145,7 @@ fn load_file(path: &Path, tx: &Sender<LoadEvent>) -> Result<(), String> {
         tx,
     )
     .map_err(|e| e.to_string())?;
-    log::info!("file playlist parsed: {} channels", summary.channels);
+    log::info!("file playlist parsed: {} channels", summary.delivered);
     Ok(())
 }
 
@@ -167,10 +167,10 @@ fn load_cached(path: &Path, tx: &Sender<LoadEvent>) -> bool {
         &mut None,
         tx,
     ) {
-        Ok(summary) if summary.channels > 0 => {
+        Ok(summary) if summary.delivered > 0 => {
             log::info!(
                 "showing {} cached channels while refreshing",
-                summary.channels
+                summary.delivered
             );
             true
         }
@@ -266,7 +266,7 @@ fn load_xtream_m3u(
             return Err(error.to_string());
         }
     };
-    if summary.channels == 0 {
+    if summary.delivered == 0 {
         if let Some(tmp) = &tmp_path {
             cache::discard_temp(tmp);
         }
@@ -278,7 +278,7 @@ fn load_xtream_m3u(
     if let (Some(tmp), Some(path)) = (&tmp_path, cache_path) {
         cache::promote(tmp, path);
     }
-    log::info!("xtream playlist parsed: {} channels", summary.channels);
+    log::info!("xtream playlist parsed: {} channels", summary.delivered);
     Ok(())
 }
 
@@ -408,24 +408,27 @@ fn format_m3u_entry(name: &str, url: &str, tvg_id: Option<&str>, group: Option<&
 
     let mut line = String::from("#EXTINF:-1");
     if let Some(id) = tvg_id {
-        let id = encode_m3u_text(id);
+        let id = encode_m3u_attribute(id);
         let _ = write!(line, " tvg-id=\"{id}\"");
     }
     if let Some(group) = group {
-        let group = encode_m3u_text(group);
+        let group = encode_m3u_attribute(group);
         let _ = write!(line, " group-title=\"{group}\"");
     }
     line.push(',');
-    line.push_str(&encode_m3u_text(name));
+    line.push_str(&single_line_m3u_text(name));
     line.push('\n');
     line.push_str(url);
     line.push('\n');
     line
 }
 
-fn encode_m3u_text(text: &str) -> String {
-    let single_line = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
-    quick_xml::escape::escape(&single_line).into_owned()
+fn encode_m3u_attribute(text: &str) -> String {
+    single_line_m3u_text(text).replace('"', "&quot;")
+}
+
+fn single_line_m3u_text(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
 /// Whether the input must start with the `#EXTM3U` header.
@@ -439,8 +442,8 @@ enum Header {
 
 /// What [`parse_stream`] saw, for post-parse diagnostics.
 struct ParseSummary {
-    /// Total channels parsed across all batches.
-    channels: usize,
+    /// Total channels delivered across all batches.
+    delivered: usize,
     /// First non-blank line of the input (truncated), so an error message
     /// can show what a channel-less response actually contained.
     first_line: Option<String>,
@@ -533,10 +536,10 @@ fn parse_stream(
         std::mem::take(&mut playlist.channels),
         playlist.groups()[groups_sent..].to_vec(),
         playlist.skipped,
-        Some(100),
+        percent(bytes_read, total_bytes),
     );
     Ok(ParseSummary {
-        channels: *delivered,
+        delivered: *delivered,
         first_line,
     })
 }
@@ -619,6 +622,33 @@ mod tests {
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        port
+    }
+
+    /// One-shot response that closes before its declared body length,
+    /// producing a read error after the supplied playlist bytes.
+    fn serve_truncated(body: String) -> u16 {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 1024];
+            let mut request = Vec::new();
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+                if n == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len() + 1024
             );
             stream.write_all(response.as_bytes()).unwrap();
         });
@@ -795,6 +825,29 @@ mod tests {
         assert!(error.is_none());
     }
 
+    #[test]
+    fn partial_m3u_delivery_does_not_fall_back_to_the_player_api() {
+        use std::fmt::Write as _;
+
+        let mut body = String::from("#EXTM3U\n");
+        for index in 0..BATCH_SIZE {
+            writeln!(
+                body,
+                "#EXTINF:-1,Channel {index}\nhttp://example.com/{index}"
+            )
+            .unwrap();
+        }
+        let port = serve_truncated(body);
+        let (channels, error) = drain(&spawn(xtream_source(port), None));
+
+        assert_eq!(channels, BATCH_SIZE);
+        let error = error.unwrap();
+        assert!(
+            !error.contains("player API"),
+            "fallback duplicated a partial load: {error}"
+        );
+    }
+
     /// Unique temp dir to use as a cache directory, cleaned up by the
     /// caller once the test is done with it.
     fn temp_cache_dir(tag: &str) -> PathBuf {
@@ -915,17 +968,22 @@ mod tests {
             format_m3u_entry(
                 "One\r\n\"Prime\" & Live",
                 "http://u/one",
-                Some("one&\".tv"),
+                Some("one\"&.tv"),
                 Some("Kids \"R\" & News\nLive"),
             )
         );
+
+        assert!(text.contains(",One \"Prime\" & Live\n"));
+        assert!(text.contains("tvg-id=\"one&quot;&.tv\""));
+        assert!(text.contains("group-title=\"Kids &quot;R&quot; & News Live\""));
+        assert!(!text.contains("&amp;"));
 
         let playlist = crate::playlist::Playlist::from_reader(text.as_bytes()).unwrap();
         assert_eq!(playlist.channels.len(), 1);
         let channel = &playlist.channels[0];
         assert_eq!(channel.name, "One \"Prime\" & Live");
         assert_eq!(channel.url, "http://u/one");
-        assert_eq!(channel.tvg_id.as_deref(), Some("one&\".tv"));
+        assert_eq!(channel.tvg_id.as_deref(), Some("one\"&.tv"));
         assert_eq!(
             playlist.group_name(channel.group.unwrap()),
             Some("Kids \"R\" & News Live")

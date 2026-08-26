@@ -39,7 +39,7 @@ pub fn open(path: &Path) -> Option<File> {
 pub fn create_temp(path: &Path) -> Option<(File, PathBuf)> {
     let parent = path.parent()?;
     private_file::create_dir_all(parent).ok()?;
-    let tmp = unique_tmp(path);
+    let tmp = private_file::unique_tmp(path);
     let file = private_file::create(&tmp).ok()?;
     Some((file, tmp))
 }
@@ -47,26 +47,13 @@ pub fn create_temp(path: &Path) -> Option<(File, PathBuf)> {
 /// Atomically replaces the cache at `path` with the finished temp file
 /// from [`create_temp`].
 pub fn promote(tmp: &Path, path: &Path) {
-    if fs::rename(tmp, path).is_err() {
-        discard_temp(tmp);
-    }
+    let _ = private_file::promote(tmp, path);
 }
 
 /// Removes a temp file whose write was aborted (parse failure, I/O
 /// error) instead of promoted.
 pub fn discard_temp(tmp: &Path) {
     let _ = fs::remove_file(tmp);
-}
-
-/// A sibling temp path unique to this process and moment, e.g.
-/// `xtream-example.m3u.tmp.4711.1234567890`.
-fn unique_tmp(path: &Path) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp.{}.{nanos}", std::process::id()));
-    path.with_file_name(name)
 }
 
 #[cfg(test)]

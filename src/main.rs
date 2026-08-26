@@ -4,7 +4,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -251,6 +251,28 @@ fn load_store() -> Option<Store> {
     }
 }
 
+fn config_to_save(args: &Args, current: &Config) -> Config {
+    let xtream = match &args.source {
+        Source::Xtream(account) => {
+            let (server, username, password) = account.credentials();
+            Some(XtreamConfig::new(
+                server.to_owned(),
+                username.to_owned(),
+                password.to_owned(),
+            ))
+        }
+        // Preserve existing Xtream config when saving with a file source.
+        Source::File(_) => current.xtream().cloned(),
+    };
+    Config::default()
+        .with_xtream(xtream)
+        .with_vlc_path(args.vlc_override.clone())
+        .with_user_agent(args.user_agent.clone())
+        .with_epg_url(args.epg.clone())
+        .with_regex_filter(current.regex_filter())
+        .with_vlc_reuse_instance(args.vlc_reuse_instance)
+}
+
 fn main() -> Result<()> {
     let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
     if version_requested(&raw_args)? {
@@ -296,25 +318,7 @@ fn main() -> Result<()> {
     }
 
     if args.save_config {
-        let xtream = match &args.source {
-            Source::Xtream(account) => {
-                let (server, username, password) = account.credentials();
-                Some(XtreamConfig::new(
-                    server.to_owned(),
-                    username.to_owned(),
-                    password.to_owned(),
-                ))
-            }
-            // Preserve existing Xtream config when saving with a file source.
-            Source::File(_) => config.xtream().cloned(),
-        };
-        let new_config = Config::default()
-            .with_xtream(xtream)
-            .with_vlc_path(args.vlc_override.clone())
-            .with_user_agent(args.user_agent.clone())
-            .with_epg_url(args.epg.clone())
-            .with_regex_filter(config.regex_filter())
-            .with_vlc_reuse_instance(args.vlc_reuse_instance);
+        let new_config = config_to_save(&args, &config);
         match config_path {
             Some(ref path) => {
                 if let Err(e) = new_config.save(path) {
@@ -344,10 +348,7 @@ fn main() -> Result<()> {
             None
         }
     });
-    let epg_runtime = EpgRuntime {
-        rx: epg_source.map(|source| epg::spawn(source, args.user_agent.clone())),
-        user_agent: args.user_agent,
-    };
+    let epg_runtime = EpgRuntime::new(epg_source, args.user_agent);
     let events = loader::spawn(args.source, Store::default_dir());
 
     let mut terminal = ratatui::init();
@@ -370,6 +371,75 @@ fn main() -> Result<()> {
 struct EpgRuntime {
     rx: Option<Receiver<EpgEvent>>,
     user_agent: Option<String>,
+    active_playlist_url: Option<String>,
+    pending_playlist_url: Option<String>,
+    resolved: bool,
+}
+
+impl EpgRuntime {
+    fn new(source: Option<EpgSource>, user_agent: Option<String>) -> Self {
+        Self {
+            rx: source.map(|source| epg::spawn(source, user_agent.clone())),
+            user_agent,
+            active_playlist_url: None,
+            pending_playlist_url: None,
+            resolved: false,
+        }
+    }
+
+    fn observe_playlist_url(&mut self, url: &str) -> bool {
+        if self.resolved {
+            return false;
+        }
+        if self.rx.is_some() {
+            if self.active_playlist_url.as_deref() != Some(url) {
+                self.pending_playlist_url = Some(url.to_owned());
+            }
+            return false;
+        }
+        self.start_playlist_url(url.to_owned());
+        true
+    }
+
+    fn take_event(&mut self) -> Option<EpgEvent> {
+        let result = self.rx.as_ref()?.try_recv();
+        match result {
+            Ok(event) => {
+                self.rx = None;
+                self.active_playlist_url = None;
+                self.resolved = matches!(&event, EpgEvent::Loaded(_));
+                if self.resolved {
+                    self.pending_playlist_url = None;
+                }
+                Some(event)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.rx = None;
+                self.active_playlist_url = None;
+                None
+            }
+        }
+    }
+
+    fn start_pending(&mut self) -> bool {
+        if self.resolved || self.rx.is_some() {
+            return false;
+        }
+        let Some(url) = self.pending_playlist_url.take() else {
+            return false;
+        };
+        self.start_playlist_url(url);
+        true
+    }
+
+    fn start_playlist_url(&mut self, url: String) {
+        self.rx = Some(epg::spawn(
+            EpgSource::from_arg(&url),
+            self.user_agent.clone(),
+        ));
+        self.active_playlist_url = Some(url);
+    }
 }
 
 /// Event loop: drain loader batches, redraw, dispatch key presses, and
@@ -395,22 +465,20 @@ fn run(
             // source, Xtream default, or the same URL from the cached
             // copy of this playlist).
             if let LoadEvent::EpgUrl(url) = &event
-                && epg_runtime.rx.is_none()
+                && epg_runtime.observe_playlist_url(url)
             {
-                epg_runtime.rx = Some(epg::spawn(
-                    EpgSource::from_arg(url),
-                    epg_runtime.user_agent.clone(),
-                ));
                 app.set_epg_loading();
             }
             app.on_load_event(event);
         }
-        if let Some(rx) = &epg_runtime.rx {
-            while let Ok(event) = rx.try_recv() {
-                app.on_epg_event(event);
-            }
+        while let Some(event) = epg_runtime.take_event() {
+            app.on_epg_event(event);
         }
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        if epg_runtime.start_pending() {
+            app.set_epg_loading();
+        }
+        app.update_viewports(usize::from(terminal.size()?.height));
+        terminal.draw(|frame| ui::draw(frame, &app))?;
         if app.should_quit() {
             return Ok(());
         }
@@ -442,6 +510,7 @@ fn run(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use m3u_viewer::config::XtreamConfig;
+    use m3u_viewer::epg::Guide;
 
     use super::*;
 
@@ -604,6 +673,88 @@ mod tests {
         ])
         .unwrap();
         assert!(args.save_config);
+    }
+
+    #[test]
+    fn file_source_save_preserves_xtream_credentials_and_regex_setting() {
+        let current = Config::default()
+            .with_xtream(Some(XtreamConfig::new(
+                "http://example.com".to_owned(),
+                "stored-user".to_owned(),
+                "stored-password".to_owned(),
+            )))
+            .with_regex_filter(false);
+        let args = parse_args(
+            ["list.m3u", "--save-config"].iter().map(OsString::from),
+            &current,
+        )
+        .unwrap();
+
+        let saved = config_to_save(&args, &current);
+        let xtream = saved.xtream().unwrap();
+        assert_eq!(xtream.server(), "http://example.com");
+        assert_eq!(xtream.username(), "stored-user");
+        assert_eq!(xtream.password(), "stored-password");
+        assert!(!saved.regex_filter());
+    }
+
+    #[test]
+    fn failed_explicit_epg_keeps_the_playlist_source_for_retry() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut runtime = EpgRuntime {
+            rx: Some(rx),
+            user_agent: None,
+            active_playlist_url: None,
+            pending_playlist_url: None,
+            resolved: false,
+        };
+
+        assert!(!runtime.observe_playlist_url("fallback.xml"));
+        assert_eq!(
+            runtime.pending_playlist_url.as_deref(),
+            Some("fallback.xml")
+        );
+        tx.send(EpgEvent::Failed("primary failed".to_owned()))
+            .unwrap();
+        assert!(matches!(runtime.take_event(), Some(EpgEvent::Failed(_))));
+        assert!(runtime.rx.is_none());
+        assert!(!runtime.resolved);
+        assert!(runtime.start_pending());
+        assert_eq!(runtime.active_playlist_url.as_deref(), Some("fallback.xml"));
+    }
+
+    #[test]
+    fn successful_epg_discards_and_blocks_playlist_sources() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut runtime = EpgRuntime {
+            rx: Some(rx),
+            user_agent: None,
+            active_playlist_url: None,
+            pending_playlist_url: Some("fallback.xml".to_owned()),
+            resolved: false,
+        };
+
+        tx.send(EpgEvent::Loaded(Guide::default())).unwrap();
+        assert!(matches!(runtime.take_event(), Some(EpgEvent::Loaded(_))));
+        assert!(runtime.rx.is_none());
+        assert!(runtime.resolved);
+        assert!(runtime.pending_playlist_url.is_none());
+        assert!(!runtime.observe_playlist_url("second.xml"));
+    }
+
+    #[test]
+    fn duplicate_inflight_playlist_epg_url_is_ignored() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut runtime = EpgRuntime {
+            rx: Some(rx),
+            user_agent: None,
+            active_playlist_url: Some("guide.xml".to_owned()),
+            pending_playlist_url: None,
+            resolved: false,
+        };
+
+        assert!(!runtime.observe_playlist_url("guide.xml"));
+        assert!(runtime.pending_playlist_url.is_none());
     }
 
     #[test]

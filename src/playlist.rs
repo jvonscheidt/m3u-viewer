@@ -145,7 +145,6 @@ pub struct PlaylistBuilder {
     /// True after a malformed `#EXTINF`: its URL line is swallowed without
     /// producing a channel (the entry was already counted as skipped).
     pending_malformed: bool,
-    seen_first_line: bool,
     /// Guide URL from the `#EXTM3U` header, when it carries one.
     tvg_url: Option<String>,
 }
@@ -160,11 +159,7 @@ impl PlaylistBuilder {
     /// Consumes one line of playlist text (with or without the trailing
     /// newline). Malformed input never fails; it is counted instead.
     pub fn push_line(&mut self, line: &str) {
-        let mut text = line.trim();
-        if !self.seen_first_line {
-            text = text.trim_start_matches('\u{feff}');
-            self.seen_first_line = true;
-        }
+        let text = line.trim().trim_start_matches('\u{feff}');
         if text.is_empty() {
             return;
         }
@@ -305,9 +300,9 @@ fn split_at_unquoted_comma(s: &str) -> Option<(&str, &str)> {
 /// any tokens that are not `name="value"` pairs are skipped), so `key`
 /// matches only as a whole attribute name — never as a substring of another
 /// name (`x-tvg-id`) and never inside another attribute's quoted value.
-/// Attributes without a closing quote are treated as absent. XML entities
-/// are decoded because generated and third-party M3U files commonly use them
-/// to represent quotes and ampersands inside values.
+/// A malformed quoted value is skipped so later attributes can still be
+/// recovered. XML entities are decoded because generated and third-party M3U
+/// files commonly use them to represent quotes and ampersands inside values.
 fn attribute(meta: &str, key: &str) -> Option<String> {
     let bytes = meta.as_bytes();
     let mut i = 0;
@@ -329,12 +324,37 @@ fn attribute(meta: &str, key: &str) -> Option<String> {
             if i < bytes.len() && bytes[i] == b'"' {
                 i += 1;
                 let value_start = i;
+                let mut next_attribute = None;
                 while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i].is_ascii_whitespace() {
+                        let mut next = i;
+                        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                            next += 1;
+                        }
+                        let mut equals = next;
+                        while equals < bytes.len()
+                            && bytes[equals] != b'='
+                            && !bytes[equals].is_ascii_whitespace()
+                        {
+                            equals += 1;
+                        }
+                        if equals + 1 < bytes.len()
+                            && bytes[equals] == b'='
+                            && bytes[equals + 1] == b'"'
+                        {
+                            next_attribute = Some(next);
+                            break;
+                        }
+                    }
                     i += 1;
                 }
+                if let Some(next) = next_attribute {
+                    i = next;
+                    continue;
+                }
                 if i >= bytes.len() {
-                    // Unterminated quote: treat as absent.
-                    return None;
+                    // Unterminated final attribute: treat it as absent.
+                    break;
                 }
                 let value = &meta[value_start..i];
                 i += 1; // Consume the closing quote.
@@ -348,7 +368,27 @@ fn attribute(meta: &str, key: &str) -> Option<String> {
 }
 
 fn decode_text(text: &str) -> String {
-    quick_xml::escape::unescape(text).map_or_else(|_| text.to_owned(), std::borrow::Cow::into_owned)
+    let mut decoded = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find('&') {
+        decoded.push_str(&remaining[..start]);
+        let entity = &remaining[start..];
+        let Some(end) = entity.find(';').filter(|&end| end <= 16) else {
+            decoded.push('&');
+            remaining = &entity[1..];
+            continue;
+        };
+        let candidate = &entity[..=end];
+        if let Ok(value) = quick_xml::escape::unescape(candidate) {
+            decoded.push_str(&value);
+            remaining = &entity[end + 1..];
+        } else {
+            decoded.push('&');
+            remaining = &entity[1..];
+        }
+    }
+    decoded.push_str(remaining);
+    decoded
 }
 
 /// Interns `name`, returning the id of an existing entry when possible.
@@ -459,6 +499,18 @@ mod tests {
     }
 
     #[test]
+    fn decodes_entities_next_to_literal_ampersands() {
+        let playlist =
+            parse("#EXTINF:-1 group-title=\"Rock & Roll &quot;Live&quot;\",A & B\nhttp://u\n");
+        let channel = &playlist.channels[0];
+        assert_eq!(channel.name, "A & B");
+        assert_eq!(
+            playlist.group_name(channel.group.unwrap()),
+            Some("Rock & Roll \"Live\"")
+        );
+    }
+
+    #[test]
     fn handles_bom_crlf_blank_lines_and_comments() {
         let playlist =
             parse("\u{feff}#EXTM3U\r\n\r\n# a comment\r\n#EXTINF:-1,A\r\nhttp://u/a\r\n");
@@ -466,6 +518,18 @@ mod tests {
         assert_eq!(playlist.channels[0].name, "A");
         assert_eq!(playlist.channels[0].url, "http://u/a");
         assert_eq!(playlist.skipped, 0);
+    }
+
+    #[test]
+    fn bom_after_leading_blank_line_is_accepted() {
+        let mut builder = PlaylistBuilder::new();
+        builder.push_line("");
+        builder.push_line("\u{feff}#EXTM3U url-tvg=\"http://example.com/epg.xml\"");
+        builder.push_line("#EXTINF:-1,A");
+        builder.push_line("http://u/a");
+
+        assert_eq!(builder.tvg_url(), Some("http://example.com/epg.xml"));
+        assert_eq!(builder.finish().channels.len(), 1);
     }
 
     #[test]
@@ -502,9 +566,14 @@ mod tests {
 
     #[test]
     fn unterminated_attribute_quote_is_absent() {
-        // Exercised directly: a never-closed quote in the full payload is
-        // rejected earlier (no separator comma), so this guards attribute().
         assert_eq!(attribute("-1 tvg-id=\"abc", "tvg-id"), None);
+    }
+
+    #[test]
+    fn malformed_attribute_does_not_hide_a_later_attribute() {
+        let metadata = "-1 tvg-id=\"broken group-title=\"News\"";
+        assert_eq!(attribute(metadata, "tvg-id"), None);
+        assert_eq!(attribute(metadata, "group-title"), Some("News".to_owned()));
     }
 
     #[test]

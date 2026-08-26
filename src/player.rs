@@ -2,6 +2,7 @@
 //! it as a detached process, so the viewer keeps running.
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -14,8 +15,8 @@ pub enum PlayerError {
     /// No usable VLC executable was found during discovery.
     #[error("VLC not found — checked --vlc, PATH, and standard install folders")]
     NotFound,
-    /// A `--vlc` override was given but does not point at an executable.
-    #[error("--vlc path is not a file: {0}")]
+    /// A `--vlc` override was given but does not point at an executable file.
+    #[error("--vlc path is not an executable file: {0}")]
     BadOverride(PathBuf),
     /// VLC was found but could not be started.
     #[error("failed to launch VLC: {0}")]
@@ -38,18 +39,18 @@ impl Player {
     ///
     /// # Errors
     ///
-    /// [`PlayerError::BadOverride`] if `override_path` is set but not a
-    /// file; [`PlayerError::NotFound`] if discovery comes up empty.
+    /// [`PlayerError::BadOverride`] if `override_path` is set but is not
+    /// executable; [`PlayerError::NotFound`] if discovery comes up empty.
     pub fn discover(override_path: Option<&Path>) -> Result<Self, PlayerError> {
         if let Some(path) = override_path {
-            return if path.is_file() {
+            return if is_executable_file(path) {
                 log::info!("using VLC override: {}", path.display());
                 Ok(Self {
                     exe: path.to_path_buf(),
                     reuse_instance: false,
                 })
             } else {
-                log::warn!("VLC override is not a file: {}", path.display());
+                log::warn!("VLC override is not executable: {}", path.display());
                 Err(PlayerError::BadOverride(path.to_path_buf()))
             };
         }
@@ -93,6 +94,8 @@ impl Player {
     /// already-running instance and plays it immediately (replacing
     /// whatever it was playing) instead of spawning a new window; the
     /// first launch still starts VLC normally since no instance exists yet.
+    /// On Linux this relies on VLC's D-Bus single-instance support, which
+    /// may be unavailable in headless or minimal desktop environments.
     ///
     /// # Errors
     ///
@@ -126,12 +129,36 @@ fn find_executable<'a>(dirs: impl Iterator<Item = &'a Path>) -> Option<PathBuf> 
     for dir in dirs {
         for name in names {
             let candidate = dir.join(name);
-            if candidate.is_file() {
+            if is_executable_file(&candidate) {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(windows)]
+    {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        true
+    }
 }
 
 /// Standard VLC install directories for the current platform.
@@ -164,9 +191,17 @@ mod tests {
     /// Creates a unique temp dir containing a fake VLC executable.
     fn fake_vlc_dir(tag: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("m3u-viewer-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let name = if cfg!(windows) { "vlc.exe" } else { "vlc" };
-        fs::write(dir.join(name), b"").unwrap();
+        let path = dir.join(name);
+        fs::write(&path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         dir
     }
 
@@ -185,6 +220,24 @@ mod tests {
         let exe = dir.join(if cfg!(windows) { "vlc.exe" } else { "vlc" });
         let player = Player::discover(Some(&exe)).unwrap();
         assert_eq!(player.exe(), exe);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn override_rejects_a_non_executable_file() {
+        let dir = env::temp_dir().join(format!(
+            "m3u-viewer-test-bad-override-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(if cfg!(windows) { "vlc.txt" } else { "vlc" });
+        fs::write(&path, b"not executable").unwrap();
+
+        assert!(matches!(
+            Player::discover(Some(&path)),
+            Err(PlayerError::BadOverride(_))
+        ));
         fs::remove_dir_all(dir).unwrap();
     }
 

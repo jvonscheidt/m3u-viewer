@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -141,7 +140,7 @@ impl Store {
     fn save(&self, file: &str, list: &[String]) -> Result<(), StoreError> {
         private_file::create_dir_all(&self.dir)?;
         let json = serde_json::to_string_pretty(list)?;
-        atomic_write(&self.dir.join(file), &json)?;
+        private_file::atomic_write(&self.dir.join(file), json.as_bytes())?;
         Ok(())
     }
 }
@@ -167,36 +166,12 @@ fn read_list(path: &Path) -> Result<Vec<String>, StoreError> {
     })
 }
 
-/// Writes via a sibling temp file and rename, so a crash mid-write can
-/// never leave a truncated JSON file behind. The temp name is unique per
-/// process and instant, so two concurrent writers cannot clobber each
-/// other's temp file before their renames.
-fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
-    let tmp = unique_tmp(path);
-    let result =
-        private_file::write(&tmp, contents.as_bytes()).and_then(|()| fs::rename(&tmp, path));
-    if result.is_err() {
-        // Best effort: don't leave the temp file behind on failure.
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
-/// A sibling temp path unique to this process and moment, e.g.
-/// `favorites.json.tmp.4711.1234567890`.
-fn unique_tmp(path: &Path) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp.{}.{nanos}", std::process::id()));
-    path.with_file_name(name)
-}
-
 #[cfg(test)]
 // unwrap is fine in tests (see CLAUDE.md).
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     /// Fresh directory under the system temp dir, unique per test.

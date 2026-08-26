@@ -3,8 +3,8 @@
 //! An XMLTV document — from a local file, an HTTP(S) URL, or an Xtream
 //! panel's `xmltv.php` — is parsed in one streaming pass into a [`Guide`]:
 //! programme lists per channel id plus a display-name index for playlist
-//! entries without a `tvg-id`. Only programmes overlapping a bounded
-//! 12-hour window around "now" are kept, so multi-day
+//! entries without a `tvg-id`. Only programmes ending after "now" and
+//! starting within the next 12 hours are kept, so multi-day
 //! guides for very large playlists stay small in memory. [`spawn`] runs
 //! the fetch and parse on a background thread, mirroring how the playlist
 //! itself is loaded, and delivers a single [`EpgEvent`] over a channel.
@@ -84,7 +84,7 @@ impl Programme {
 pub struct Guide {
     /// XMLTV channel id → programmes sorted by start time.
     programmes: HashMap<String, Vec<Programme>>,
-    /// Lowercased `<display-name>` → XMLTV channel id.
+    /// Lowercased `<display-name>` → first XMLTV channel id using that name.
     display_names: HashMap<String, String>,
 }
 
@@ -155,9 +155,9 @@ enum TextTarget {
 /// [`EpgError::Xml`] when the document is not well-formed XML (which
 /// includes I/O failures of the underlying reader).
 pub fn parse_xmltv<R: BufRead>(input: R, now: i64) -> Result<Guide, EpgError> {
-    // No trim_text: entity references split text into several events,
-    // and per-event trimming would eat the spaces around them. Collected
-    // text is trimmed once, when its element ends.
+    // No trim_text: per-event trimming could eat spaces around separately
+    // reported entity references. Collected text is trimmed once, when its
+    // element ends.
     let mut reader = XmlReader::from_reader(input);
     let mut guide = Guide::default();
     let mut buf = Vec::new();
@@ -196,8 +196,8 @@ pub fn parse_xmltv<R: BufRead>(input: R, now: i64) -> Result<Guide, EpgError> {
                     text.push_str(&String::from_utf8_lossy(&t));
                 }
             }
-            // `&amp;` and friends arrive as their own events, not as part
-            // of the surrounding text.
+            // Handle references when quick-xml reports them separately;
+            // versions/configurations that expand them into Text work too.
             XmlEvent::GeneralRef(reference) => {
                 if !matches!(target, TextTarget::None)
                     && let Some(ch) = resolve_reference(&reference)
@@ -212,7 +212,10 @@ pub fn parse_xmltv<R: BufRead>(input: R, now: i64) -> Result<Guide, EpgError> {
                         && let Some(id) = &channel_id
                         && !name.is_empty()
                     {
-                        guide.display_names.insert(name.to_lowercase(), id.clone());
+                        guide
+                            .display_names
+                            .entry(name.to_lowercase())
+                            .or_insert_with(|| id.clone());
                     }
                     target = TextTarget::None;
                 }
@@ -304,7 +307,7 @@ fn parse_xmltv_time(value: &str) -> Option<i64> {
         Some((digits, offset)) => (digits, Some(offset.trim())),
         None => (value, None),
     };
-    if !(12..=14).contains(&digits.len()) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if !matches!(digits.len(), 12 | 14) || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let mut padded = digits.to_owned();
@@ -466,6 +469,11 @@ mod tests {
         time.format("%Y%m%d%H%M%S +0000").to_string()
     }
 
+    fn stamp_seconds(offset_seconds: i64) -> String {
+        let time = DateTime::from_timestamp(NOW + offset_seconds, 0).unwrap();
+        time.format("%Y%m%d%H%M%S +0000").to_string()
+    }
+
     fn sample_guide() -> Guide {
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -517,10 +525,47 @@ mod tests {
     }
 
     #[test]
+    fn programme_window_boundaries_are_exact() {
+        let xml = format!(
+            r#"<tv>
+<programme start="{}" stop="{}" channel="one.tv"><title>Just Ended</title></programme>
+<programme start="{}" stop="{}" channel="one.tv"><title>Lookahead Edge</title></programme>
+</tv>"#,
+            stamp_seconds(-3600),
+            stamp_seconds(0),
+            stamp_seconds(KEEP_AHEAD_SECS),
+            stamp_seconds(KEEP_AHEAD_SECS + 3600),
+        );
+        let guide = parse(&xml);
+        let (current, next) = guide.now_next(Some("one.tv"), "x", NOW);
+        assert!(current.is_none());
+        assert_eq!(next.unwrap().title, "Lookahead Edge");
+    }
+
+    #[test]
     fn display_name_fallback_matches_case_insensitively() {
         let guide = sample_guide();
         let (current, _) = guide.now_next(None, "CHANNEL TWO", NOW);
         assert_eq!(current.unwrap().title, "Match <Live>");
+    }
+
+    #[test]
+    fn duplicate_display_names_keep_the_first_channel() {
+        let xml = format!(
+            r#"<tv>
+<channel id="first.tv"><display-name>Shared</display-name></channel>
+<channel id="second.tv"><display-name>Shared</display-name></channel>
+<programme start="{}" stop="{}" channel="first.tv"><title>First</title></programme>
+<programme start="{}" stop="{}" channel="second.tv"><title>Second</title></programme>
+</tv>"#,
+            stamp(-1),
+            stamp(1),
+            stamp(-1),
+            stamp(1),
+        );
+        let guide = parse(&xml);
+        let (current, _) = guide.now_next(None, "shared", NOW);
+        assert_eq!(current.unwrap().title, "First");
     }
 
     #[test]
@@ -593,6 +638,7 @@ mod tests {
         );
         assert_eq!(parse_xmltv_time(""), None);
         assert_eq!(parse_xmltv_time("20260705"), None);
+        assert_eq!(parse_xmltv_time("2026070510000"), None);
     }
 
     #[test]

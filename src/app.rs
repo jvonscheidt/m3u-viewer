@@ -66,8 +66,8 @@ pub enum EpgState {
     Loading,
     /// The guide is ready for now/next lookups.
     Ready(Guide),
-    /// Loading failed; the detailed error is in the log file.
-    Failed,
+    /// Loading failed; retains the error for diagnostics.
+    Failed(String),
 }
 
 /// A channel the user asked to play, handed from [`App::handle_key`] to
@@ -161,7 +161,9 @@ pub struct App {
     pub(crate) skipped: usize,
     pub(crate) error: Option<String>,
     pub(crate) file_name: String,
-    /// Cursor in the visible group popup rows.
+    /// Cursor in the visible group popup rows. Row zero is the synthetic
+    /// "(all groups)" entry without a search, but the first real match while
+    /// searching.
     pub(crate) group_cursor: usize,
     /// Case-insensitive substring search applied inside the group popup.
     pub(crate) group_search: String,
@@ -333,7 +335,7 @@ impl App {
     pub fn on_epg_event(&mut self, event: EpgEvent) {
         self.epg = match event {
             EpgEvent::Loaded(guide) => EpgState::Ready(guide),
-            EpgEvent::Failed(_) => EpgState::Failed,
+            EpgEvent::Failed(message) => EpgState::Failed(message),
         };
     }
 
@@ -429,7 +431,7 @@ impl App {
                 self.mode = Mode::Groups;
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('e') => match self.epg {
+            KeyCode::Char('e') => match &self.epg {
                 EpgState::Absent => {
                     self.message =
                         Some("✗ no EPG source (--epg, url-tvg, or an Xtream account)".to_owned());
@@ -484,7 +486,7 @@ impl App {
                 self.filter.pop();
                 self.recompute_filter();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if is_text_input(c, key.modifiers) => {
                 self.filter.push(c);
                 self.recompute_filter();
             }
@@ -523,7 +525,7 @@ impl App {
                 self.group_search.pop();
                 self.rebuild_visible_groups();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if is_text_input(c, key.modifiers) => {
                 self.group_search.push(c);
                 self.rebuild_visible_groups();
             }
@@ -540,6 +542,7 @@ impl App {
             self.visible_groups.get(self.group_cursor).copied()
         };
         if !self.group_search.is_empty() && selected.is_none() {
+            self.message = Some("✗ no matching groups".to_owned());
             return;
         }
         self.group_filter = selected;
@@ -620,8 +623,7 @@ impl App {
             // recents view must show nothing, not everything.
             (View::Favorites | View::Recents, None) => Vec::new(),
         };
-        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
-        self.offset = self.offset.min(self.selected);
+        self.clamp_selection();
     }
 
     /// Merge-updates [`Self::sorted_channels`] (and, for the "all
@@ -670,6 +672,7 @@ impl App {
         {
             self.selected = position;
         }
+        self.clamp_selection();
     }
 
     /// Rebuilds the alphabetical group order shown in the group popup.
@@ -756,6 +759,11 @@ impl App {
         self.selected = self.selected.saturating_sub(by);
     }
 
+    fn clamp_selection(&mut self) {
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+        self.offset = self.offset.min(self.selected);
+    }
+
     fn move_down(&mut self, by: usize) {
         let last = self.filtered.len().saturating_sub(1);
         self.selected = (self.selected + by).min(last);
@@ -770,14 +778,15 @@ impl App {
         self.group_cursor = self.group_cursor.saturating_add(by).min(last);
     }
 
-    /// Records the group popup viewport height for PageUp/PageDown.
-    pub(crate) fn set_group_page_rows(&mut self, rows: usize) {
-        self.group_page_rows = rows.max(1);
+    /// Updates channel and group-popup viewport sizes for the current terminal
+    /// height, keeping the channel selection visible.
+    pub fn update_viewports(&mut self, terminal_rows: usize) {
+        let reserved_rows = 1 + usize::from(self.visible_guide().is_some());
+        self.ensure_visible(terminal_rows.saturating_sub(reserved_rows).max(1));
+        self.group_page_rows = terminal_rows.min(17).saturating_sub(3).max(1);
     }
 
-    /// Records the viewport height and scrolls `offset` so the selection
-    /// stays visible. Called from the renderer each frame.
-    pub(crate) fn ensure_visible(&mut self, rows: usize) {
+    fn ensure_visible(&mut self, rows: usize) {
         self.page_rows = rows.max(1);
         if self.selected < self.offset {
             self.offset = self.selected;
@@ -820,6 +829,12 @@ fn merge_by_key_into(out: &mut Vec<usize>, a: &[usize], b: &[usize], keys: &[Str
     out.extend_from_slice(&b[j..]);
 }
 
+fn is_text_input(character: char, modifiers: KeyModifiers) -> bool {
+    let control = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    !character.is_control() && control == alt
+}
+
 #[cfg(test)]
 // unwrap is fine in tests (see CLAUDE.md).
 #[allow(clippy::unwrap_used)]
@@ -828,6 +843,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
     }
 
     fn channel(name: &str, group: Option<GroupId>) -> Channel {
@@ -947,6 +966,23 @@ mod tests {
     }
 
     #[test]
+    fn later_batches_clamp_a_stale_selection() {
+        let mut app = loaded_app();
+        app.selected = usize::MAX;
+        app.offset = usize::MAX;
+
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Arte", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+
+        assert_eq!(app.selected, app.filtered.len() - 1);
+        assert_eq!(app.offset, app.selected);
+    }
+
+    #[test]
     fn favorites_view_is_also_alphabetical() {
         let (store, dir) = temp_store("fav-alpha");
         let mut app = App::new("test.m3u".into(), Some(store));
@@ -1037,6 +1073,23 @@ mod tests {
     }
 
     #[test]
+    fn selecting_an_empty_group_search_reports_no_match() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::GroupSearch);
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("no matching groups")
+        );
+    }
+
+    #[test]
     fn group_picker_supports_fast_scrolling() {
         let mut app = App::new("test.m3u".into(), None);
         let groups = (0..30).map(|i| format!("Group {i:02}")).collect();
@@ -1047,7 +1100,7 @@ mod tests {
             percent: Some(100),
         });
         app.handle_key(key(KeyCode::Char('g')));
-        app.set_group_page_rows(10);
+        app.update_viewports(13);
         app.handle_key(key(KeyCode::PageDown));
         assert_eq!(app.group_cursor, 10);
         app.handle_key(key(KeyCode::End));
@@ -1069,6 +1122,29 @@ mod tests {
         assert_eq!(app.filtered, vec![0]);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn text_inputs_ignore_control_and_alt_modified_characters() {
+        let mut app = loaded_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::ALT));
+        app.handle_key(key(KeyCode::Char('\u{7f}')));
+        assert!(app.filter.is_empty());
+        app.handle_key(modified_key(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(app.filter, "@");
+
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::ALT));
+        app.handle_key(key(KeyCode::Char('\u{7f}')));
+        assert!(app.group_search.is_empty());
     }
 
     #[test]
@@ -1429,7 +1505,7 @@ mod tests {
         let mut app = loaded_app();
         app.set_epg_loading();
         app.on_epg_event(EpgEvent::Failed("boom".into()));
-        assert!(matches!(app.epg, EpgState::Failed));
+        assert!(matches!(&app.epg, EpgState::Failed(message) if message == "boom"));
         assert!(app.visible_guide().is_none());
     }
 

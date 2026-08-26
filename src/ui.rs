@@ -8,16 +8,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table};
 
 use crate::app::{App, EpgState, Mode, View};
-use crate::epg::format_time;
+use crate::epg::{Programme, format_time};
+
+type ProgrammePair<'a> = (Option<&'a Programme>, Option<&'a Programme>);
 
 /// Draws one frame.
-pub fn draw(frame: &mut Frame, app: &mut App) {
+pub fn draw(frame: &mut Frame, app: &App) {
     draw_at(frame, app, chrono::Utc::now().timestamp());
 }
 
 /// Draws one frame as of `now` (Unix seconds — injected so tests render
 /// against a fixed clock).
-fn draw_at(frame: &mut Frame, app: &mut App, now: i64) {
+fn draw_at(frame: &mut Frame, app: &App, now: i64) {
+    let selected_programmes = selected_programmes(app, now);
     if app.visible_guide().is_some() {
         let [list_area, epg_area, status_area] = Layout::vertical([
             Constraint::Fill(1),
@@ -25,13 +28,13 @@ fn draw_at(frame: &mut Frame, app: &mut App, now: i64) {
             Constraint::Length(1),
         ])
         .areas(frame.area());
-        draw_channels(frame, list_area, app, now);
-        draw_epg_bar(frame, epg_area, app, now);
+        draw_channels(frame, list_area, app, now, selected_programmes);
+        draw_epg_bar(frame, epg_area, selected_programmes);
         draw_status(frame, status_area, app);
     } else {
         let [list_area, status_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-        draw_channels(frame, list_area, app, now);
+        draw_channels(frame, list_area, app, now, selected_programmes);
         draw_status(frame, status_area, app);
     }
     match app.mode {
@@ -43,7 +46,13 @@ fn draw_at(frame: &mut Frame, app: &mut App, now: i64) {
 
 /// The virtualized channel table: only the rows inside the viewport are
 /// materialized, so list size does not affect frame time.
-fn draw_channels(frame: &mut Frame, area: Rect, app: &mut App, now: i64) {
+fn draw_channels(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    now: i64,
+    selected_programmes: Option<ProgrammePair<'_>>,
+) {
     if app.filtered.is_empty() {
         let filtering = !app.filter.is_empty() || app.group_filter.is_some();
         let message = if app.channels.is_empty() {
@@ -73,7 +82,6 @@ fn draw_channels(frame: &mut Frame, area: Rect, app: &mut App, now: i64) {
         return;
     }
 
-    app.ensure_visible(usize::from(area.height));
     let guide = app.visible_guide();
     let end = (app.offset + usize::from(area.height)).min(app.filtered.len());
     let rows = app.filtered[app.offset..end]
@@ -93,10 +101,14 @@ fn draw_channels(frame: &mut Frame, area: Rect, app: &mut App, now: i64) {
             };
             let mut cells = vec![format!("{star}{}", channel.name)];
             if let Some(guide) = guide {
-                let airing = guide
-                    .now_next(channel.tvg_id.as_deref(), &channel.name, now)
-                    .0
-                    .map_or_else(String::new, |programme| programme.title.clone());
+                let current = if app.offset + row == app.selected {
+                    selected_programmes.and_then(|(current, _)| current)
+                } else {
+                    guide
+                        .now_next(channel.tvg_id.as_deref(), &channel.name, now)
+                        .0
+                };
+                let airing = current.map_or_else(String::new, |programme| programme.title.clone());
                 cells.push(airing);
             }
             cells.push(group.to_owned());
@@ -118,14 +130,19 @@ fn draw_channels(frame: &mut Frame, area: Rect, app: &mut App, now: i64) {
 
 /// One-line now/next summary for the selected channel, shown between the
 /// channel table and the status bar whenever a guide is visible.
-fn draw_epg_bar(frame: &mut Frame, area: Rect, app: &App, now: i64) {
-    let Some(guide) = app.visible_guide() else {
+fn selected_programmes(app: &App, now: i64) -> Option<ProgrammePair<'_>> {
+    let guide = app.visible_guide()?;
+    let channel = app
+        .filtered
+        .get(app.selected)
+        .map(|&index| &app.channels[index])?;
+    Some(guide.now_next(channel.tvg_id.as_deref(), &channel.name, now))
+}
+
+fn draw_epg_bar(frame: &mut Frame, area: Rect, programmes: Option<ProgrammePair<'_>>) {
+    let Some((current, next)) = programmes else {
         return;
     };
-    let Some(channel) = app.filtered.get(app.selected).map(|&i| &app.channels[i]) else {
-        return;
-    };
-    let (current, next) = guide.now_next(channel.tvg_id.as_deref(), &channel.name, now);
     if current.is_none() && next.is_none() {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -204,9 +221,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
                 .map_or_else(|| "  loading…".to_owned(), |p| format!("  loading {p}%"));
             spans.push(Span::styled(progress, Style::new().yellow()));
         }
-        match app.epg {
+        match &app.epg {
             EpgState::Loading => spans.push(Span::styled("  epg…", Style::new().dim())),
-            EpgState::Failed => {
+            EpgState::Failed(_) => {
                 spans.push(Span::styled("  epg ✗ (see log)", Style::new().dim()));
             }
             EpgState::Absent | EpgState::Ready(_) => {}
@@ -242,7 +259,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Centered popup listing "(all groups)" plus every interned group, in
 /// alphabetical order.
-fn draw_group_popup(frame: &mut Frame, app: &mut App) {
+fn draw_group_popup(frame: &mut Frame, app: &App) {
     let area = centered(frame.area(), 48, 17);
     let [list_area, search_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
@@ -272,7 +289,6 @@ fn draw_group_popup(frame: &mut Frame, app: &mut App) {
         ""
     };
     let search = Paragraph::new(format!("/{}{cursor}", app.group_search));
-    app.set_group_page_rows(usize::from(list_area.height.saturating_sub(2)));
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(list, list_area, &mut state);
     frame.render_widget(search, search_area);
@@ -353,6 +369,7 @@ mod tests {
 
     fn render_at(app: &mut App, now: i64) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        app.update_viewports(12);
         terminal.draw(|frame| draw_at(frame, app, now)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         buffer
@@ -381,6 +398,17 @@ mod tests {
     }
 
     #[test]
+    fn rendering_keeps_a_cursor_beyond_the_viewport_visible() {
+        let mut app = app_with_channels(30);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+
+        let screen = render(&mut app);
+
+        assert_eq!(app.offset, 19);
+        assert!(screen.contains("Channel 9"));
+    }
+
+    #[test]
     fn renders_group_popup() {
         let mut app = app_with_channels(3);
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
@@ -400,6 +428,24 @@ mod tests {
         let screen = render(&mut app);
         assert!(screen.contains("/sports█"));
         assert!(screen.contains("(no matching groups)"));
+    }
+
+    #[test]
+    fn group_popup_page_size_tracks_the_terminal_height() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: Vec::new(),
+            new_groups: (0..30).map(|index| format!("Group {index:02}")).collect(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+
+        let _ = render(&mut app);
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+
+        assert_eq!(app.group_page_rows, 9);
+        assert_eq!(app.group_cursor, 9);
     }
 
     #[test]
