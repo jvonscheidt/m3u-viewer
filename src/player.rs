@@ -4,8 +4,9 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -97,27 +98,104 @@ impl Player {
     /// On Linux this relies on VLC's D-Bus single-instance support, which
     /// may be unavailable in headless or minimal desktop environments.
     ///
+    /// Timings are written to the log: how long the spawn call itself
+    /// blocked the UI thread, how long VLC then took to become ready for
+    /// input, and how long the child lived. In `--one-instance` mode the
+    /// child exits as soon as the URL has been handed to the running VLC,
+    /// so its lifetime measures the handoff.
+    ///
     /// # Errors
     ///
     /// [`PlayerError::Spawn`] if the process cannot be started.
     pub fn play(&self, url: &str) -> Result<(), PlayerError> {
         log::info!("launching VLC for playback");
+        let started = Instant::now();
+        let (mut child, spawn_time) = self.spawn_detached(url)?;
+        let pid = child.id();
+        log::info!(
+            "VLC spawn took {} ms (pid {pid}, reuse_instance={})",
+            spawn_time.as_millis(),
+            self.reuse_instance
+        );
+        thread::spawn(move || {
+            report_ready(&child, pid, started);
+            let status = child.wait();
+            log::info!(
+                "VLC process {pid} ended after {} ms: {}",
+                started.elapsed().as_millis(),
+                match status {
+                    Ok(status) => status.to_string(),
+                    Err(error) => format!("wait failed: {error}"),
+                }
+            );
+        });
+        Ok(())
+    }
+
+    /// Spawns VLC on `url` with its streams detached, reporting how long
+    /// the spawn call took.
+    fn spawn_detached(&self, url: &str) -> Result<(Child, Duration), PlayerError> {
         let mut command = Command::new(&self.exe);
         if self.reuse_instance {
             command.arg("--one-instance").arg("--no-playlist-enqueue");
         }
-        let mut child = command
+        command
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
-        Ok(())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let child = command.spawn()?;
+        Ok((child, started.elapsed()))
     }
 }
+
+/// Logs how long VLC took to finish starting up and become ready for
+/// input, measured from just before the spawn call.
+///
+/// This is the number that `spawn` itself cannot see: spawning returns in
+/// a few milliseconds, while VLC goes on to load its plugin DLLs. On a
+/// warm start those are already in the OS file cache and the wait is
+/// short; on a cold start — the first launch after a reboot — they come
+/// off disk and this is where the seconds go.
+///
+/// Blocking, so call it from the reaper thread, never the UI thread.
+#[cfg(windows)]
+fn report_ready(child: &Child, pid: u32, started: Instant) {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::System::Threading::WaitForInputIdle;
+
+    /// VLC finished initialising and is waiting for input.
+    const READY: u32 = 0;
+    /// VLC is still busy after `READY_TIMEOUT_MS`.
+    const TIMED_OUT: u32 = 0x0000_0102;
+    /// Generous: a cold start on a slow disk can take a long time, and
+    /// this only occupies the reaper thread.
+    const READY_TIMEOUT_MS: u32 = 120_000;
+
+    let handle = child.as_raw_handle();
+    // SAFETY: `handle` belongs to `child`, which is borrowed for the whole
+    // call, so the process handle stays open and valid throughout.
+    // WaitForInputIdle only waits on it.
+    #[allow(unsafe_code)] // No safe equivalent: std cannot wait on process readiness.
+    let outcome = unsafe { WaitForInputIdle(handle, READY_TIMEOUT_MS) };
+    let elapsed = started.elapsed().as_millis();
+    match outcome {
+        READY => log::info!("VLC ready after {elapsed} ms (pid {pid})"),
+        TIMED_OUT => log::warn!("VLC still not ready after {elapsed} ms (pid {pid})"),
+        // Defensive: a process that exits before it ever goes idle has no
+        // readiness to report. Measured VLC does reach idle even in
+        // --one-instance handoff mode, where "ready" means the URL has
+        // been passed on, so this branch is not the normal handoff path.
+        _ => log::debug!("VLC readiness not observable (pid {pid})"),
+    }
+}
+
+/// Non-Windows stand-in: readiness cannot be observed portably, so the
+/// spawn and lifetime timings are all the log gets.
+#[cfg(not(windows))]
+fn report_ready(_child: &Child, _pid: u32, _started: Instant) {}
 
 /// First directory in `dirs` containing a VLC executable name.
 fn find_executable<'a>(dirs: impl Iterator<Item = &'a Path>) -> Option<PathBuf> {
@@ -250,6 +328,31 @@ mod tests {
         let player = player.with_reuse_instance(true);
         assert!(player.reuse_instance);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn spawn_reports_how_long_the_launch_took() {
+        // A harmless stand-in for VLC: exits immediately, whatever the
+        // "url" argument is.
+        let exe = if cfg!(windows) {
+            PathBuf::from(env::var_os("SystemRoot").unwrap_or_else(|| "C:/Windows".into()))
+                .join("System32")
+                .join("where.exe")
+        } else {
+            PathBuf::from("/bin/echo")
+        };
+        if !is_executable_file(&exe) {
+            return;
+        }
+        let player = Player::discover(Some(&exe)).unwrap();
+        let (mut child, spawn_time) = player.spawn_detached("m3u-viewer-test-url").unwrap();
+        let pid = child.id();
+        // A console stand-in has no idle state to wait for, so this
+        // exercises the unobservable branch: it must return, not hang or
+        // panic, or every playback would leak a stuck reaper thread.
+        report_ready(&child, pid, Instant::now());
+        child.wait().unwrap();
+        assert!(spawn_time < Duration::from_secs(30));
     }
 
     #[test]
