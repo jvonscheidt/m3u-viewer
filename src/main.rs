@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{NaiveDate, Utc};
@@ -495,6 +495,25 @@ impl EpgRuntime {
     }
 }
 
+/// How long to wait for a key press before looping, so loader batches
+/// keep painting while the user is idle.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Repaint at least this often even when nothing changed. The EPG columns
+/// render against the current time, so they would otherwise sit frozen
+/// until the next key press.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Whether the UI needs painting: either the state changed, or the
+/// time-dependent EPG columns are due a refresh.
+///
+/// Without this the loop repainted on every [`POLL_INTERVAL`] tick — 20
+/// full renders a second of an unchanged screen, which costs real CPU
+/// once a large playlist and a guide are loaded.
+fn needs_redraw(dirty: bool, since_last_draw: Duration) -> bool {
+    dirty || since_last_draw >= REFRESH_INTERVAL
+}
+
 /// Event loop: drain loader batches, redraw, dispatch key presses, and
 /// hand play requests to VLC until the user quits.
 fn run(
@@ -511,6 +530,8 @@ fn run(
     if epg_runtime.rx.is_some() {
         app.set_epg_loading();
     }
+    let mut dirty = true;
+    let mut last_draw = Instant::now();
     loop {
         while let Ok(event) = events.try_recv() {
             // A guide URL discovered in the playlist header starts an EPG
@@ -523,36 +544,49 @@ fn run(
                 app.set_epg_loading();
             }
             app.on_load_event(event);
+            dirty = true;
         }
         while let Some(event) = epg_runtime.take_event() {
             app.on_epg_event(event);
+            dirty = true;
         }
         if epg_runtime.start_pending() {
             app.set_epg_loading();
+            dirty = true;
         }
-        app.update_viewports(usize::from(terminal.size()?.height));
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        if needs_redraw(dirty, last_draw.elapsed()) {
+            app.update_viewports(usize::from(terminal.size()?.height));
+            terminal.draw(|frame| ui::draw(frame, &app))?;
+            dirty = false;
+            last_draw = Instant::now();
+        }
         if app.should_quit() {
             return Ok(());
         }
-        // Short poll so loader batches keep painting while idle.
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-            // Windows delivers Release events too; act on Press only.
-            && key.kind == KeyEventKind::Press
-        {
-            app.handle_key(key);
-            if let Some(request) = app.take_play_request() {
-                match player.as_ref().map(|p| p.play(request.url())) {
-                    Ok(Ok(())) => {
-                        // Confirmation first: a failing recents save then
-                        // overrides it with its own error message.
-                        app.set_message(format!("▶ {} in VLC", request.name()));
-                        app.record_played(request.url());
+        // Short poll so loader batches are picked up promptly.
+        if event::poll(POLL_INTERVAL)? {
+            match event::read()? {
+                // Windows delivers Release events too; act on Press only.
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    dirty = true;
+                    app.handle_key(key);
+                    if let Some(request) = app.take_play_request() {
+                        match player.as_ref().map(|p| p.play(request.url())) {
+                            Ok(Ok(())) => {
+                                // Confirmation first: a failing recents
+                                // save then overrides it with its own
+                                // error message.
+                                app.set_message(format!("▶ {} in VLC", request.name()));
+                                app.record_played(request.url());
+                            }
+                            Ok(Err(error)) => app.set_message(format!("✗ {error}")),
+                            Err(error) => app.set_message(format!("✗ {error}")),
+                        }
                     }
-                    Ok(Err(error)) => app.set_message(format!("✗ {error}")),
-                    Err(error) => app.set_message(format!("✗ {error}")),
                 }
+                // Same state, new layout: repaint without any app change.
+                Event::Resize(..) => dirty = true,
+                _ => {}
             }
         }
     }
@@ -582,6 +616,27 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("m3u-viewer.log"), contents).unwrap();
         dir
+    }
+
+    #[test]
+    fn idle_screen_is_not_repainted_every_poll() {
+        // The bug: the loop painted once per POLL_INTERVAL regardless of
+        // whether anything had changed, burning CPU on a static screen.
+        assert!(!needs_redraw(false, POLL_INTERVAL));
+        assert!(!needs_redraw(false, Duration::from_millis(950)));
+    }
+
+    #[test]
+    fn state_changes_paint_immediately() {
+        assert!(needs_redraw(true, Duration::ZERO));
+    }
+
+    #[test]
+    fn idle_screen_still_refreshes_for_the_clock() {
+        // EPG columns render against "now", so an untouched screen must
+        // keep repainting slowly rather than freezing.
+        assert!(needs_redraw(false, REFRESH_INTERVAL));
+        assert!(needs_redraw(false, REFRESH_INTERVAL * 3));
     }
 
     fn date(text: &str) -> NaiveDate {
