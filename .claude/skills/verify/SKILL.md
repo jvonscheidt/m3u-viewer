@@ -36,6 +36,8 @@ is accepted (`url-tvg="C:/…"` or `--epg guide.xml`).
 
 ## Where things land
 
-- Log: `%APPDATA%/m3u-viewer/config/m3u-viewer.log` — truncated on every
-  launch, so read it straight after the run you care about.
+- Log: `%APPDATA%/m3u-viewer/config/m3u-viewer.log` — appended across
+  launches (rotated to `.old` after 30 days), so `tail` it rather than
+  reading the whole file; each run starts with an `m3u-viewer … starting`
+  line. Delete it before a run when you want a clean capture.
 - Config: `%APPDATA%/m3u-viewer/config/config.toml`.
