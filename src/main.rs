@@ -3,11 +3,13 @@
 //! application state.
 
 use std::ffi::{OsStr, OsString};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{NaiveDate, Utc};
 use m3u_viewer::app::App;
 use m3u_viewer::config::{Config, XtreamConfig};
 use m3u_viewer::epg::{self, EpgEvent, EpgSource};
@@ -219,22 +221,73 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
     }
 }
 
-/// Initialises file-only logging to `path`, truncating any previous run's
-/// log. A missing platform log path disables logging.
+/// How many days a log file collects entries before it is rotated aside.
+const LOG_RETENTION_DAYS: i64 = 30;
+
+/// Initialises file-only logging to `path`, appending so a launch no
+/// longer discards the previous run, and rotating the file aside once it
+/// spans [`LOG_RETENTION_DAYS`]. A missing platform log path disables
+/// logging.
 fn init_logger(path: Option<&Path>) -> Result<()> {
     let Some(path) = path else { return Ok(()) };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create log directory {}", parent.display()))?;
     }
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("could not create log file {}", path.display()))?;
+    rotate_if_stale(path, Utc::now().date_naive())?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("could not open log file {}", path.display()))?;
     simplelog::WriteLogger::init(
         simplelog::LevelFilter::Info,
-        simplelog::Config::default(),
+        // Dated timestamps: a log spanning up to 30 days needs them to be
+        // readable, and the first line's date is what dates the file.
+        simplelog::ConfigBuilder::new()
+            .set_time_format_rfc3339()
+            .build(),
         file,
     )
     .map_err(|_| anyhow!("could not register file logger"))?;
+    Ok(())
+}
+
+/// Date of the oldest entry in a log file, read from the RFC 3339
+/// timestamp opening its first line.
+///
+/// `None` when the file is empty, unreadable, or was written by a version
+/// that timestamped entries with the time alone — all of which mean the
+/// file's age is unknown and it is due for rotation.
+fn log_start_date(path: &Path) -> Option<NaiveDate> {
+    let mut first_line = String::new();
+    BufReader::new(std::fs::File::open(path).ok()?)
+        .read_line(&mut first_line)
+        .ok()?;
+    NaiveDate::parse_from_str(first_line.get(..10)?, "%Y-%m-%d").ok()
+}
+
+/// Renames the log to `<name>.old` once its oldest entry is
+/// [`LOG_RETENTION_DAYS`] or more behind `today`, so the previous period
+/// is still on disk. Any earlier `.old` file is replaced, keeping the two
+/// files bounded.
+fn rotate_if_stale(path: &Path, today: NaiveDate) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let within_retention =
+        log_start_date(path).is_some_and(|start| (today - start).num_days() < LOG_RETENTION_DAYS);
+    if within_retention {
+        return Ok(());
+    }
+    let rotated = path.with_extension("log.old");
+    std::fs::rename(path, &rotated).with_context(|| {
+        format!(
+            "could not rotate log {} to {}",
+            path.display(),
+            rotated.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -516,6 +569,89 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args> {
         parse_args(args.iter().map(OsString::from), &Config::default())
+    }
+
+    /// Unique temp dir holding a log file with `contents`.
+    fn log_dir_with(tag: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "m3u-viewer-log-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m3u-viewer.log"), contents).unwrap();
+        dir
+    }
+
+    fn date(text: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn log_within_retention_is_left_alone() {
+        let dir = log_dir_with("fresh", "2026-09-01T10:00:00Z [INFO] m3u-viewer starting\n");
+        let log = dir.join("m3u-viewer.log");
+        rotate_if_stale(&log, date("2026-09-12")).unwrap();
+        assert!(log.exists());
+        assert!(!dir.join("m3u-viewer.log.old").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn log_is_rotated_once_it_spans_the_retention_period() {
+        let dir = log_dir_with("stale", "2026-08-01T10:00:00Z [INFO] m3u-viewer starting\n");
+        let log = dir.join("m3u-viewer.log");
+        rotate_if_stale(&log, date("2026-09-12")).unwrap();
+        assert!(!log.exists(), "stale log should have been moved aside");
+        let rotated = std::fs::read_to_string(dir.join("m3u-viewer.log.old")).unwrap();
+        assert!(rotated.contains("2026-08-01"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retention_boundary_is_thirty_days() {
+        let dir = log_dir_with("boundary", "2026-08-13T10:00:00Z [INFO] starting\n");
+        let log = dir.join("m3u-viewer.log");
+        // Exactly 30 days old: rotated. 29 would be kept.
+        rotate_if_stale(&log, date("2026-09-12")).unwrap();
+        assert!(!log.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn undated_legacy_log_is_rotated() {
+        // Logs written before timestamps carried a date cannot be aged,
+        // so they are rotated rather than appended to forever.
+        let dir = log_dir_with("legacy", "12:21:31 [INFO] m3u-viewer 0.8.0 starting\n");
+        let log = dir.join("m3u-viewer.log");
+        rotate_if_stale(&log, date("2026-09-12")).unwrap();
+        assert!(!log.exists());
+        assert!(dir.join("m3u-viewer.log.old").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn empty_log_is_rotated_and_missing_log_is_a_no_op() {
+        let dir = log_dir_with("empty", "");
+        let log = dir.join("m3u-viewer.log");
+        rotate_if_stale(&log, date("2026-09-12")).unwrap();
+        assert!(!log.exists());
+        // Second pass: nothing to rotate, and no error.
+        rotate_if_stale(&log, date("2026-09-12")).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rotating_twice_replaces_the_previous_archive() {
+        let dir = log_dir_with("replace", "2026-07-01T10:00:00Z [INFO] first\n");
+        let log = dir.join("m3u-viewer.log");
+        rotate_if_stale(&log, date("2026-09-12")).unwrap();
+        std::fs::write(&log, "2026-08-01T10:00:00Z [INFO] second\n").unwrap();
+        rotate_if_stale(&log, date("2026-09-12")).unwrap();
+        let rotated = std::fs::read_to_string(dir.join("m3u-viewer.log.old")).unwrap();
+        assert!(rotated.contains("second"), "newest archive should win");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
