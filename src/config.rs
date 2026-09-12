@@ -61,6 +61,11 @@ pub struct Config {
     /// Disabled by default.
     #[serde(default)]
     pub(crate) vlc_reuse_instance: bool,
+    /// Whether to read VLC's plugins into the OS file cache at startup so
+    /// the first playback is not delayed by a cold disk. Enabled by
+    /// default; set to `false` to skip the background reads.
+    #[serde(default = "default_vlc_prewarm")]
+    pub(crate) vlc_prewarm: bool,
 }
 
 impl fmt::Debug for Config {
@@ -73,6 +78,7 @@ impl fmt::Debug for Config {
             .field("epg_url", &self.epg_url.as_ref().map(|_| "<redacted URL>"))
             .field("regex_filter", &self.regex_filter)
             .field("vlc_reuse_instance", &self.vlc_reuse_instance)
+            .field("vlc_prewarm", &self.vlc_prewarm)
             .finish()
     }
 }
@@ -86,11 +92,16 @@ impl Default for Config {
             epg_url: None,
             regex_filter: default_regex_filter(),
             vlc_reuse_instance: false,
+            vlc_prewarm: default_vlc_prewarm(),
         }
     }
 }
 
 fn default_regex_filter() -> bool {
+    true
+}
+
+fn default_vlc_prewarm() -> bool {
     true
 }
 
@@ -212,6 +223,12 @@ impl Config {
         self.vlc_reuse_instance
     }
 
+    /// Whether VLC's plugins are read into the file cache at startup.
+    #[must_use]
+    pub fn vlc_prewarm(&self) -> bool {
+        self.vlc_prewarm
+    }
+
     /// Loads config from `path`, returning [`Config::default`] when the file
     /// does not exist.
     ///
@@ -312,6 +329,7 @@ mod tests {
             epg_url: Some("http://example.com/epg.xml.gz".to_owned()),
             regex_filter: false,
             vlc_reuse_instance: true,
+            vlc_prewarm: false,
         };
         config.save(&path).unwrap();
 
@@ -327,6 +345,7 @@ mod tests {
             Some("http://example.com/epg.xml.gz".to_owned())
         );
         assert!(!loaded.regex_filter);
+        assert!(!loaded.vlc_prewarm);
         assert!(loaded.vlc_reuse_instance);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -381,6 +400,15 @@ mod tests {
         fs::write(&path, "vlc_path = \"/usr/bin/vlc\"\n").unwrap();
         let loaded = Config::load(&path).unwrap();
         assert!(loaded.regex_filter);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_written_before_vlc_prewarm_existed_defaults_to_enabled() {
+        let path = temp_path("pre-prewarm");
+        fs::write(&path, "vlc_path = \"/usr/bin/vlc\"\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.vlc_prewarm);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -389,6 +389,13 @@ fn main() -> Result<()> {
     // error surfaces in the status bar on the first play attempt.
     let player = Player::discover(args.vlc_override.as_deref())
         .map(|player| player.with_reuse_instance(args.vlc_reuse_instance));
+    // Start the plugin reads now, so they overlap with loading the
+    // playlist rather than with the user's first Enter.
+    if config.vlc_prewarm()
+        && let Ok(player) = &player
+    {
+        player.prewarm();
+    }
     let store = load_store();
     // An explicit --epg/config source wins; an Xtream account brings its
     // own guide endpoint. Plain files without either may still name one

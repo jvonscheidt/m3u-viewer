@@ -81,6 +81,14 @@ m3u-viewer --version
   Can also be set as `vlc_reuse_instance = true` in `config.toml`.
 - `--version`, `-V` — print the application version and exit.
 
+On startup, VLC's plugins are read into the operating system's file cache
+on a background thread, so the first channel you play does not wait for
+them to come off disk. The first launch after a reboot is where this
+matters: measured on Windows it took ~10.7 s to reach a playable VLC cold
+against ~0.3 s warm, almost all of it disk reads and the on-access virus
+scan rather than VLC itself. Set `vlc_prewarm = false` in `config.toml`
+to skip it.
+
 ### Programme guide (EPG)
 
 When a guide is available — from `--epg`, the playlist's
@@ -132,7 +140,7 @@ macOS `~/Library/Application Support/m3u-viewer/`.
 
 | File | Contents |
 | --- | --- |
-| `config.toml` | Xtream credentials, user agent, EPG source, and VLC path (written by `--save-config`); hand-edited toggles like `regex_filter` and `vlc_reuse_instance` |
+| `config.toml` | Xtream credentials, user agent, EPG source, and VLC path (written by `--save-config`); hand-edited toggles like `regex_filter`, `vlc_reuse_instance`, and `vlc_prewarm` |
 | `favorites.json` | Favorited channel URLs |
 | `recents.json` | Recently played channel URLs (newest first, capped at 50) |
 | `cache/` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs |

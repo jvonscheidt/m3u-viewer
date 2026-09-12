@@ -3,6 +3,7 @@
 
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -132,6 +133,44 @@ impl Player {
         Ok(())
     }
 
+    /// Reads VLC's executable, libraries, and plugins in a background
+    /// thread so the first playback does not pay for them.
+    ///
+    /// Measured on Windows, a first launch after a reboot took ~10.7 s to
+    /// become ready against ~0.3 s warm. Almost none of that is VLC's own
+    /// initialisation: it is paging ~134 MB of plugin DLLs off disk and,
+    /// on Windows, the on-access virus scan of each one. Reading them here
+    /// moves both costs off the critical path and onto a thread nobody is
+    /// waiting for.
+    ///
+    /// Returns immediately; progress and totals go to the log. Errors are
+    /// deliberately swallowed — a warm cache is an optimisation, and
+    /// failing to read a file must never affect playback.
+    pub fn prewarm(&self) {
+        let exe = self.exe.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let targets = prewarm_targets(&exe);
+            let mut warmed = 0u64;
+            let mut files = 0usize;
+            for target in &targets {
+                if warmed >= PREWARM_BYTE_BUDGET {
+                    log::warn!("VLC pre-warm stopped at the {PREWARM_BYTE_BUDGET} byte budget");
+                    break;
+                }
+                if let Ok(bytes) = warm_file(target) {
+                    warmed += bytes;
+                    files += 1;
+                }
+            }
+            log::info!(
+                "VLC pre-warmed: {files} files, {} MB in {} ms",
+                warmed / (1024 * 1024),
+                started.elapsed().as_millis()
+            );
+        });
+    }
+
     /// Spawns VLC on `url` with its streams detached, reporting how long
     /// the spawn call took.
     fn spawn_detached(&self, url: &str) -> Result<(Child, Duration), PlayerError> {
@@ -148,6 +187,53 @@ impl Player {
         let child = command.spawn()?;
         Ok((child, started.elapsed()))
     }
+}
+
+/// Upper bound on how much VLC gets read during pre-warming, so an
+/// unexpected install layout cannot turn startup into a disk hog.
+const PREWARM_BYTE_BUDGET: u64 = 512 * 1024 * 1024;
+
+/// Reads `path` and throws the bytes away, returning how many were read.
+///
+/// The point is the side effect: the file lands in the OS file cache, and
+/// on Windows the on-access virus scan happens here rather than when VLC
+/// loads it.
+fn warm_file(path: &Path) -> io::Result<u64> {
+    let mut file = fs::File::open(path)?;
+    io::copy(&mut file, &mut io::sink())
+}
+
+/// Files worth warming: the executable itself, the DLLs beside it, and
+/// everything in `plugins/`, which is the bulk of a VLC install.
+fn prewarm_targets(exe: &Path) -> Vec<PathBuf> {
+    let Some(install_dir) = exe.parent() else {
+        return vec![exe.to_path_buf()];
+    };
+    let mut targets = vec![exe.to_path_buf()];
+    let mut dirs = vec![install_dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => dirs.push(path),
+                Ok(kind) if kind.is_file() => {
+                    let worth_warming = path.extension().is_some_and(|extension| {
+                        ["dll", "dat", "so", "dylib"]
+                            .iter()
+                            .any(|wanted| extension.eq_ignore_ascii_case(wanted))
+                    });
+                    if worth_warming {
+                        targets.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    targets
 }
 
 /// Logs how long VLC took to finish starting up and become ready for
@@ -353,6 +439,46 @@ mod tests {
         report_ready(&child, pid, Instant::now());
         child.wait().unwrap();
         assert!(spawn_time < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn prewarm_collects_the_exe_and_its_libraries_recursively() {
+        let dir = fake_vlc_dir("prewarm");
+        let exe = dir.join(if cfg!(windows) { "vlc.exe" } else { "vlc" });
+        fs::write(dir.join("libvlccore.dll"), b"lib").unwrap();
+        fs::create_dir_all(dir.join("plugins/codec")).unwrap();
+        fs::write(dir.join("plugins/plugins.dat"), b"cache").unwrap();
+        fs::write(dir.join("plugins/codec/libavcodec_plugin.dll"), b"plugin").unwrap();
+        // Not a library: must not be read just because it sits alongside.
+        fs::write(dir.join("NEWS.txt"), b"release notes").unwrap();
+
+        let targets = prewarm_targets(&exe);
+        let names: Vec<String> = targets
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(names.contains(&exe.file_name().unwrap().to_string_lossy().into_owned()));
+        assert!(names.contains(&"libvlccore.dll".to_owned()));
+        assert!(names.contains(&"plugins.dat".to_owned()));
+        assert!(
+            names.contains(&"libavcodec_plugin.dll".to_owned()),
+            "nested plugin dirs must be walked"
+        );
+        assert!(!names.contains(&"NEWS.txt".to_owned()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn warming_reads_the_whole_file_and_missing_files_are_not_fatal() {
+        let dir = fake_vlc_dir("warmfile");
+        let path = dir.join("payload.dll");
+        fs::write(&path, vec![7u8; 4096]).unwrap();
+        assert_eq!(warm_file(&path).unwrap(), 4096);
+        // A file that vanished between listing and reading must not stop
+        // the sweep; prewarm ignores the error and moves on.
+        assert!(warm_file(&dir.join("gone.dll")).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
