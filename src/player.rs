@@ -23,6 +23,87 @@ pub enum PlayerError {
     /// VLC was found but could not be started.
     #[error("failed to launch VLC: {0}")]
     Spawn(#[from] std::io::Error),
+    /// The entry's URL failed the pre-launch safety check, so VLC was not
+    /// started at all.
+    #[error("refusing to play: {0}")]
+    UnsafeUrl(#[from] UrlRejection),
+}
+
+/// Why a playlist entry's URL was not handed to VLC.
+///
+/// Playlists are untrusted input and the parser accepts any non-`#` line
+/// as a URL, so a hostile entry could otherwise smuggle VLC options in or
+/// make VLC open a network file share (which on Windows leaks the user's
+/// NTLM hash over SMB). The messages deliberately never echo the URL, as
+/// Xtream URLs carry the account credentials.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum UrlRejection {
+    /// Starts with `-`, so VLC would parse it as a command-line option.
+    #[error("stream URL starts with '-' and would be read as a VLC option")]
+    LeadingDash,
+    /// A UNC / network share path (`\\host\share`, `//host/share`).
+    #[error("stream URL is a network file share path")]
+    NetworkPath,
+    /// Not of the form `scheme://…`, e.g. a local file path.
+    #[error("stream URL is not a network address of the form scheme://…")]
+    NotNetworkUrl,
+    /// A well-formed URL whose scheme is not a known streaming protocol,
+    /// e.g. `file:` or `smb:`.
+    #[error("stream URL scheme is not supported (allowed: {})", ALLOWED_SCHEMES.join(", "))]
+    UnsupportedScheme,
+}
+
+/// Network streaming protocols VLC may be pointed at, compared
+/// case-insensitively. Everything else — notably `file:`, `smb:`, and
+/// VLC-internal schemes such as `vlc:` or `screen:` — is refused.
+pub const ALLOWED_SCHEMES: &[&str] = &[
+    "http", "https", "rtsp", "rtsps", "rtmp", "rtmps", "rtp", "udp", "mms", "mmsh", "srt",
+];
+
+/// Checks that `url` is a network stream VLC can safely be launched on.
+///
+/// Local file paths are refused too: playlists in this viewer are IPTV
+/// channel lists, and playing local files from them is not a feature.
+///
+/// # Errors
+///
+/// The [`UrlRejection`] describing the first problem found.
+pub fn check_stream_url(url: &str) -> Result<(), UrlRejection> {
+    if url.starts_with('-') {
+        return Err(UrlRejection::LeadingDash);
+    }
+    let mut leading = url.chars();
+    if matches!(
+        (leading.next(), leading.next()),
+        (Some('/' | '\\'), Some('/' | '\\'))
+    ) {
+        return Err(UrlRejection::NetworkPath);
+    }
+    // RFC 3986: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return Err(UrlRejection::NotNetworkUrl);
+    };
+    let well_formed = scheme
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    // A one-letter "scheme" is a Windows drive letter (`C:\…`).
+    if !well_formed || scheme.len() < 2 {
+        return Err(UrlRejection::NotNetworkUrl);
+    }
+    if !ALLOWED_SCHEMES
+        .iter()
+        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+    {
+        return Err(UrlRejection::UnsupportedScheme);
+    }
+    if !rest.starts_with("//") {
+        return Err(UrlRejection::NotNetworkUrl);
+    }
+    Ok(())
 }
 
 /// A resolved external player.
@@ -107,7 +188,9 @@ impl Player {
     ///
     /// # Errors
     ///
-    /// [`PlayerError::Spawn`] if the process cannot be started.
+    /// [`PlayerError::UnsafeUrl`] if `url` fails [`check_stream_url`], in
+    /// which case VLC is not started; [`PlayerError::Spawn`] if the process
+    /// cannot be started.
     pub fn play(&self, url: &str) -> Result<(), PlayerError> {
         log::info!("launching VLC for playback");
         let started = Instant::now();
@@ -172,13 +255,25 @@ impl Player {
     }
 
     /// Spawns VLC on `url` with its streams detached, reporting how long
-    /// the spawn call took.
+    /// the spawn call took. Refuses URLs that fail [`check_stream_url`].
     fn spawn_detached(&self, url: &str) -> Result<(Child, Duration), PlayerError> {
+        // Validated here, directly before the argument is built, so no
+        // caller can reach the spawn with an unchecked URL.
+        if let Err(rejection) = check_stream_url(url) {
+            // The reason only: the URL may carry Xtream credentials.
+            log::warn!("refused to launch VLC: {rejection}");
+            return Err(rejection.into());
+        }
         let mut command = Command::new(&self.exe);
         if self.reuse_instance {
             command.arg("--one-instance").arg("--no-playlist-enqueue");
         }
+        // Defence in depth only — validation above is the real guard.
+        // VLC's getopt (src/config/getopt.c) treats `--` as the end of
+        // options, so even a URL that slipped past the check could not be
+        // parsed as an option.
         command
+            .arg("--")
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -431,7 +526,9 @@ mod tests {
             return;
         }
         let player = Player::discover(Some(&exe)).unwrap();
-        let (mut child, spawn_time) = player.spawn_detached("m3u-viewer-test-url").unwrap();
+        let (mut child, spawn_time) = player
+            .spawn_detached("http://m3u-viewer-test.invalid/stream")
+            .unwrap();
         let pid = child.id();
         // A console stand-in has no idle state to wait for, so this
         // exercises the unobservable branch: it must return, not hang or
@@ -439,6 +536,151 @@ mod tests {
         report_ready(&child, pid, Instant::now());
         child.wait().unwrap();
         assert!(spawn_time < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn network_stream_urls_are_accepted() {
+        for url in [
+            "http://example.com/live/1.ts",
+            "https://example.com/user/pass/42.m3u8",
+            "rtsp://cam.local:554/stream",
+            "rtsps://cam.local/stream",
+            "rtmp://example.com/app/key",
+            "rtmps://example.com/app/key",
+            "rtp://@239.0.0.1:5004",
+            "udp://@239.0.0.1:1234",
+            "mms://example.com/stream",
+            "mmsh://example.com/stream",
+            "srt://example.com:9000",
+        ] {
+            assert_eq!(check_stream_url(url), Ok(()), "{url}");
+        }
+    }
+
+    #[test]
+    fn scheme_match_ignores_case() {
+        assert_eq!(check_stream_url("HTTP://example.com/a.ts"), Ok(()));
+        assert_eq!(check_stream_url("HtTpS://example.com/a.ts"), Ok(()));
+        assert_eq!(
+            check_stream_url("FiLe://evil/share/x.ts"),
+            Err(UrlRejection::UnsupportedScheme)
+        );
+        assert_eq!(
+            check_stream_url("SMB://evil/share/x.ts"),
+            Err(UrlRejection::UnsupportedScheme)
+        );
+    }
+
+    #[test]
+    fn leading_dash_is_rejected_as_an_option() {
+        for url in [
+            r"--config=\\evil\share\vlcrc",
+            "-I",
+            "--extraintf=http",
+            "-http://example.com/a.ts",
+        ] {
+            assert_eq!(
+                check_stream_url(url),
+                Err(UrlRejection::LeadingDash),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn unc_paths_are_rejected() {
+        for url in [
+            r"\\evil\share\a.ts",
+            "//evil/share/a.ts",
+            r"\/evil/share/a.ts",
+            r"/\evil\share\a.ts",
+            r"\\?\UNC\evil\share\a.ts",
+        ] {
+            assert_eq!(
+                check_stream_url(url),
+                Err(UrlRejection::NetworkPath),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_and_smb_schemes_are_rejected() {
+        for url in [
+            "file://evil/share/x.ts",
+            "file:///C:/Users/me/video.ts",
+            "file:x.ts",
+            "smb://evil/share/x.ts",
+            "smb:x",
+        ] {
+            assert_eq!(
+                check_stream_url(url),
+                Err(UrlRejection::UnsupportedScheme),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_schemes_are_rejected() {
+        for url in [
+            "ftp://example.com/a.ts",
+            "vlc://quit",
+            "screen://",
+            "dshow://",
+            "javascript:alert(1)",
+            "http/ts://example.com/a.ts",
+        ] {
+            assert!(check_stream_url(url).is_err(), "{url}");
+        }
+        assert_eq!(
+            check_stream_url("ftp://example.com/a.ts"),
+            Err(UrlRejection::UnsupportedScheme)
+        );
+    }
+
+    #[test]
+    fn local_paths_and_malformed_urls_are_rejected() {
+        for url in [
+            "",
+            "channel.ts",
+            "/home/me/video.ts",
+            r"C:\Videos\a.ts",
+            "C:/Videos/a.ts",
+            " http://example.com/a.ts",
+            ":sout=#file{dst=x}",
+            "http:example.com/a.ts",
+            "http:\\\\evil\\share",
+        ] {
+            assert_eq!(
+                check_stream_url(url),
+                Err(UrlRejection::NotNetworkUrl),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_messages_never_echo_the_url() {
+        let url = "smb://user:secret@evil/share/x.ts";
+        let message = PlayerError::from(check_stream_url(url).unwrap_err()).to_string();
+        assert!(message.starts_with("refusing to play"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+        assert!(!message.contains("evil"), "{message}");
+    }
+
+    #[test]
+    fn hostile_urls_never_reach_the_spawn() {
+        // Regression: a playlist line like `--config=…` or a UNC path used
+        // to be passed to VLC verbatim. The stand-in executable must not
+        // even be started.
+        let dir = fake_vlc_dir("hostile");
+        let exe = dir.join(if cfg!(windows) { "vlc.exe" } else { "vlc" });
+        let player = Player::discover(Some(&exe)).unwrap();
+        for url in [r"--config=\\evil\share\vlcrc", r"\\evil\share\a.ts"] {
+            assert!(matches!(player.play(url), Err(PlayerError::UnsafeUrl(_))));
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
