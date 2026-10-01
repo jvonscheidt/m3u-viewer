@@ -16,12 +16,12 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use crate::cache;
+use crate::cache::{self, PendingCache};
 use crate::playlist::{Channel, GroupId, PlaylistBuilder};
 use crate::xtream::Account;
 
@@ -141,7 +141,7 @@ fn load_file(path: &Path, tx: &Sender<LoadEvent>) -> Result<(), String> {
         Header::Optional,
         &mut delivered,
         &mut false,
-        &mut None,
+        None,
         tx,
     )
     .map_err(|e| e.to_string())?;
@@ -164,7 +164,7 @@ fn load_cached(path: &Path, tx: &Sender<LoadEvent>) -> bool {
         Header::Optional,
         &mut delivered,
         &mut false,
-        &mut None,
+        None,
         tx,
     ) {
         Ok(summary) if summary.delivered > 0 => {
@@ -242,42 +242,28 @@ fn load_xtream_m3u(
     tx: &Sender<LoadEvent>,
 ) -> Result<(), String> {
     let (reader, total) = account.fetch().map_err(|error| error.to_string())?;
-    let (mut sink, tmp_path) = match cache_path.and_then(cache::create_temp) {
-        Some((file, tmp)) => (Some(file), Some(tmp)),
-        None => (None, None),
-    };
+    // Dropped (and so discarded) on every early return below.
+    let mut sink = cache_path.and_then(PendingCache::create);
     // get.php always answers with extended M3U, so anything else (CDN
     // challenge page, HTML error, panel notice) must abort with a look at
     // the body rather than turn into junk channels or an empty list.
-    let summary = match parse_stream(
+    let summary = parse_stream(
         reader,
         total,
         Header::Required,
         delivered,
         reset_pending,
-        &mut sink,
+        sink.as_mut(),
         tx,
-    ) {
-        Ok(summary) => summary,
-        Err(error) => {
-            if let Some(tmp) = &tmp_path {
-                cache::discard_temp(tmp);
-            }
-            return Err(error.to_string());
-        }
-    };
+    )
+    .map_err(|error| error.to_string())?;
     if summary.delivered == 0 {
-        if let Some(tmp) = &tmp_path {
-            cache::discard_temp(tmp);
-        }
         return Err(match summary.first_line {
             Some(line) => format!("server sent a playlist with no channels (starts: {line:?})"),
             None => "server sent an empty response — check that the account is active".to_owned(),
         });
     }
-    if let (Some(tmp), Some(path)) = (&tmp_path, cache_path) {
-        cache::promote(tmp, path);
-    }
+    commit_cache(sink);
     log::info!("xtream playlist parsed: {} channels", summary.delivered);
     Ok(())
 }
@@ -308,16 +294,10 @@ fn load_xtream_api(
         return Err("the player API returned no live streams".to_owned());
     }
 
-    let (mut cache_sink, tmp_path) = match cache_path.and_then(cache::create_temp) {
-        Some((mut file, tmp)) => {
-            if file.write_all(b"#EXTM3U\n").is_ok() {
-                (Some(file), Some(tmp))
-            } else {
-                (None, None)
-            }
-        }
-        None => (None, None),
-    };
+    let mut cache_sink = cache_path.and_then(PendingCache::create);
+    if let Some(sink) = &mut cache_sink {
+        sink.write(b"#EXTM3U\n");
+    }
 
     let category_names: HashMap<&str, &str> = categories
         .iter()
@@ -344,7 +324,7 @@ fn load_xtream_api(
         // Panels without a stream name get the URL, like bare M3U entries.
         let name = stream.name.unwrap_or_else(|| url.clone());
         write_m3u_entry(
-            &mut cache_sink,
+            cache_sink.as_mut(),
             &name,
             &url,
             stream.epg_channel_id.as_deref(),
@@ -378,28 +358,35 @@ fn load_xtream_api(
         0,
         Some(100),
     );
-    drop(cache_sink);
-    if let (Some(tmp), Some(path)) = (&tmp_path, cache_path) {
-        cache::promote(tmp, path);
-    }
+    commit_cache(cache_sink);
     Ok(())
 }
 
+/// Replaces the on-disk cache with a fully loaded `sink`, if caching is
+/// on. A sink that hit a write error is discarded instead (see
+/// [`PendingCache::commit`]), so a truncated copy never replaces a good
+/// cache.
+fn commit_cache(sink: Option<PendingCache>) {
+    if let Some(sink) = sink
+        && !sink.commit()
+    {
+        log::warn!("playlist cache not updated; the previous copy (if any) is kept");
+    }
+}
+
 /// Appends one channel as an `#EXTINF`/URL pair to `sink`, if present. A
-/// write failure disables the sink for the rest of the load — mirroring
-/// the same file that's about to be shown to the user isn't worth
-/// failing over.
+/// write failure poisons the sink for the rest of the load (it is then
+/// discarded, not committed) — mirroring the same list that's being shown
+/// to the user isn't worth failing the load over.
 fn write_m3u_entry(
-    sink: &mut Option<File>,
+    sink: Option<&mut PendingCache>,
     name: &str,
     url: &str,
     tvg_id: Option<&str>,
     group: Option<&str>,
 ) {
-    let Some(file) = sink else { return };
-    let line = format_m3u_entry(name, url, tvg_id, group);
-    if file.write_all(line.as_bytes()).is_err() {
-        *sink = None;
+    if let Some(sink) = sink {
+        sink.write(format_m3u_entry(name, url, tvg_id, group).as_bytes());
     }
 }
 
@@ -462,18 +449,18 @@ struct ParseSummary {
 /// flow (see [`load_xtream`]): when `*reset_pending` is set, a
 /// [`LoadEvent::Reset`] is sent right before the first non-empty batch —
 /// not any earlier, so a fetch that never gets that far never clears a
-/// cached copy already on screen. When `cache_sink` holds a file, every
-/// line read is mirrored into it, so a stream that parses successfully
-/// leaves behind an exact copy to cache; the caller decides whether to
-/// keep it. A write failure just stops the mirroring silently — caching
-/// is never a reason to fail the load.
+/// cached copy already on screen. When `cache_sink` is given, every line
+/// read is mirrored into it, so a stream that parses successfully leaves
+/// behind an exact copy to cache; the caller decides whether to commit
+/// it. A write failure poisons the sink (it then refuses to commit) but
+/// never fails the load — caching is not worth failing over.
 fn parse_stream(
     input: impl Read,
     total_bytes: Option<u64>,
     header: Header,
     delivered: &mut usize,
     reset_pending: &mut bool,
-    cache_sink: &mut Option<File>,
+    mut cache_sink: Option<&mut PendingCache>,
     tx: &Sender<LoadEvent>,
 ) -> std::io::Result<ParseSummary> {
     let mut reader = BufReader::with_capacity(256 * 1024, input);
@@ -491,10 +478,8 @@ fn parse_stream(
             break;
         }
         bytes_read += n as u64;
-        if let Some(sink) = cache_sink
-            && sink.write_all(line.as_bytes()).is_err()
-        {
-            *cache_sink = None;
+        if let Some(sink) = cache_sink.as_deref_mut() {
+            sink.write(line.as_bytes());
         }
         if first_line.is_none() {
             let trimmed = line.trim_start_matches('\u{feff}').trim();
@@ -958,6 +943,47 @@ mod tests {
         assert!(cached_text.contains("tvg-id=\"one.tv\""));
         assert!(cached_text.contains("group-title=\"News\""));
         assert!(cached_text.contains(",One\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_write_failure_mid_load_keeps_the_previous_cache() {
+        // Regression: a write error (disk full) mid-download dropped the
+        // cache sink but the caller still promoted the truncated temp
+        // file over the good cache. Covers both mirroring paths: the
+        // get.php stream (parse_stream) and the player API (write_m3u_entry).
+        let dir = temp_cache_dir("write-failure");
+        let cache_path = cache::path(&dir, "acct");
+        let good = "#EXTM3U\n#EXTINF:-1,Good\nhttp://u/good\n";
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&cache_path, good).unwrap();
+
+        let (tx, rx) = channel();
+        let mut sink = PendingCache::failing_for_test(&cache_path);
+        let mut delivered = 0;
+        let summary = parse_stream(
+            "#EXTM3U\n#EXTINF:-1,Fresh\nhttp://u/fresh\n".as_bytes(),
+            None,
+            Header::Required,
+            &mut delivered,
+            &mut false,
+            Some(&mut sink),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(summary.delivered, 1, "the load itself must still succeed");
+        commit_cache(Some(sink));
+        assert_eq!(fs::read_to_string(&cache_path).unwrap(), good);
+
+        let mut sink = PendingCache::failing_for_test(&cache_path);
+        write_m3u_entry(Some(&mut sink), "Fresh", "http://u/fresh", None, None);
+        commit_cache(Some(sink));
+        assert_eq!(fs::read_to_string(&cache_path).unwrap(), good);
+
+        drop(tx);
+        assert!(rx.iter().count() > 0);
+        let leftovers = fs::read_dir(cache_path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "temp files were left behind");
         let _ = fs::remove_dir_all(&dir);
     }
 
