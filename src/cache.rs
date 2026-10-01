@@ -34,6 +34,12 @@ pub fn open(path: &Path) -> Option<File> {
     private_file::open(path).ok()
 }
 
+/// Deletes the cache at `path` (e.g. one that could not be read back), so
+/// the next launch fetches live instead of tripping over it again.
+pub fn remove(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
 /// A replacement cache being streamed into a temp file beside its final
 /// path, so a write that dies halfway never corrupts the previous,
 /// still-valid cache.

@@ -154,32 +154,34 @@ fn load_file(path: &Path, tx: &Sender<LoadEvent>) -> Result<(), String> {
 /// was actually shown, so the caller knows a later [`LoadEvent::Reset`]
 /// is needed once live data starts arriving.
 fn load_cached(path: &Path, tx: &Sender<LoadEvent>) -> bool {
-    let Some(file) = cache::open(path) else {
-        return false;
-    };
+    cache::open(path).is_some_and(|file| show_cached(file, path, tx))
+}
+
+/// Streams the cache contents in `input` (read from `path`) to the UI;
+/// see [`load_cached`]. A read error partway through still returns `true`
+/// when batches already went out — those rows are on screen and must be
+/// cleared by a [`LoadEvent::Reset`] before live data arrives, or the
+/// fresh rows would be appended to them (and their group ids would index
+/// the cached group table). The unreadable cache file is removed so the
+/// next launch doesn't stumble over it again.
+fn show_cached(input: impl Read, path: &Path, tx: &Sender<LoadEvent>) -> bool {
     let mut delivered = 0;
-    match parse_stream(
-        file,
+    let result = parse_stream(
+        input,
         None,
         Header::Optional,
         &mut delivered,
         &mut false,
         None,
         tx,
-    ) {
-        Ok(summary) if summary.delivered > 0 => {
-            log::info!(
-                "showing {} cached channels while refreshing",
-                summary.delivered
-            );
-            true
-        }
-        Ok(_) => false,
-        Err(error) => {
-            log::warn!("cached playlist unreadable ({error}); ignoring");
-            false
-        }
+    );
+    if let Err(error) = result {
+        log::warn!("cached playlist unreadable after {delivered} channels ({error}); removing it");
+        cache::remove(path);
+    } else if delivered > 0 {
+        log::info!("showing {delivered} cached channels while refreshing");
     }
+    delivered > 0
 }
 
 /// Xtream loading: a cached copy (if any) is shown first for an instant
@@ -984,6 +986,69 @@ mod tests {
         assert!(rx.iter().count() > 0);
         let leftovers = fs::read_dir(cache_path.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "temp files were left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reader that fails like a dying disk once its data runs out.
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+    }
+
+    #[test]
+    fn cache_read_failure_after_a_batch_still_requests_a_reset() {
+        // Regression: a cache that failed to read partway through reported
+        // "nothing shown", so the live refresh skipped its Reset and
+        // appended fresh rows to the partial cached ones (with group ids
+        // indexing the cached group table).
+        use std::fmt::Write as _;
+
+        let dir = temp_cache_dir("read-failure");
+        let cache_path = cache::path(&dir, "acct");
+        let mut body = String::from("#EXTM3U\n");
+        for index in 0..=BATCH_SIZE {
+            writeln!(
+                body,
+                "#EXTINF:-1 group-title=\"Cached\",Channel {index}\nhttp://u/{index}"
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&cache_path, &body).unwrap();
+
+        let (tx, rx) = channel();
+        let input = body.as_bytes().chain(FailingReader);
+        assert!(
+            show_cached(input, &cache_path, &tx),
+            "rows reached the UI, so the live refresh must reset them"
+        );
+        drop(tx);
+        let shown: usize = rx
+            .iter()
+            .map(|event| match event {
+                LoadEvent::Batch { channels, .. } => channels.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(shown, BATCH_SIZE, "only the first full batch went out");
+        assert!(!cache_path.exists(), "unreadable cache should be removed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_read_failure_before_any_batch_shows_nothing() {
+        let dir = temp_cache_dir("read-failure-early");
+        let cache_path = cache::path(&dir, "acct");
+        let (tx, rx) = channel();
+        let input = "#EXTM3U\n#EXTINF:-1,A\nhttp://u/a\n"
+            .as_bytes()
+            .chain(FailingReader);
+        assert!(!show_cached(input, &cache_path, &tx));
+        drop(tx);
+        assert_eq!(rx.iter().count(), 0, "a failed read sends no tail batch");
         let _ = fs::remove_dir_all(&dir);
     }
 
