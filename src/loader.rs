@@ -63,6 +63,12 @@ pub enum LoadEvent {
     /// arrive more than once (cached copy, then the live refresh) and
     /// every occurrence after the first is ignored there.
     EpgUrl(String),
+    /// A non-fatal problem the user should know about; loading still ends
+    /// with [`LoadEvent::Finished`]. Sent when the live refresh failed
+    /// and the cached playlist stays on screen, so its stale (possibly
+    /// unplayable) URLs don't masquerade as a successful load. Contains
+    /// no credentials.
+    Warning(String),
     /// The whole playlist was parsed successfully.
     Finished,
     /// Loading aborted (I/O error, HTTP failure, bad credentials, …).
@@ -89,6 +95,7 @@ impl fmt::Debug for LoadEvent {
                 .debug_tuple("EpgUrl")
                 .field(&"<redacted URL>")
                 .finish(),
+            Self::Warning(message) => formatter.debug_tuple("Warning").field(message).finish(),
             Self::Finished => formatter.write_str("Finished"),
             Self::Failed(message) => formatter.debug_tuple("Failed").field(message).finish(),
         }
@@ -190,7 +197,11 @@ fn show_cached(input: impl Read, path: &Path, tx: &Sender<LoadEvent>) -> bool {
 /// instead. Either live path clears the cached rows (via
 /// [`LoadEvent::Reset`]) only once it actually has fresh data to replace
 /// them with, so a live fetch that never gets that far leaves the cached
-/// copy on screen instead of clearing it for nothing.
+/// copy on screen instead of clearing it for nothing — with a
+/// [`LoadEvent::Warning`] saying so, since its URLs may no longer play.
+///
+/// Error messages pass through [`redact_credentials`] before they are
+/// logged or reach the UI.
 fn load_xtream(
     account: &Account,
     cache_dir: Option<&Path>,
@@ -211,7 +222,7 @@ fn load_xtream(
         tx,
     ) {
         Ok(()) => return Ok(()),
-        Err(error) => error,
+        Err(error) => redact_credentials(&error),
     };
     if delivered > 0 {
         // Channels already reached the UI (download died mid-stream); a
@@ -222,18 +233,46 @@ fn load_xtream(
     match load_xtream_api(account, &mut reset_pending, cache_path.as_deref(), tx) {
         Ok(()) => Ok(()),
         Err(api_error) => {
+            let api_error = redact_credentials(&api_error);
             let combined = format!("M3U download failed: {m3u_error}; player API: {api_error}");
             if cache_shown {
                 // Both live paths failed before producing anything, so the
                 // cached copy was never cleared — keep showing it instead
-                // of replacing a working list with an error.
+                // of replacing a list with an error, but say that it is
+                // stale: after e.g. a password change its URLs won't play.
                 log::warn!("xtream refresh failed ({combined}); keeping cached playlist");
+                let _ = tx.send(LoadEvent::Warning(format!(
+                    "showing cached playlist — refresh failed: {combined}"
+                )));
                 Ok(())
             } else {
                 Err(combined)
             }
         }
     }
+}
+
+/// Masks the value of every `password=` query parameter in `message`.
+/// Some HTTP client errors (ureq's `BadUri`, `RequireHttpsOnly`) quote the
+/// full request URL, and Xtream request URLs carry the password in the
+/// query string; this keeps it out of the status bar and the log.
+fn redact_credentials(message: &str) -> String {
+    const KEY: &str = "password=";
+
+    let mut redacted = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(start) = rest.find(KEY) {
+        let value_start = start + KEY.len();
+        redacted.push_str(&rest[..value_start]);
+        redacted.push_str("<redacted>");
+        let value = &rest[value_start..];
+        let end = value
+            .find(|c: char| matches!(c, '&' | '"' | '\'' | '#') || c.is_whitespace())
+            .unwrap_or(value.len());
+        rest = &value[end..];
+    }
+    redacted.push_str(rest);
+    redacted
 }
 
 fn load_xtream_m3u(
@@ -653,7 +692,7 @@ mod tests {
                 } => channels += batch.len(),
                 // Cached rows are being replaced by fresh ones.
                 LoadEvent::Reset => channels = 0,
-                LoadEvent::EpgUrl(_) => {}
+                LoadEvent::EpgUrl(_) | LoadEvent::Warning(_) => {}
                 LoadEvent::Finished => return (channels, None),
                 LoadEvent::Failed(message) => return (channels, Some(message)),
             }
@@ -734,6 +773,7 @@ mod tests {
                 }
                 LoadEvent::Reset => panic!("unexpected reset: no cache was primed"),
                 LoadEvent::EpgUrl(_) => {}
+                LoadEvent::Warning(message) => panic!("unexpected warning: {message}"),
                 LoadEvent::Finished => break,
                 LoadEvent::Failed(message) => panic!("load failed: {message}"),
             }
@@ -869,13 +909,82 @@ mod tests {
             "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
         );
 
-        let (channels, error) = drain(&spawn(Source::Xtream(account), Some(dir.clone())));
+        let (channels, warnings, error) =
+            drain_with_warnings(&spawn(Source::Xtream(account), Some(dir.clone())));
         assert_eq!(channels, 1, "the cached channel should still be showing");
         assert!(
             error.is_none(),
             "expected success (cache kept), got: {error:?}"
         );
+        // Regression: the failed refresh used to be only logged, so a
+        // stale cache (e.g. URLs with an old password) looked current.
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(
+            warnings[0].starts_with("showing cached playlist — refresh failed:"),
+            "got: {warnings:?}"
+        );
+        assert!(warnings[0].contains("player API"), "got: {warnings:?}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Like [`drain`], but also collects every [`LoadEvent::Warning`].
+    fn drain_with_warnings(rx: &Receiver<LoadEvent>) -> (usize, Vec<String>, Option<String>) {
+        let mut channels = 0;
+        let mut warnings = Vec::new();
+        for event in rx {
+            match event {
+                LoadEvent::Batch {
+                    channels: batch, ..
+                } => channels += batch.len(),
+                LoadEvent::Reset => channels = 0,
+                LoadEvent::EpgUrl(_) => {}
+                LoadEvent::Warning(message) => warnings.push(message),
+                LoadEvent::Finished => return (channels, warnings, None),
+                LoadEvent::Failed(message) => return (channels, warnings, Some(message)),
+            }
+        }
+        panic!("loader hung up without a terminal event");
+    }
+
+    #[test]
+    fn refresh_failure_warning_does_not_leak_the_password() {
+        // A panel error page echoing the request URL ends up in the
+        // "did not send an M3U" snippet; HTTP client errors can quote the
+        // URL the same way.
+        let dir = temp_cache_dir("redact");
+        let port = serve_once(
+            "<html>bad request: /get.php?username=u&password=s3cret-pw&type=m3u</html>\n",
+        );
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "s3cret-pw".into());
+        seed_cache(
+            &dir,
+            &account.cache_key(),
+            "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
+        );
+        let (channels, warnings, error) =
+            drain_with_warnings(&spawn(Source::Xtream(account), Some(dir.clone())));
+        assert_eq!(channels, 1);
+        assert!(error.is_none(), "got: {error:?}");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(!warnings[0].contains("s3cret"), "leaked: {}", warnings[0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redact_credentials_masks_password_query_values() {
+        assert_eq!(
+            redact_credentials(
+                "bad uri: http://h/get.php?username=u&password=p%26w&type=m3u is missing host"
+            ),
+            "bad uri: http://h/get.php?username=u&password=<redacted>&type=m3u is missing host"
+        );
+        assert_eq!(
+            redact_credentials("a password=one b \"password=two\" password="),
+            "a password=<redacted> b \"password=<redacted>\" password=<redacted>"
+        );
+        // The auth-failure hint mentions the word, but carries no value.
+        let hint = "check username, password, and account status";
+        assert_eq!(redact_credentials(hint), hint);
     }
 
     #[test]
@@ -906,6 +1015,7 @@ mod tests {
                 }
                 LoadEvent::Reset => saw_reset = true,
                 LoadEvent::EpgUrl(_) => {}
+                LoadEvent::Warning(message) => panic!("unexpected warning: {message}"),
                 LoadEvent::Finished => break,
                 LoadEvent::Failed(message) => panic!("load failed: {message}"),
             }
@@ -1098,7 +1208,7 @@ mod tests {
             match event {
                 LoadEvent::EpgUrl(url) => epg_urls.push(url),
                 LoadEvent::Finished | LoadEvent::Failed(_) => break,
-                LoadEvent::Batch { .. } | LoadEvent::Reset => {}
+                LoadEvent::Batch { .. } | LoadEvent::Reset | LoadEvent::Warning(_) => {}
             }
         }
         assert_eq!(epg_urls, ["http://example.com/epg.xml"]);
