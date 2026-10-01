@@ -22,7 +22,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 use crate::cache::{self, PendingCache};
-use crate::playlist::{Channel, GroupId, PlaylistBuilder};
+use crate::playlist::{Channel, GroupId, PlaylistBuilder, decode_line};
 use crate::xtream::Account;
 
 /// Channels per [`LoadEvent::Batch`]; small enough for a responsive first
@@ -484,7 +484,8 @@ struct ParseSummary {
 ///
 /// With [`Header::Required`], input whose first non-blank line is not
 /// `#EXTM3U` fails as [`std::io::ErrorKind::InvalidData`] before any
-/// batch is sent.
+/// batch is sent. Lines that are not valid UTF-8 are decoded leniently
+/// ([`decode_line`]), so the only other errors are reader I/O failures.
 ///
 /// `reset_pending` and `cache_sink` support the Xtream cache-then-refresh
 /// flow (see [`load_xtream`]): when `*reset_pending` is set, a
@@ -506,22 +507,25 @@ fn parse_stream(
 ) -> std::io::Result<ParseSummary> {
     let mut reader = BufReader::with_capacity(256 * 1024, input);
     let mut builder = PlaylistBuilder::new();
-    let mut line = String::new();
+    let mut raw_line = Vec::new();
     let mut bytes_read: u64 = 0;
     let mut groups_sent = 0;
     let mut first_line: Option<String> = None;
     let mut epg_url_sent = false;
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
+        raw_line.clear();
+        let n = reader.read_until(b'\n', &mut raw_line)?;
         if n == 0 {
             break;
         }
         bytes_read += n as u64;
+        // Mirror the bytes as received: the cache is re-read through the
+        // same decoding, so it parses back to exactly the same channels.
         if let Some(sink) = cache_sink.as_deref_mut() {
-            sink.write(line.as_bytes());
+            sink.write(&raw_line);
         }
+        let line = decode_line(&raw_line);
         if first_line.is_none() {
             let trimmed = line.trim_start_matches('\u{feff}').trim();
             if !trimmed.is_empty() {
@@ -1159,6 +1163,92 @@ mod tests {
         assert!(!show_cached(input, &cache_path, &tx));
         drop(tx);
         assert_eq!(rx.iter().count(), 0, "a failed read sends no tail batch");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Latin-1 playlist (as written by legacy tools) for the encoding tests.
+    const LATIN1_PLAYLIST: &[u8] = b"#EXTM3U\n\
+        #EXTINF:-1 group-title=\"M\xfasica\",Caf\xe9 Radio\n\
+        http://u/1\n\
+        #EXTINF:-1 group-title=\"Noticias\",Espa\xf1a 24h\n\
+        http://u/2\n";
+
+    /// Channel names and group names delivered by `rx`, in order.
+    fn names_and_groups(rx: &Receiver<LoadEvent>) -> (Vec<String>, Vec<String>) {
+        let mut names = Vec::new();
+        let mut groups = Vec::new();
+        for event in rx {
+            match event {
+                LoadEvent::Batch {
+                    channels,
+                    new_groups,
+                    ..
+                } => {
+                    names.extend(channels.into_iter().map(|c| c.name));
+                    groups.extend(new_groups);
+                }
+                LoadEvent::Failed(message) => panic!("load failed: {message}"),
+                LoadEvent::Finished => break,
+                LoadEvent::Reset | LoadEvent::EpgUrl(_) | LoadEvent::Warning(_) => {}
+            }
+        }
+        (names, groups)
+    }
+
+    #[test]
+    fn latin1_file_loads_instead_of_failing() {
+        // Regression: the first non-UTF-8 byte failed the whole load with
+        // "stream did not contain valid UTF-8".
+        let dir = temp_cache_dir("latin1-file");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("latin1.m3u");
+        fs::write(&path, LATIN1_PLAYLIST).unwrap();
+
+        let (names, groups) = names_and_groups(&spawn(Source::File(path), None));
+        assert_eq!(names, ["Café Radio", "España 24h"]);
+        assert_eq!(groups, ["Música", "Noticias"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latin1_stream_is_cached_byte_for_byte_and_reads_back_identically() {
+        let dir = temp_cache_dir("latin1-cache");
+        let cache_path = cache::path(&dir, "acct");
+        let (tx, rx) = channel();
+        let mut sink = PendingCache::create(&cache_path).unwrap();
+        let mut delivered = 0;
+        parse_stream(
+            LATIN1_PLAYLIST,
+            Some(LATIN1_PLAYLIST.len() as u64),
+            Header::Required,
+            &mut delivered,
+            &mut false,
+            Some(&mut sink),
+            &tx,
+        )
+        .unwrap();
+        assert!(sink.commit());
+        assert_eq!(fs::read(&cache_path).unwrap(), LATIN1_PLAYLIST);
+
+        assert!(load_cached(&cache_path, &tx));
+        drop(tx);
+        let mut percents = Vec::new();
+        let mut names = Vec::new();
+        for event in &rx {
+            if let LoadEvent::Batch {
+                channels, percent, ..
+            } = event
+            {
+                percents.push(percent);
+                names.extend(channels.into_iter().map(|c| c.name));
+            }
+        }
+        assert_eq!(percents[0], Some(100), "progress counts raw bytes");
+        assert_eq!(
+            names,
+            ["Café Radio", "España 24h", "Café Radio", "España 24h"],
+            "live and cached loads must decode identically"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
