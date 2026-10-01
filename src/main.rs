@@ -324,6 +324,8 @@ fn config_to_save(args: &Args, current: &Config) -> Config {
         .with_epg_url(args.epg.clone())
         .with_regex_filter(current.regex_filter())
         .with_vlc_reuse_instance(args.vlc_reuse_instance)
+        // No CLI flag sets this, so it can only come from the file.
+        .with_vlc_prewarm(current.vlc_prewarm())
 }
 
 fn main() -> Result<()> {
@@ -894,6 +896,18 @@ mod tests {
         assert_eq!(xtream.username(), "stored-user");
         assert_eq!(xtream.password(), "stored-password");
         assert!(!saved.regex_filter());
+    }
+
+    #[test]
+    fn save_preserves_disabled_vlc_prewarm() {
+        let current = Config::default().with_vlc_prewarm(false);
+        let args = parse_args(
+            ["list.m3u", "--save-config"].iter().map(OsString::from),
+            &current,
+        )
+        .unwrap();
+
+        assert!(!config_to_save(&args, &current).vlc_prewarm());
     }
 
     #[test]

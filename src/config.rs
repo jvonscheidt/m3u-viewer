@@ -187,6 +187,13 @@ impl Config {
         self
     }
 
+    /// Sets whether VLC's plugins are read into the file cache at startup.
+    #[must_use]
+    pub fn with_vlc_prewarm(mut self, enabled: bool) -> Self {
+        self.vlc_prewarm = enabled;
+        self
+    }
+
     /// Stored Xtream account, when configured.
     #[must_use]
     pub fn xtream(&self) -> Option<&XtreamConfig> {
