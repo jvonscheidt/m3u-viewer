@@ -24,6 +24,8 @@ use quick_xml::Reader as XmlReader;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
 use thiserror::Error;
 
+use crate::xtream::{HttpTimeouts, http_agent};
+
 /// Programmes ending before "now" are dropped at parse time; so are ones
 /// starting further ahead than this. Twelve hours keeps now/next working
 /// through a long session without holding a full multi-day guide.
@@ -385,7 +387,7 @@ pub fn spawn(source: EpgSource, user_agent: Option<String>) -> Receiver<EpgEvent
         let described = source.describe();
         log::info!("loading EPG from {described}");
         let now = Utc::now().timestamp();
-        let event = match load(&source, user_agent.as_deref(), now) {
+        let event = match load(&source, user_agent.as_deref(), now, HttpTimeouts::STANDARD) {
             Ok(guide) => {
                 log::info!(
                     "EPG loaded: {} channels with programmes",
@@ -404,11 +406,19 @@ pub fn spawn(source: EpgSource, user_agent: Option<String>) -> Receiver<EpgEvent
     rx
 }
 
-fn load(source: &EpgSource, user_agent: Option<&str>, now: i64) -> Result<Guide, EpgError> {
+/// Fetches and parses the guide. URLs go through the shared download
+/// agent configured with `timeouts`, so a server that accepts and then
+/// hangs fails the load instead of blocking this thread forever.
+fn load(
+    source: &EpgSource,
+    user_agent: Option<&str>,
+    now: i64,
+    timeouts: HttpTimeouts,
+) -> Result<Guide, EpgError> {
     let reader: Box<dyn BufRead> = match source {
         EpgSource::File(path) => Box::new(BufReader::new(File::open(path)?)),
         EpgSource::Url(url) => {
-            let mut request = ureq::get(url);
+            let mut request = http_agent(timeouts).get(url);
             if let Some(user_agent) = user_agent {
                 request = request.header("User-Agent", user_agent);
             }
@@ -698,6 +708,25 @@ mod tests {
             stamp(1),
         );
         assert_eq!(parse(&xml).channel_count(), 0);
+    }
+
+    #[test]
+    fn stalled_epg_server_fails_instead_of_hanging() {
+        // Regression: EPG downloads used ureq's default agent without any
+        // timeouts, so a server that accepted and then went silent blocked
+        // the EPG thread forever — both before the headers and mid-body.
+        use crate::xtream::test_server::{FAST, ok_head, serve};
+        use std::time::{Duration, Instant};
+
+        let partial = vec![b"<tv><programme start=".to_vec()];
+        for (head, chunks) in [(String::new(), Vec::new()), (ok_head(10_000), partial)] {
+            let (port, server) = serve(head, chunks, Duration::ZERO);
+            let source = EpgSource::Url(format!("http://127.0.0.1:{port}/xmltv.php"));
+            let started = Instant::now();
+            assert!(load(&source, None, NOW, FAST).is_err());
+            assert!(started.elapsed() < Duration::from_secs(5));
+            server.join().unwrap();
+        }
     }
 
     #[test]
