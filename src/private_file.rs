@@ -121,7 +121,7 @@ fn tighten_legacy_permissions(path: &Path) {
 }
 
 #[cfg(test)]
-// unwrap is fine in tests (see CLAUDE.md).
+// unwrap is fine in tests (see AGENTS.md).
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

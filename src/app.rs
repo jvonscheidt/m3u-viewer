@@ -836,7 +836,7 @@ fn is_text_input(character: char, modifiers: KeyModifiers) -> bool {
 }
 
 #[cfg(test)]
-// unwrap is fine in tests (see CLAUDE.md).
+// unwrap is fine in tests (see AGENTS.md).
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

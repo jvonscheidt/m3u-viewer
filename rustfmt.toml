@@ -1,2 +1,2 @@
-# Default rustfmt style; add project-wide deviations here (see CLAUDE.md).
+# Default rustfmt style; add project-wide deviations here (see AGENTS.md).
 newline_style = "Unix"
