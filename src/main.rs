@@ -228,18 +228,14 @@ const LOG_RETENTION_DAYS: i64 = 30;
 /// longer discards the previous run, and rotating the file aside once it
 /// spans [`LOG_RETENTION_DAYS`]. A missing platform log path disables
 /// logging.
+///
+/// # Errors
+///
+/// When the log file cannot be opened or the logger registered. Callers
+/// treat this as a warning: the viewer works without a log.
 fn init_logger(path: Option<&Path>) -> Result<()> {
     let Some(path) = path else { return Ok(()) };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("could not create log directory {}", parent.display()))?;
-    }
-    rotate_if_stale(path, Utc::now().date_naive())?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("could not open log file {}", path.display()))?;
+    let (file, rotation_failure) = open_log_file(path, Utc::now().date_naive())?;
     simplelog::WriteLogger::init(
         simplelog::LevelFilter::Info,
         // Dated timestamps: a log spanning up to 30 days needs them to be
@@ -250,7 +246,37 @@ fn init_logger(path: Option<&Path>) -> Result<()> {
         file,
     )
     .map_err(|_| anyhow!("could not register file logger"))?;
+    if let Some(reason) = rotation_failure {
+        log::warn!("log rotation skipped, appending instead: {reason}");
+    }
     Ok(())
+}
+
+/// Opens the log at `path` for appending, rotating it aside first when it
+/// is stale.
+///
+/// A failed rotation — on Windows typically `m3u-viewer.log.old` held open
+/// by an antivirus scanner or a log viewer — is not an error: the current
+/// file is appended to instead, and the reason is returned so it can be
+/// logged once the logger is up.
+///
+/// # Errors
+///
+/// When the log directory cannot be created or the file not opened.
+fn open_log_file(path: &Path, today: NaiveDate) -> Result<(std::fs::File, Option<String>)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create log directory {}", parent.display()))?;
+    }
+    let rotation_failure = rotate_if_stale(path, today)
+        .err()
+        .map(|error| format!("{error:#}"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("could not open log file {}", path.display()))?;
+    Ok((file, rotation_failure))
 }
 
 /// Date of the oldest entry in a log file, read from the RFC 3339
@@ -436,12 +462,17 @@ fn main() -> Result<()> {
     let log_path = config_path
         .as_ref()
         .map(|p| p.with_file_name("m3u-viewer.log"));
-    init_logger(log_path.as_deref())?;
-    log::info!("m3u-viewer {} starting", env!("CARGO_PKG_VERSION"));
-
     // Startup warnings that would otherwise only reach stderr, which the
     // alternate screen hides until the user quits; shown in the status bar.
     let mut notices = Vec::new();
+    // The log is a diagnostic aid; failing to open it must never stop
+    // the viewer from starting.
+    if let Err(error) = init_logger(log_path.as_deref()) {
+        eprintln!("warning: logging disabled: {error:#}");
+        notices.push("⚠ logging disabled: could not open the log file".to_owned());
+    }
+    log::info!("m3u-viewer {} starting", env!("CARGO_PKG_VERSION"));
+
     let startup = load_config(config_path.as_deref());
     if let Some(unreadable) = &startup.unreadable {
         eprintln!(
@@ -843,6 +874,40 @@ mod tests {
         rotate_if_stale(&log, date("2026-09-12")).unwrap();
         let rotated = std::fs::read_to_string(dir.join("m3u-viewer.log.old")).unwrap();
         assert!(rotated.contains("second"), "newest archive should win");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_rotation_appends_to_the_current_log_instead_of_failing() {
+        // Regression: a rotation failure (on Windows, `.log.old` held open
+        // by antivirus or a viewer) aborted startup. A non-empty directory
+        // in the archive's place makes the rename fail on every platform.
+        let dir = log_dir_with("rotate-fails", "2026-07-01T10:00:00Z [INFO] old run\n");
+        let log = dir.join("m3u-viewer.log");
+        let blocker = dir.join("m3u-viewer.log.old");
+        std::fs::create_dir_all(&blocker).unwrap();
+        std::fs::write(blocker.join("keep"), "x").unwrap();
+
+        let (mut file, rotation_failure) = open_log_file(&log, date("2026-09-12")).unwrap();
+        let reason = rotation_failure.expect("the failed rotation is reported");
+        assert!(reason.contains("could not rotate log"), "{reason}");
+
+        std::io::Write::write_all(&mut file, b"2026-09-12T08:00:00Z [INFO] new run\n").unwrap();
+        drop(file);
+        let contents = std::fs::read_to_string(&log).unwrap();
+        assert!(contents.contains("old run"), "previous entries are kept");
+        assert!(contents.contains("new run"), "new entries are appended");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn log_file_opens_after_a_successful_rotation() {
+        let dir = log_dir_with("rotate-ok", "2026-07-01T10:00:00Z [INFO] old run\n");
+        let log = dir.join("m3u-viewer.log");
+        let (_file, rotation_failure) = open_log_file(&log, date("2026-09-12")).unwrap();
+        assert!(rotation_failure.is_none());
+        assert!(dir.join("m3u-viewer.log.old").is_file());
+        assert!(log.is_file(), "a fresh log was created");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

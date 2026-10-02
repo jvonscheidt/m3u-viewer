@@ -151,7 +151,7 @@ macOS `~/Library/Application Support/m3u-viewer/`.
 | `favorites.json` | Favorited channel URLs |
 | `recents.json` | Recently played channel URLs (newest first, capped at 50) |
 | `cache/` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs. If the refresh fails, the cached list stays on screen with a warning in the status bar |
-| `m3u-viewer.log` | Diagnostic log (startup, loading, playback timings); appended across runs and rotated to `m3u-viewer.log.old` once it spans 30 days |
+| `m3u-viewer.log` | Diagnostic log (startup, loading, playback timings); appended across runs and rotated to `m3u-viewer.log.old` once it spans 30 days (if that file is locked, the log keeps appending; a log that cannot be opened never stops the viewer) |
 
 Favorites and recents are keyed by stream URL, so they survive playlist
 re-downloads and re-ordering. **Xtream credentials are stored in plaintext**
