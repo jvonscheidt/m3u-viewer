@@ -41,8 +41,15 @@ pub(super) struct ApiList<T> {
 pub(super) fn parse_api_list<R: RawRecord>(
     reader: impl std::io::Read,
 ) -> Result<ApiList<R::Record>, XtreamError> {
-    let value: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(reader))?;
-    match value.deserialize_any(ListVisitor::<R>(PhantomData))? {
+    // Straight from the byte stream into the records: no intermediate
+    // `serde_json::Value` tree, which for a 20 MB stream list would cost
+    // several times the body in short-lived allocations on top of the
+    // records being built. Only one record's raw fields (and, for the
+    // account object, the small `user_info`) exist as loose values.
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(reader));
+    let outcome = (&mut deserializer).deserialize_any(ListVisitor::<R>(PhantomData))?;
+    deserializer.end()?;
+    match outcome {
         Outcome::List(list) => Ok(list),
         Outcome::AuthFailed => Err(XtreamError::AuthFailed),
         Outcome::Unexpected => Err(XtreamError::UnexpectedApiReply),
@@ -675,6 +682,46 @@ mod tests {
         let error =
             parse_api_list::<RawLiveStream>(br#"{"user_info":{"auth":0}}"#.as_slice()).unwrap_err();
         assert!(matches!(error, XtreamError::AuthFailed));
+    }
+
+    #[test]
+    fn large_list_streams_through_with_scattered_bad_records() {
+        use std::fmt::Write as _;
+
+        // Generated, not checked in (AGENTS.md): a 55k-stream reply of the
+        // size that used to be buffered as a whole `Value` tree first.
+        const COUNT: u64 = 55_000;
+        let mut json = String::from("[");
+        for id in 1..=COUNT {
+            if id > 1 {
+                json.push(',');
+            }
+            let stream_id = if id % 1000 == 0 {
+                "null".to_owned()
+            } else {
+                format!("\"{id}\"")
+            };
+            let category = id % 40;
+            write!(
+                json,
+                r#"{{"num":{id},"name":"Channel {id}","stream_type":"live","stream_id":{stream_id},"stream_icon":"http://logo/{id}.png","epg_channel_id":"c{id}.tv","added":"1700000000","category_id":"{category}","tv_archive":0,"direct_source":"","category_ids":[{category}]}}"#,
+            )
+            .unwrap();
+        }
+        json.push(']');
+        let list = streams(&json);
+        assert_eq!(list.skipped, 55);
+        assert_eq!(list.records.len(), 54_945);
+        let final_record = list.records.last().unwrap();
+        assert_eq!(final_record.stream_id, COUNT - 1);
+        assert_eq!(final_record.name.as_deref(), Some("Channel 54999"));
+    }
+
+    #[test]
+    fn trailing_garbage_after_the_list_is_an_error() {
+        let error =
+            parse_api_list::<RawLiveStream>(br#"[{"stream_id":1}] x"#.as_slice()).unwrap_err();
+        assert!(matches!(error, XtreamError::Json(_)));
     }
 
     #[test]
