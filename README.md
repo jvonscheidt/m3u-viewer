@@ -14,6 +14,12 @@ winget install --id jvonscheidt.m3u-viewer --exact
 
 Prebuilt archives for Windows, Linux, and macOS are attached to each
 [GitHub release](https://github.com/jvonscheidt/m3u-viewer/releases).
+Each archive contains the binary, `README.md`, and `LICENSE`. To verify a
+download, check it against the release's `SHA256SUMS` file:
+
+```console
+sha256sum --check --ignore-missing SHA256SUMS
+```
 
 ## Usage
 

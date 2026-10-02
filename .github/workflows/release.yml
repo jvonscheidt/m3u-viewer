@@ -12,27 +12,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  create-release:
-    name: create release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Create GitHub release for the tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --verify-tag \
-            --generate-notes || echo "release already exists"
-
+  # Builds run read-only and pass their archives on as artifacts. The
+  # compile step (and every build script in the dependency tree) never
+  # holds a write token, and nothing is published until all targets build.
   build:
     name: build (${{ matrix.target }})
-    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -46,9 +30,6 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
-    # Uploads its archive to the release.
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,27 +43,66 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package
+        id: package
         shell: bash
-        run: |
-          name="m3u-viewer-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir "$name"
-          cp README.md "$name"/
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "target/${{ matrix.target }}/release/m3u-viewer.exe" "$name"/
-            7z a "$name.zip" "$name" > /dev/null
-          else
-            cp "target/${{ matrix.target }}/release/m3u-viewer" "$name"/
-            tar czf "$name.tar.gz" "$name"
-          fi
-      - name: Upload binaries to the release
         env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: gh release upload "${{ github.ref_name }}" "m3u-viewer-${{ github.ref_name }}-${{ matrix.target }}".* --clobber
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="m3u-viewer-$TAG-$TARGET"
+          mkdir "$name"
+          cp README.md LICENSE "$name"/
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "target/$TARGET/release/m3u-viewer.exe" "$name"/
+            7z a "$name.zip" "$name" > /dev/null
+            archive="$name.zip"
+          else
+            cp "target/$TARGET/release/m3u-viewer" "$name"/
+            tar czf "$name.tar.gz" "$name"
+            archive="$name.tar.gz"
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      # One checksum file for all archives. To check a download, run
+      # `sha256sum --check --ignore-missing SHA256SUMS`.
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum m3u-viewer-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create GitHub release for the tag
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --verify-tag \
+            --generate-notes || echo "release already exists"
+      - name: Upload archives and checksums
+        run: gh release upload "$TAG" dist/* --clobber
 
   publish-winget:
     name: publish to winget-pkgs
-    needs: build
+    needs: release
     # winget-create is only supported on Windows
     runs-on: windows-latest
     # winget-create will read this environment variable to access the GitHub
@@ -110,14 +130,24 @@ jobs:
       - name: Submit package using wingetcreate
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           $packageId = "jvonscheidt.m3u-viewer"
-          $packageVersion = "${{ github.ref_name }}".TrimStart("v")
+          $packageVersion = $env:TAG.TrimStart("v")
+          # Match the exact asset name, so SHA256SUMS or any other asset can
+          # never be picked up as the installer.
+          $assetName = "m3u-viewer-$env:TAG-x86_64-pc-windows-msvc.zip"
 
-          $installerUrl = gh release view "${{ github.ref_name }}" `
+          $assets = (gh release view $env:TAG `
             --repo "${{ github.repository }}" `
-            --json assets `
-            --jq '.assets[] | select(.name | endswith("x86_64-pc-windows-msvc.zip")) | .url'
+            --json assets | ConvertFrom-Json).assets
+          $asset = @($assets | Where-Object name -eq $assetName)
+          if ($asset.Count -ne 1) {
+            Write-Error "expected one asset named $assetName on release $env:TAG, found $($asset.Count)"
+            exit 1
+          }
+          $installerUrl = $asset[0].url
 
           .\wingetcreate.exe update $packageId `
             --version $packageVersion `
