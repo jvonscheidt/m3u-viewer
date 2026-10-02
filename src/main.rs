@@ -749,15 +749,50 @@ fn needs_redraw(dirty: bool, since_last_draw: Duration) -> bool {
     dirty || since_last_draw >= REFRESH_INTERVAL
 }
 
+/// Longest the event loop spends folding loader events into the app
+/// before it repaints and polls input again.
+///
+/// Absorbing a batch costs more the bigger the list already is, while the
+/// loader parses at a steady pace; once absorbing fell behind, an
+/// unbounded drain never emptied the channel until loading ended — no
+/// paint, no key handling, no quit for the whole load.
+const DRAIN_BUDGET: Duration = Duration::from_millis(25);
+
+/// Most loader events applied per frame, whatever the clock says.
+const MAX_EVENTS_PER_FRAME: usize = 64;
+
+/// What one bounded pass over the background channels did.
+#[derive(Debug, PartialEq, Eq)]
+struct Drained {
+    /// Whether the app state changed, i.e. the screen needs a repaint.
+    changed: bool,
+    /// Whether the pass stopped at its budget with loader events possibly
+    /// still queued, so the loop should come straight back for them.
+    backlog: bool,
+}
+
 /// Applies what the loader and EPG threads sent since the last call
-/// (including their unexpected death); returns whether the app changed.
+/// (including their unexpected death).
+///
+/// Loader events are applied until `deadline` passes or
+/// [`MAX_EVENTS_PER_FRAME`] were taken — always at least one, so loading
+/// progresses however slow a single absorb is; the rest stay queued for
+/// the next frame.
 fn apply_background_events(
     app: &mut App,
     loader: &mut LoaderFeed,
     epg_runtime: &mut EpgRuntime,
-) -> bool {
+    deadline: Instant,
+) -> Drained {
     let mut changed = false;
-    while let Some(event) = loader.try_next() {
+    let mut applied = 0;
+    let backlog = loop {
+        if applied > 0 && (applied >= MAX_EVENTS_PER_FRAME || Instant::now() >= deadline) {
+            break true;
+        }
+        let Some(event) = loader.try_next() else {
+            break false;
+        };
         // A guide URL discovered in the playlist header starts an EPG
         // load, unless one is already running (explicit --epg/config
         // source, Xtream default, or the same URL from the cached copy of
@@ -769,7 +804,8 @@ fn apply_background_events(
         }
         app.on_load_event(event);
         changed = true;
-    }
+        applied += 1;
+    };
     while let Some(event) = epg_runtime.take_event() {
         app.on_epg_event(event);
         changed = true;
@@ -778,7 +814,7 @@ fn apply_background_events(
         app.set_epg_loading();
         changed = true;
     }
-    changed
+    Drained { changed, backlog }
 }
 
 /// Event loop: drain loader batches, redraw, dispatch key presses, and
@@ -796,18 +832,32 @@ fn run(
     let mut dirty = true;
     let mut last_draw = Instant::now();
     loop {
-        dirty |= apply_background_events(&mut app, &mut loader, &mut epg_runtime);
+        // Checked first, so a quit pressed mid-load does not wait for
+        // another drain and paint.
+        if app.should_quit() {
+            return Ok(());
+        }
+        let drained = apply_background_events(
+            &mut app,
+            &mut loader,
+            &mut epg_runtime,
+            Instant::now() + DRAIN_BUDGET,
+        );
+        dirty |= drained.changed;
         if needs_redraw(dirty, last_draw.elapsed()) {
             app.update_viewports(usize::from(terminal.size()?.height));
             terminal.draw(|frame| ui::draw(frame, &app))?;
             dirty = false;
             last_draw = Instant::now();
         }
-        if app.should_quit() {
-            return Ok(());
-        }
-        // Short poll so loader batches are picked up promptly.
-        if event::poll(POLL_INTERVAL)? {
+        // Short poll so loader batches are picked up promptly; no wait at
+        // all while a backlog is queued, only a check for pending input.
+        let timeout = if drained.backlog {
+            Duration::ZERO
+        } else {
+            POLL_INTERVAL
+        };
+        if event::poll(timeout)? {
             match event::read()? {
                 // Windows delivers Release events too; act on Press only.
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -910,6 +960,78 @@ mod tests {
         EpgRuntime::new(None, None)
     }
 
+    /// A drain deadline that never interferes with a test.
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
+
+    /// A loader feed with `batches` empty batches and then `Finished`
+    /// queued; the sender is kept alive like a still-running loader.
+    fn queued_feed(batches: usize) -> (std::sync::mpsc::Sender<LoadEvent>, LoaderFeed) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..batches {
+            tx.send(empty_batch()).unwrap();
+        }
+        tx.send(LoadEvent::Finished).unwrap();
+        (tx, LoaderFeed::new(rx))
+    }
+
+    /// Events still queued in `loader`, consuming them.
+    fn remaining(loader: &mut LoaderFeed) -> usize {
+        std::iter::from_fn(|| loader.try_next()).count()
+    }
+
+    #[test]
+    fn drain_stops_at_the_event_cap_and_keeps_the_rest_queued() {
+        // Regression: the loop drained every queued event before painting,
+        // so a backlog that grew faster than it was absorbed froze the UI
+        // (no paint, no quit) until loading ended.
+        let (_tx, mut loader) = queued_feed(200);
+        let mut app = App::new("list.m3u".to_owned(), None);
+        let drained = apply_background_events(&mut app, &mut loader, &mut idle_epg(), later());
+        assert_eq!(
+            drained,
+            Drained {
+                changed: true,
+                backlog: true
+            }
+        );
+        assert_eq!(remaining(&mut loader), 201 - MAX_EVENTS_PER_FRAME);
+    }
+
+    #[test]
+    fn drain_past_its_deadline_still_applies_one_event() {
+        // However slow one absorb is, every frame makes progress.
+        let (_tx, mut loader) = queued_feed(10);
+        let mut app = App::new("list.m3u".to_owned(), None);
+        let drained =
+            apply_background_events(&mut app, &mut loader, &mut idle_epg(), Instant::now());
+        assert!(drained.changed);
+        assert!(drained.backlog);
+        assert_eq!(remaining(&mut loader), 10);
+    }
+
+    #[test]
+    fn bounded_drains_finish_the_load_and_then_go_quiet() {
+        let (_tx, mut loader) = queued_feed(3 * MAX_EVENTS_PER_FRAME);
+        let mut app = App::new("list.m3u".to_owned(), None);
+        let mut epg_runtime = idle_epg();
+        let mut passes = 0;
+        while apply_background_events(&mut app, &mut loader, &mut epg_runtime, later()).backlog {
+            passes += 1;
+        }
+        assert_eq!(passes, 3);
+        assert!(!screen(&mut app).contains("loading"));
+        // Nothing new: no repaint is requested, and no backlog either.
+        assert_eq!(
+            apply_background_events(&mut app, &mut loader, &mut epg_runtime, later()),
+            Drained {
+                changed: false,
+                backlog: false
+            }
+        );
+    }
+
     #[test]
     fn loader_panic_is_reported_instead_of_loading_forever() {
         // Regression: `while let Ok(..) = try_recv()` treated a dead
@@ -924,11 +1046,8 @@ mod tests {
 
         let mut app = App::new("list.m3u".to_owned(), None);
         let mut loader = LoaderFeed::new(rx);
-        assert!(apply_background_events(
-            &mut app,
-            &mut loader,
-            &mut idle_epg()
-        ));
+        let drained = apply_background_events(&mut app, &mut loader, &mut idle_epg(), later());
+        assert!(drained.changed);
         let screen = screen(&mut app);
         assert!(screen.contains(LOADER_DIED), "{screen}");
         assert!(!screen.contains("loading"), "{screen}");
@@ -973,11 +1092,8 @@ mod tests {
         let (_loader_tx, loader_rx) = std::sync::mpsc::channel();
         let mut loader = LoaderFeed::new(loader_rx);
 
-        assert!(apply_background_events(
-            &mut app,
-            &mut loader,
-            &mut epg_runtime
-        ));
+        let drained = apply_background_events(&mut app, &mut loader, &mut epg_runtime, later());
+        assert!(drained.changed);
         assert!(epg_runtime.rx.is_none());
         assert!(!epg_runtime.resolved, "a fallback guide may still be tried");
         let screen = screen(&mut app);
