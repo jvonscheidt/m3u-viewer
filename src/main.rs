@@ -6,6 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -535,7 +536,15 @@ fn main() -> Result<()> {
         let _ = ratatui::try_restore();
     })?;
     let _restore_on_exit = TerminalGuard;
-    run(&mut terminal, app, &events, &player, epg_runtime)
+    // After try_init, so the hook it wraps is ratatui's restoring one.
+    install_panic_hook();
+    run(
+        &mut terminal,
+        app,
+        LoaderFeed::new(events),
+        &player,
+        epg_runtime,
+    )
 }
 
 /// Restores the terminal when dropped, so every way out of the TUI — a
@@ -565,6 +574,78 @@ fn start_terminal<T>(
              stdin or stdout)",
         )
     })
+}
+
+/// Status shown when the playlist loader thread dies without reporting.
+const LOADER_DIED: &str = "playlist loader stopped unexpectedly — see log";
+
+/// Failure recorded when the EPG thread dies without reporting.
+const EPG_DIED: &str = "EPG loader stopped unexpectedly — see log";
+
+/// The loader's event channel, plus whether its final event has arrived.
+struct LoaderFeed {
+    rx: Receiver<LoadEvent>,
+    /// Set once [`LoadEvent::Finished`] or [`LoadEvent::Failed`] arrived
+    /// (or was synthesised): the sender hanging up after that is the
+    /// normal end of loading, not a crash.
+    done: bool,
+}
+
+impl LoaderFeed {
+    fn new(rx: Receiver<LoadEvent>) -> Self {
+        Self { rx, done: false }
+    }
+
+    /// Next queued loader event, if any.
+    ///
+    /// A disconnect before the final event means the loader thread died
+    /// (panicked); it is turned into a [`LoadEvent::Failed`] so the UI
+    /// reports it instead of showing "loading" forever.
+    fn try_next(&mut self) -> Option<LoadEvent> {
+        if self.done {
+            return None;
+        }
+        match self.rx.try_recv() {
+            Ok(event) => {
+                self.done = matches!(event, LoadEvent::Finished | LoadEvent::Failed(_));
+                Some(event)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.done = true;
+                log::error!("playlist loader thread ended without reporting a result");
+                Some(LoadEvent::Failed(LOADER_DIED.to_owned()))
+            }
+        }
+    }
+}
+
+/// Wraps the current panic hook — ratatui's, which restores the terminal
+/// and then prints — so it only runs for panics on the UI thread (the
+/// caller's). Every panic is logged with its thread name first.
+///
+/// ratatui's hook fires for a panic on *any* thread, so a dying loader or
+/// EPG thread used to drop the terminal out of raw mode and the alternate
+/// screen while the UI kept drawing. A background panic now only reaches
+/// the log; the event loop notices the dead thread through its closed
+/// channel and says so in the status bar.
+fn install_panic_hook() {
+    let ui_thread = std::thread::current().id();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        log::error!("thread '{name}' {info}");
+        if forwards_panic(thread.id(), ui_thread) {
+            previous(info);
+        }
+    }));
+}
+
+/// Whether a panic on `panicking` goes on to the terminal-restoring hook:
+/// only for the UI thread, which owns the terminal.
+fn forwards_panic(panicking: ThreadId, ui_thread: ThreadId) -> bool {
+    panicking == ui_thread
 }
 
 /// EPG wiring owned by the event loop: the in-flight guide load, if one
@@ -616,10 +697,15 @@ impl EpgRuntime {
                 Some(event)
             }
             Err(TryRecvError::Empty) => None,
+            // The thread always sends exactly one event before hanging up,
+            // so a bare disconnect means it died (panicked). Report it as
+            // a failure rather than leaving "epg…" up forever; a pending
+            // playlist guide URL may still be tried afterwards.
             Err(TryRecvError::Disconnected) => {
                 self.rx = None;
                 self.active_playlist_url = None;
-                None
+                log::error!("EPG thread ended without reporting a result");
+                Some(EpgEvent::Failed(EPG_DIED.to_owned()))
             }
         }
     }
@@ -663,12 +749,44 @@ fn needs_redraw(dirty: bool, since_last_draw: Duration) -> bool {
     dirty || since_last_draw >= REFRESH_INTERVAL
 }
 
+/// Applies what the loader and EPG threads sent since the last call
+/// (including their unexpected death); returns whether the app changed.
+fn apply_background_events(
+    app: &mut App,
+    loader: &mut LoaderFeed,
+    epg_runtime: &mut EpgRuntime,
+) -> bool {
+    let mut changed = false;
+    while let Some(event) = loader.try_next() {
+        // A guide URL discovered in the playlist header starts an EPG
+        // load, unless one is already running (explicit --epg/config
+        // source, Xtream default, or the same URL from the cached copy of
+        // this playlist).
+        if let LoadEvent::EpgUrl(url) = &event
+            && epg_runtime.observe_playlist_url(url)
+        {
+            app.set_epg_loading();
+        }
+        app.on_load_event(event);
+        changed = true;
+    }
+    while let Some(event) = epg_runtime.take_event() {
+        app.on_epg_event(event);
+        changed = true;
+    }
+    if epg_runtime.start_pending() {
+        app.set_epg_loading();
+        changed = true;
+    }
+    changed
+}
+
 /// Event loop: drain loader batches, redraw, dispatch key presses, and
 /// hand play requests to VLC until the user quits.
 fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
-    events: &Receiver<LoadEvent>,
+    mut loader: LoaderFeed,
     player: &Result<Player, PlayerError>,
     mut epg_runtime: EpgRuntime,
 ) -> Result<()> {
@@ -678,27 +796,7 @@ fn run(
     let mut dirty = true;
     let mut last_draw = Instant::now();
     loop {
-        while let Ok(event) = events.try_recv() {
-            // A guide URL discovered in the playlist header starts an EPG
-            // load, unless one is already running (explicit --epg/config
-            // source, Xtream default, or the same URL from the cached
-            // copy of this playlist).
-            if let LoadEvent::EpgUrl(url) = &event
-                && epg_runtime.observe_playlist_url(url)
-            {
-                app.set_epg_loading();
-            }
-            app.on_load_event(event);
-            dirty = true;
-        }
-        while let Some(event) = epg_runtime.take_event() {
-            app.on_epg_event(event);
-            dirty = true;
-        }
-        if epg_runtime.start_pending() {
-            app.set_epg_loading();
-            dirty = true;
-        }
+        dirty |= apply_background_events(&mut app, &mut loader, &mut epg_runtime);
         if needs_redraw(dirty, last_draw.elapsed()) {
             app.update_viewports(usize::from(terminal.size()?.height));
             terminal.draw(|frame| ui::draw(frame, &app))?;
@@ -782,6 +880,119 @@ mod tests {
         // keep repainting slowly rather than freezing.
         assert!(needs_redraw(false, REFRESH_INTERVAL));
         assert!(needs_redraw(false, REFRESH_INTERVAL * 3));
+    }
+
+    /// Renders `app` the way the event loop does and returns the screen.
+    fn screen(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 8)).unwrap();
+        app.update_viewports(8);
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    fn empty_batch() -> LoadEvent {
+        LoadEvent::Batch {
+            channels: Vec::new(),
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(10),
+        }
+    }
+
+    fn idle_epg() -> EpgRuntime {
+        EpgRuntime::new(None, None)
+    }
+
+    #[test]
+    fn loader_panic_is_reported_instead_of_loading_forever() {
+        // Regression: `while let Ok(..) = try_recv()` treated a dead
+        // loader (Disconnected) like an idle one (Empty), so a panic in
+        // the loader thread left the status bar on "loading" forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loader_thread = std::thread::spawn(move || {
+            tx.send(empty_batch()).unwrap();
+            panic!("simulated loader crash");
+        });
+        assert!(loader_thread.join().is_err());
+
+        let mut app = App::new("list.m3u".to_owned(), None);
+        let mut loader = LoaderFeed::new(rx);
+        assert!(apply_background_events(
+            &mut app,
+            &mut loader,
+            &mut idle_epg()
+        ));
+        let screen = screen(&mut app);
+        assert!(screen.contains(LOADER_DIED), "{screen}");
+        assert!(!screen.contains("loading"), "{screen}");
+        // Reported once, not on every frame.
+        assert!(loader.try_next().is_none());
+    }
+
+    #[test]
+    fn hang_up_after_finished_is_the_normal_end_not_a_failure() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(LoadEvent::Finished).unwrap();
+        drop(tx);
+        let mut loader = LoaderFeed::new(rx);
+        assert!(matches!(loader.try_next(), Some(LoadEvent::Finished)));
+        assert!(loader.try_next().is_none());
+        assert!(loader.try_next().is_none());
+    }
+
+    #[test]
+    fn idle_loader_is_not_reported_as_dead() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut loader = LoaderFeed::new(rx);
+        assert!(loader.try_next().is_none());
+        assert!(!loader.done);
+    }
+
+    #[test]
+    fn epg_thread_death_is_reported_as_a_failed_guide() {
+        // Regression: a dead EPG thread was silently forgotten, leaving
+        // "epg…" in the status bar for good.
+        let (tx, rx) = std::sync::mpsc::channel::<EpgEvent>();
+        drop(tx);
+        let mut epg_runtime = EpgRuntime {
+            rx: Some(rx),
+            user_agent: None,
+            active_playlist_url: None,
+            pending_playlist_url: None,
+            resolved: false,
+        };
+        let mut app = App::new("list.m3u".to_owned(), None);
+        app.set_epg_loading();
+        let (_loader_tx, loader_rx) = std::sync::mpsc::channel();
+        let mut loader = LoaderFeed::new(loader_rx);
+
+        assert!(apply_background_events(
+            &mut app,
+            &mut loader,
+            &mut epg_runtime
+        ));
+        assert!(epg_runtime.rx.is_none());
+        assert!(!epg_runtime.resolved, "a fallback guide may still be tried");
+        let screen = screen(&mut app);
+        assert!(screen.contains("epg ✗"), "{screen}");
+        assert!(!screen.contains("epg…"), "{screen}");
+    }
+
+    #[test]
+    fn only_ui_thread_panics_reach_the_terminal_restoring_hook() {
+        let ui_thread = std::thread::current().id();
+        assert!(forwards_panic(ui_thread, ui_thread));
+        let background = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        assert!(!forwards_panic(background, ui_thread));
     }
 
     #[test]
