@@ -4,8 +4,10 @@
 //! directives are decoded into [`Channel`] entries, `group-title` values are
 //! interned into a flat table, and malformed entries are counted in
 //! [`Playlist::skipped`] instead of aborting the load. Only I/O failures
-//! abort parsing.
+//! abort parsing: bytes that are not valid UTF-8 (common in Latin-1 /
+//! Windows-1252 playlists) are decoded leniently rather than rejected.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
@@ -106,15 +108,22 @@ impl Playlist {
     /// Accepts extended M3U (`#EXTINF` metadata followed by a URL line) as
     /// well as plain M3U (bare URL lines). Unknown `#` directives and blank
     /// lines are ignored; a UTF-8 BOM and CRLF line endings are handled.
+    /// Bytes that are not valid UTF-8 are read as Windows-1252 (which
+    /// covers Latin-1 text) instead of failing the whole load.
     ///
     /// # Errors
     ///
     /// Returns [`ParseError::Io`] if the reader fails. Malformed content is
     /// skipped and counted in [`Playlist::skipped`] instead of erroring.
-    pub fn from_reader<R: BufRead>(reader: R) -> Result<Self, ParseError> {
+    pub fn from_reader<R: BufRead>(mut reader: R) -> Result<Self, ParseError> {
         let mut builder = PlaylistBuilder::new();
-        for line in reader.lines() {
-            builder.push_line(&line?);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            builder.push_line(&decode_line(&line));
         }
         Ok(builder.finish())
     }
@@ -255,6 +264,43 @@ impl PlaylistBuilder {
             self.playlist.skipped += 1;
         }
         self.playlist
+    }
+}
+
+/// Decodes one raw playlist line (newline included or not).
+///
+/// Valid UTF-8 is borrowed as is. Anything else is decoded leniently:
+/// valid UTF-8 runs stay UTF-8 and each invalid byte is read as
+/// Windows-1252 — the encoding legacy (Latin-1-era) playlists are almost
+/// always in, so `M\xFAsica` becomes "Música" instead of failing the load
+/// or turning into U+FFFD. Every byte maps to some character, so this
+/// never fails. A UTF-8 BOM decodes to U+FEFF, which
+/// [`PlaylistBuilder::push_line`] strips.
+pub(crate) fn decode_line(bytes: &[u8]) -> Cow<'_, str> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Cow::Borrowed(text);
+    }
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for chunk in bytes.utf8_chunks() {
+        text.push_str(chunk.valid());
+        text.extend(chunk.invalid().iter().copied().map(windows_1252));
+    }
+    Cow::Owned(text)
+}
+
+/// Maps a byte to its Windows-1252 character. That is Latin-1 except for
+/// 0x80–0x9F, where Windows-1252 has printable characters (€, curly
+/// quotes, dashes, …) instead of C1 controls; its five unassigned bytes
+/// keep their C1 code points, as in the WHATWG encoding standard.
+fn windows_1252(byte: u8) -> char {
+    const C1_RANGE: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
+        'ž', 'Ÿ',
+    ];
+    match byte {
+        0x80..=0x9F => C1_RANGE[usize::from(byte - 0x80)],
+        _ => char::from(byte),
     }
 }
 
@@ -518,6 +564,50 @@ mod tests {
         assert_eq!(playlist.channels[0].name, "A");
         assert_eq!(playlist.channels[0].url, "http://u/a");
         assert_eq!(playlist.skipped, 0);
+    }
+
+    #[test]
+    fn latin1_names_and_groups_do_not_abort_the_load() {
+        // Regression: one non-UTF-8 byte failed the whole load with
+        // InvalidData; Latin-1/Windows-1252 playlists are common.
+        let input = b"#EXTM3U\n\
+            #EXTINF:-1 group-title=\"M\xfasica\",Caf\xe9 \x80 \x93Live\x94\n\
+            http://u/1\n\
+            #EXTINF:-1 group-title=\"News\",Plain\n\
+            http://u/2\n";
+        let playlist = Playlist::from_reader(&input[..]).unwrap();
+        assert_eq!(playlist.channels.len(), 2);
+        let channel = &playlist.channels[0];
+        assert_eq!(channel.name, "Café € “Live”");
+        assert_eq!(playlist.group_name(channel.group.unwrap()), Some("Música"));
+        assert_eq!(playlist.channels[1].name, "Plain");
+        assert_eq!(playlist.skipped, 0);
+    }
+
+    #[test]
+    fn decode_line_keeps_utf8_and_reads_stray_bytes_as_windows_1252() {
+        assert!(matches!(
+            decode_line("Música\n".as_bytes()),
+            Cow::Borrowed("Música\n")
+        ));
+        // Valid UTF-8 runs survive next to an invalid byte on the same line.
+        assert_eq!(decode_line(b"Caf\xc3\xa9 / Caf\xe9"), "Café / Café");
+        assert_eq!(decode_line(b"\x80\x81\x9f\xa0\xff"), "€\u{81}Ÿ\u{a0}ÿ");
+        // A BOM still decodes to U+FEFF for push_line to strip.
+        assert_eq!(
+            decode_line(b"\xef\xbb\xbf#EXTM3U \xe9"),
+            "\u{feff}#EXTM3U é"
+        );
+    }
+
+    #[test]
+    fn bom_with_latin1_content_is_still_stripped() {
+        let input =
+            b"\xef\xbb\xbf#EXTM3U url-tvg=\"http://x/epg\"\r\n#EXTINF:-1,Ni\xf1o\r\nhttp://u/a\r\n";
+        let playlist = Playlist::from_reader(&input[..]).unwrap();
+        assert_eq!(playlist.channels.len(), 1);
+        assert_eq!(playlist.channels[0].name, "Niño");
+        assert_eq!(playlist.channels[0].url, "http://u/a");
     }
 
     #[test]

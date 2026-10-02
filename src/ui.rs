@@ -221,6 +221,12 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
                 .map_or_else(|| "  loading…".to_owned(), |p| format!("  loading {p}%"));
             spans.push(Span::styled(progress, Style::new().yellow()));
         }
+        if let Some(warning) = &app.warning {
+            spans.push(Span::styled(
+                format!("  ⚠ {warning}"),
+                Style::new().yellow(),
+            ));
+        }
         match &app.epg {
             EpgState::Loading => spans.push(Span::styled("  epg…", Style::new().dim())),
             EpgState::Failed(_) => {
@@ -386,6 +392,15 @@ mod tests {
         assert!(screen.contains("Channel 0"));
         assert!(screen.contains("News"));
         assert!(screen.contains("3/3 channels"));
+    }
+
+    #[test]
+    fn load_warning_shows_next_to_the_channel_count() {
+        let mut app = app_with_channels(3);
+        app.on_load_event(LoadEvent::Warning("showing cached playlist".into()));
+        let screen = render(&mut app);
+        assert!(screen.contains("3/3 channels"));
+        assert!(screen.contains("⚠ showing cached playlist"));
     }
 
     #[test]

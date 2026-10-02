@@ -174,14 +174,18 @@ fn sanitize_for_filename(text: &str) -> String {
         .collect()
 }
 
-/// Stable non-cryptographic identity suffix preventing sanitized-name collisions.
-fn cache_identity_hash(host: &str, username: &str) -> u64 {
+/// Stable non-cryptographic (FNV-1a) identity suffix: prevents
+/// sanitized-name collisions and, by covering the password, gives every
+/// credential set its own cache — cached stream URLs embed the password.
+fn cache_identity_hash(host: &str, username: &str, password: &str) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
     host.bytes()
         .chain(std::iter::once(0))
         .chain(username.bytes())
+        .chain(std::iter::once(0))
+        .chain(password.bytes())
         .fold(OFFSET_BASIS, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(PRIME)
         })
@@ -258,9 +262,12 @@ impl Account {
     }
 
     /// Filesystem-safe key identifying this account for the on-disk
-    /// playlist cache: the server host and username (not the password),
-    /// with anything that isn't ASCII alphanumeric replaced by `_`, plus
-    /// a stable hash of the unsanitized values to prevent collisions.
+    /// playlist cache: the server host and username, with anything that
+    /// isn't ASCII alphanumeric replaced by `_`, plus a stable hash of the
+    /// unsanitized host, username *and password*. The password only enters
+    /// through the hash, so it never appears in the file name; including
+    /// it means a changed password starts a fresh cache instead of reusing
+    /// one full of stream URLs that embed the old credentials.
     #[must_use]
     pub fn cache_key(&self) -> String {
         let host = self
@@ -272,7 +279,7 @@ impl Account {
             sanitize_for_filename(host),
             sanitize_for_filename(&self.username)
         );
-        let hash = cache_identity_hash(host, &self.username);
+        let hash = cache_identity_hash(host, &self.username, &self.password);
         format!("{readable}-{hash:016x}")
     }
 
@@ -540,10 +547,29 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_ignores_the_password() {
+    fn cache_key_changes_with_the_password() {
+        // Regression: the key ignored the password, so after a password
+        // change the cache full of old-credential stream URLs was reused
+        // and every channel failed to play.
         let a = Account::new("example.com", "u".into(), "one".into());
         let b = Account::new("example.com", "u".into(), "two".into());
-        assert_eq!(a.cache_key(), b.cache_key());
+        assert_ne!(a.cache_key(), b.cache_key());
+        assert_eq!(
+            a.cache_key(),
+            Account::new("example.com", "u".into(), "one".into()).cache_key(),
+            "the key must stay stable for unchanged credentials"
+        );
+    }
+
+    #[test]
+    fn cache_key_does_not_contain_the_password() {
+        // Letters outside 0-9a-f, so they cannot show up in the hex hash.
+        let account = Account::new("example.com", "u".into(), "Secret-Pw".into());
+        let key = account.cache_key();
+        assert!(key.starts_with("example_com-u-"), "got: {key}");
+        for needle in ["Secret", "Pw"] {
+            assert!(!key.contains(needle), "{needle:?} leaked into {key}");
+        }
     }
 
     /// One-shot local HTTP server; returns the request it received.

@@ -16,13 +16,13 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use crate::cache;
-use crate::playlist::{Channel, GroupId, PlaylistBuilder};
+use crate::cache::{self, PendingCache};
+use crate::playlist::{Channel, GroupId, PlaylistBuilder, decode_line};
 use crate::xtream::Account;
 
 /// Channels per [`LoadEvent::Batch`]; small enough for a responsive first
@@ -63,6 +63,12 @@ pub enum LoadEvent {
     /// arrive more than once (cached copy, then the live refresh) and
     /// every occurrence after the first is ignored there.
     EpgUrl(String),
+    /// A non-fatal problem the user should know about; loading still ends
+    /// with [`LoadEvent::Finished`]. Sent when the live refresh failed
+    /// and the cached playlist stays on screen, so its stale (possibly
+    /// unplayable) URLs don't masquerade as a successful load. Contains
+    /// no credentials.
+    Warning(String),
     /// The whole playlist was parsed successfully.
     Finished,
     /// Loading aborted (I/O error, HTTP failure, bad credentials, …).
@@ -89,6 +95,7 @@ impl fmt::Debug for LoadEvent {
                 .debug_tuple("EpgUrl")
                 .field(&"<redacted URL>")
                 .finish(),
+            Self::Warning(message) => formatter.debug_tuple("Warning").field(message).finish(),
             Self::Finished => formatter.write_str("Finished"),
             Self::Failed(message) => formatter.debug_tuple("Failed").field(message).finish(),
         }
@@ -141,7 +148,7 @@ fn load_file(path: &Path, tx: &Sender<LoadEvent>) -> Result<(), String> {
         Header::Optional,
         &mut delivered,
         &mut false,
-        &mut None,
+        None,
         tx,
     )
     .map_err(|e| e.to_string())?;
@@ -154,32 +161,34 @@ fn load_file(path: &Path, tx: &Sender<LoadEvent>) -> Result<(), String> {
 /// was actually shown, so the caller knows a later [`LoadEvent::Reset`]
 /// is needed once live data starts arriving.
 fn load_cached(path: &Path, tx: &Sender<LoadEvent>) -> bool {
-    let Some(file) = cache::open(path) else {
-        return false;
-    };
+    cache::open(path).is_some_and(|file| show_cached(file, path, tx))
+}
+
+/// Streams the cache contents in `input` (read from `path`) to the UI;
+/// see [`load_cached`]. A read error partway through still returns `true`
+/// when batches already went out — those rows are on screen and must be
+/// cleared by a [`LoadEvent::Reset`] before live data arrives, or the
+/// fresh rows would be appended to them (and their group ids would index
+/// the cached group table). The unreadable cache file is removed so the
+/// next launch doesn't stumble over it again.
+fn show_cached(input: impl Read, path: &Path, tx: &Sender<LoadEvent>) -> bool {
     let mut delivered = 0;
-    match parse_stream(
-        file,
+    let result = parse_stream(
+        input,
         None,
         Header::Optional,
         &mut delivered,
         &mut false,
-        &mut None,
+        None,
         tx,
-    ) {
-        Ok(summary) if summary.delivered > 0 => {
-            log::info!(
-                "showing {} cached channels while refreshing",
-                summary.delivered
-            );
-            true
-        }
-        Ok(_) => false,
-        Err(error) => {
-            log::warn!("cached playlist unreadable ({error}); ignoring");
-            false
-        }
+    );
+    if let Err(error) = result {
+        log::warn!("cached playlist unreadable after {delivered} channels ({error}); removing it");
+        cache::remove(path);
+    } else if delivered > 0 {
+        log::info!("showing {delivered} cached channels while refreshing");
     }
+    delivered > 0
 }
 
 /// Xtream loading: a cached copy (if any) is shown first for an instant
@@ -188,7 +197,11 @@ fn load_cached(path: &Path, tx: &Sender<LoadEvent>) -> bool {
 /// instead. Either live path clears the cached rows (via
 /// [`LoadEvent::Reset`]) only once it actually has fresh data to replace
 /// them with, so a live fetch that never gets that far leaves the cached
-/// copy on screen instead of clearing it for nothing.
+/// copy on screen instead of clearing it for nothing — with a
+/// [`LoadEvent::Warning`] saying so, since its URLs may no longer play.
+///
+/// Error messages pass through [`redact_credentials`] before they are
+/// logged or reach the UI.
 fn load_xtream(
     account: &Account,
     cache_dir: Option<&Path>,
@@ -209,7 +222,7 @@ fn load_xtream(
         tx,
     ) {
         Ok(()) => return Ok(()),
-        Err(error) => error,
+        Err(error) => redact_credentials(&error),
     };
     if delivered > 0 {
         // Channels already reached the UI (download died mid-stream); a
@@ -220,18 +233,46 @@ fn load_xtream(
     match load_xtream_api(account, &mut reset_pending, cache_path.as_deref(), tx) {
         Ok(()) => Ok(()),
         Err(api_error) => {
+            let api_error = redact_credentials(&api_error);
             let combined = format!("M3U download failed: {m3u_error}; player API: {api_error}");
             if cache_shown {
                 // Both live paths failed before producing anything, so the
                 // cached copy was never cleared — keep showing it instead
-                // of replacing a working list with an error.
+                // of replacing a list with an error, but say that it is
+                // stale: after e.g. a password change its URLs won't play.
                 log::warn!("xtream refresh failed ({combined}); keeping cached playlist");
+                let _ = tx.send(LoadEvent::Warning(format!(
+                    "showing cached playlist — refresh failed: {combined}"
+                )));
                 Ok(())
             } else {
                 Err(combined)
             }
         }
     }
+}
+
+/// Masks the value of every `password=` query parameter in `message`.
+/// Some HTTP client errors (ureq's `BadUri`, `RequireHttpsOnly`) quote the
+/// full request URL, and Xtream request URLs carry the password in the
+/// query string; this keeps it out of the status bar and the log.
+fn redact_credentials(message: &str) -> String {
+    const KEY: &str = "password=";
+
+    let mut redacted = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(start) = rest.find(KEY) {
+        let value_start = start + KEY.len();
+        redacted.push_str(&rest[..value_start]);
+        redacted.push_str("<redacted>");
+        let value = &rest[value_start..];
+        let end = value
+            .find(|c: char| matches!(c, '&' | '"' | '\'' | '#') || c.is_whitespace())
+            .unwrap_or(value.len());
+        rest = &value[end..];
+    }
+    redacted.push_str(rest);
+    redacted
 }
 
 fn load_xtream_m3u(
@@ -242,42 +283,28 @@ fn load_xtream_m3u(
     tx: &Sender<LoadEvent>,
 ) -> Result<(), String> {
     let (reader, total) = account.fetch().map_err(|error| error.to_string())?;
-    let (mut sink, tmp_path) = match cache_path.and_then(cache::create_temp) {
-        Some((file, tmp)) => (Some(file), Some(tmp)),
-        None => (None, None),
-    };
+    // Dropped (and so discarded) on every early return below.
+    let mut sink = cache_path.and_then(PendingCache::create);
     // get.php always answers with extended M3U, so anything else (CDN
     // challenge page, HTML error, panel notice) must abort with a look at
     // the body rather than turn into junk channels or an empty list.
-    let summary = match parse_stream(
+    let summary = parse_stream(
         reader,
         total,
         Header::Required,
         delivered,
         reset_pending,
-        &mut sink,
+        sink.as_mut(),
         tx,
-    ) {
-        Ok(summary) => summary,
-        Err(error) => {
-            if let Some(tmp) = &tmp_path {
-                cache::discard_temp(tmp);
-            }
-            return Err(error.to_string());
-        }
-    };
+    )
+    .map_err(|error| error.to_string())?;
     if summary.delivered == 0 {
-        if let Some(tmp) = &tmp_path {
-            cache::discard_temp(tmp);
-        }
         return Err(match summary.first_line {
             Some(line) => format!("server sent a playlist with no channels (starts: {line:?})"),
             None => "server sent an empty response — check that the account is active".to_owned(),
         });
     }
-    if let (Some(tmp), Some(path)) = (&tmp_path, cache_path) {
-        cache::promote(tmp, path);
-    }
+    commit_cache(sink);
     log::info!("xtream playlist parsed: {} channels", summary.delivered);
     Ok(())
 }
@@ -308,16 +335,10 @@ fn load_xtream_api(
         return Err("the player API returned no live streams".to_owned());
     }
 
-    let (mut cache_sink, tmp_path) = match cache_path.and_then(cache::create_temp) {
-        Some((mut file, tmp)) => {
-            if file.write_all(b"#EXTM3U\n").is_ok() {
-                (Some(file), Some(tmp))
-            } else {
-                (None, None)
-            }
-        }
-        None => (None, None),
-    };
+    let mut cache_sink = cache_path.and_then(PendingCache::create);
+    if let Some(sink) = &mut cache_sink {
+        sink.write(b"#EXTM3U\n");
+    }
 
     let category_names: HashMap<&str, &str> = categories
         .iter()
@@ -344,7 +365,7 @@ fn load_xtream_api(
         // Panels without a stream name get the URL, like bare M3U entries.
         let name = stream.name.unwrap_or_else(|| url.clone());
         write_m3u_entry(
-            &mut cache_sink,
+            cache_sink.as_mut(),
             &name,
             &url,
             stream.epg_channel_id.as_deref(),
@@ -378,28 +399,35 @@ fn load_xtream_api(
         0,
         Some(100),
     );
-    drop(cache_sink);
-    if let (Some(tmp), Some(path)) = (&tmp_path, cache_path) {
-        cache::promote(tmp, path);
-    }
+    commit_cache(cache_sink);
     Ok(())
 }
 
+/// Replaces the on-disk cache with a fully loaded `sink`, if caching is
+/// on. A sink that hit a write error is discarded instead (see
+/// [`PendingCache::commit`]), so a truncated copy never replaces a good
+/// cache.
+fn commit_cache(sink: Option<PendingCache>) {
+    if let Some(sink) = sink
+        && !sink.commit()
+    {
+        log::warn!("playlist cache not updated; the previous copy (if any) is kept");
+    }
+}
+
 /// Appends one channel as an `#EXTINF`/URL pair to `sink`, if present. A
-/// write failure disables the sink for the rest of the load — mirroring
-/// the same file that's about to be shown to the user isn't worth
-/// failing over.
+/// write failure poisons the sink for the rest of the load (it is then
+/// discarded, not committed) — mirroring the same list that's being shown
+/// to the user isn't worth failing the load over.
 fn write_m3u_entry(
-    sink: &mut Option<File>,
+    sink: Option<&mut PendingCache>,
     name: &str,
     url: &str,
     tvg_id: Option<&str>,
     group: Option<&str>,
 ) {
-    let Some(file) = sink else { return };
-    let line = format_m3u_entry(name, url, tvg_id, group);
-    if file.write_all(line.as_bytes()).is_err() {
-        *sink = None;
+    if let Some(sink) = sink {
+        sink.write(format_m3u_entry(name, url, tvg_id, group).as_bytes());
     }
 }
 
@@ -456,46 +484,48 @@ struct ParseSummary {
 ///
 /// With [`Header::Required`], input whose first non-blank line is not
 /// `#EXTM3U` fails as [`std::io::ErrorKind::InvalidData`] before any
-/// batch is sent.
+/// batch is sent. Lines that are not valid UTF-8 are decoded leniently
+/// ([`decode_line`]), so the only other errors are reader I/O failures.
 ///
 /// `reset_pending` and `cache_sink` support the Xtream cache-then-refresh
 /// flow (see [`load_xtream`]): when `*reset_pending` is set, a
 /// [`LoadEvent::Reset`] is sent right before the first non-empty batch —
 /// not any earlier, so a fetch that never gets that far never clears a
-/// cached copy already on screen. When `cache_sink` holds a file, every
-/// line read is mirrored into it, so a stream that parses successfully
-/// leaves behind an exact copy to cache; the caller decides whether to
-/// keep it. A write failure just stops the mirroring silently — caching
-/// is never a reason to fail the load.
+/// cached copy already on screen. When `cache_sink` is given, every line
+/// read is mirrored into it, so a stream that parses successfully leaves
+/// behind an exact copy to cache; the caller decides whether to commit
+/// it. A write failure poisons the sink (it then refuses to commit) but
+/// never fails the load — caching is not worth failing over.
 fn parse_stream(
     input: impl Read,
     total_bytes: Option<u64>,
     header: Header,
     delivered: &mut usize,
     reset_pending: &mut bool,
-    cache_sink: &mut Option<File>,
+    mut cache_sink: Option<&mut PendingCache>,
     tx: &Sender<LoadEvent>,
 ) -> std::io::Result<ParseSummary> {
     let mut reader = BufReader::with_capacity(256 * 1024, input);
     let mut builder = PlaylistBuilder::new();
-    let mut line = String::new();
+    let mut raw_line = Vec::new();
     let mut bytes_read: u64 = 0;
     let mut groups_sent = 0;
     let mut first_line: Option<String> = None;
     let mut epg_url_sent = false;
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
+        raw_line.clear();
+        let n = reader.read_until(b'\n', &mut raw_line)?;
         if n == 0 {
             break;
         }
         bytes_read += n as u64;
-        if let Some(sink) = cache_sink
-            && sink.write_all(line.as_bytes()).is_err()
-        {
-            *cache_sink = None;
+        // Mirror the bytes as received: the cache is re-read through the
+        // same decoding, so it parses back to exactly the same channels.
+        if let Some(sink) = cache_sink.as_deref_mut() {
+            sink.write(&raw_line);
         }
+        let line = decode_line(&raw_line);
         if first_line.is_none() {
             let trimmed = line.trim_start_matches('\u{feff}').trim();
             if !trimmed.is_empty() {
@@ -666,7 +696,7 @@ mod tests {
                 } => channels += batch.len(),
                 // Cached rows are being replaced by fresh ones.
                 LoadEvent::Reset => channels = 0,
-                LoadEvent::EpgUrl(_) => {}
+                LoadEvent::EpgUrl(_) | LoadEvent::Warning(_) => {}
                 LoadEvent::Finished => return (channels, None),
                 LoadEvent::Failed(message) => return (channels, Some(message)),
             }
@@ -747,6 +777,7 @@ mod tests {
                 }
                 LoadEvent::Reset => panic!("unexpected reset: no cache was primed"),
                 LoadEvent::EpgUrl(_) => {}
+                LoadEvent::Warning(message) => panic!("unexpected warning: {message}"),
                 LoadEvent::Finished => break,
                 LoadEvent::Failed(message) => panic!("load failed: {message}"),
             }
@@ -882,13 +913,82 @@ mod tests {
             "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
         );
 
-        let (channels, error) = drain(&spawn(Source::Xtream(account), Some(dir.clone())));
+        let (channels, warnings, error) =
+            drain_with_warnings(&spawn(Source::Xtream(account), Some(dir.clone())));
         assert_eq!(channels, 1, "the cached channel should still be showing");
         assert!(
             error.is_none(),
             "expected success (cache kept), got: {error:?}"
         );
+        // Regression: the failed refresh used to be only logged, so a
+        // stale cache (e.g. URLs with an old password) looked current.
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(
+            warnings[0].starts_with("showing cached playlist — refresh failed:"),
+            "got: {warnings:?}"
+        );
+        assert!(warnings[0].contains("player API"), "got: {warnings:?}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Like [`drain`], but also collects every [`LoadEvent::Warning`].
+    fn drain_with_warnings(rx: &Receiver<LoadEvent>) -> (usize, Vec<String>, Option<String>) {
+        let mut channels = 0;
+        let mut warnings = Vec::new();
+        for event in rx {
+            match event {
+                LoadEvent::Batch {
+                    channels: batch, ..
+                } => channels += batch.len(),
+                LoadEvent::Reset => channels = 0,
+                LoadEvent::EpgUrl(_) => {}
+                LoadEvent::Warning(message) => warnings.push(message),
+                LoadEvent::Finished => return (channels, warnings, None),
+                LoadEvent::Failed(message) => return (channels, warnings, Some(message)),
+            }
+        }
+        panic!("loader hung up without a terminal event");
+    }
+
+    #[test]
+    fn refresh_failure_warning_does_not_leak_the_password() {
+        // A panel error page echoing the request URL ends up in the
+        // "did not send an M3U" snippet; HTTP client errors can quote the
+        // URL the same way.
+        let dir = temp_cache_dir("redact");
+        let port = serve_once(
+            "<html>bad request: /get.php?username=u&password=s3cret-pw&type=m3u</html>\n",
+        );
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "s3cret-pw".into());
+        seed_cache(
+            &dir,
+            &account.cache_key(),
+            "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
+        );
+        let (channels, warnings, error) =
+            drain_with_warnings(&spawn(Source::Xtream(account), Some(dir.clone())));
+        assert_eq!(channels, 1);
+        assert!(error.is_none(), "got: {error:?}");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(!warnings[0].contains("s3cret"), "leaked: {}", warnings[0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redact_credentials_masks_password_query_values() {
+        assert_eq!(
+            redact_credentials(
+                "bad uri: http://h/get.php?username=u&password=p%26w&type=m3u is missing host"
+            ),
+            "bad uri: http://h/get.php?username=u&password=<redacted>&type=m3u is missing host"
+        );
+        assert_eq!(
+            redact_credentials("a password=one b \"password=two\" password="),
+            "a password=<redacted> b \"password=<redacted>\" password=<redacted>"
+        );
+        // The auth-failure hint mentions the word, but carries no value.
+        let hint = "check username, password, and account status";
+        assert_eq!(redact_credentials(hint), hint);
     }
 
     #[test]
@@ -919,6 +1019,7 @@ mod tests {
                 }
                 LoadEvent::Reset => saw_reset = true,
                 LoadEvent::EpgUrl(_) => {}
+                LoadEvent::Warning(message) => panic!("unexpected warning: {message}"),
                 LoadEvent::Finished => break,
                 LoadEvent::Failed(message) => panic!("load failed: {message}"),
             }
@@ -958,6 +1059,196 @@ mod tests {
         assert!(cached_text.contains("tvg-id=\"one.tv\""));
         assert!(cached_text.contains("group-title=\"News\""));
         assert!(cached_text.contains(",One\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_write_failure_mid_load_keeps_the_previous_cache() {
+        // Regression: a write error (disk full) mid-download dropped the
+        // cache sink but the caller still promoted the truncated temp
+        // file over the good cache. Covers both mirroring paths: the
+        // get.php stream (parse_stream) and the player API (write_m3u_entry).
+        let dir = temp_cache_dir("write-failure");
+        let cache_path = cache::path(&dir, "acct");
+        let good = "#EXTM3U\n#EXTINF:-1,Good\nhttp://u/good\n";
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&cache_path, good).unwrap();
+
+        let (tx, rx) = channel();
+        let mut sink = PendingCache::failing_for_test(&cache_path);
+        let mut delivered = 0;
+        let summary = parse_stream(
+            "#EXTM3U\n#EXTINF:-1,Fresh\nhttp://u/fresh\n".as_bytes(),
+            None,
+            Header::Required,
+            &mut delivered,
+            &mut false,
+            Some(&mut sink),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(summary.delivered, 1, "the load itself must still succeed");
+        commit_cache(Some(sink));
+        assert_eq!(fs::read_to_string(&cache_path).unwrap(), good);
+
+        let mut sink = PendingCache::failing_for_test(&cache_path);
+        write_m3u_entry(Some(&mut sink), "Fresh", "http://u/fresh", None, None);
+        commit_cache(Some(sink));
+        assert_eq!(fs::read_to_string(&cache_path).unwrap(), good);
+
+        drop(tx);
+        assert!(rx.iter().count() > 0);
+        let leftovers = fs::read_dir(cache_path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "temp files were left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reader that fails like a dying disk once its data runs out.
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated read failure"))
+        }
+    }
+
+    #[test]
+    fn cache_read_failure_after_a_batch_still_requests_a_reset() {
+        // Regression: a cache that failed to read partway through reported
+        // "nothing shown", so the live refresh skipped its Reset and
+        // appended fresh rows to the partial cached ones (with group ids
+        // indexing the cached group table).
+        use std::fmt::Write as _;
+
+        let dir = temp_cache_dir("read-failure");
+        let cache_path = cache::path(&dir, "acct");
+        let mut body = String::from("#EXTM3U\n");
+        for index in 0..=BATCH_SIZE {
+            writeln!(
+                body,
+                "#EXTINF:-1 group-title=\"Cached\",Channel {index}\nhttp://u/{index}"
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&cache_path, &body).unwrap();
+
+        let (tx, rx) = channel();
+        let input = body.as_bytes().chain(FailingReader);
+        assert!(
+            show_cached(input, &cache_path, &tx),
+            "rows reached the UI, so the live refresh must reset them"
+        );
+        drop(tx);
+        let shown: usize = rx
+            .iter()
+            .map(|event| match event {
+                LoadEvent::Batch { channels, .. } => channels.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(shown, BATCH_SIZE, "only the first full batch went out");
+        assert!(!cache_path.exists(), "unreadable cache should be removed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_read_failure_before_any_batch_shows_nothing() {
+        let dir = temp_cache_dir("read-failure-early");
+        let cache_path = cache::path(&dir, "acct");
+        let (tx, rx) = channel();
+        let input = "#EXTM3U\n#EXTINF:-1,A\nhttp://u/a\n"
+            .as_bytes()
+            .chain(FailingReader);
+        assert!(!show_cached(input, &cache_path, &tx));
+        drop(tx);
+        assert_eq!(rx.iter().count(), 0, "a failed read sends no tail batch");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Latin-1 playlist (as written by legacy tools) for the encoding tests.
+    const LATIN1_PLAYLIST: &[u8] = b"#EXTM3U\n\
+        #EXTINF:-1 group-title=\"M\xfasica\",Caf\xe9 Radio\n\
+        http://u/1\n\
+        #EXTINF:-1 group-title=\"Noticias\",Espa\xf1a 24h\n\
+        http://u/2\n";
+
+    /// Channel names and group names delivered by `rx`, in order.
+    fn names_and_groups(rx: &Receiver<LoadEvent>) -> (Vec<String>, Vec<String>) {
+        let mut names = Vec::new();
+        let mut groups = Vec::new();
+        for event in rx {
+            match event {
+                LoadEvent::Batch {
+                    channels,
+                    new_groups,
+                    ..
+                } => {
+                    names.extend(channels.into_iter().map(|c| c.name));
+                    groups.extend(new_groups);
+                }
+                LoadEvent::Failed(message) => panic!("load failed: {message}"),
+                LoadEvent::Finished => break,
+                LoadEvent::Reset | LoadEvent::EpgUrl(_) | LoadEvent::Warning(_) => {}
+            }
+        }
+        (names, groups)
+    }
+
+    #[test]
+    fn latin1_file_loads_instead_of_failing() {
+        // Regression: the first non-UTF-8 byte failed the whole load with
+        // "stream did not contain valid UTF-8".
+        let dir = temp_cache_dir("latin1-file");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("latin1.m3u");
+        fs::write(&path, LATIN1_PLAYLIST).unwrap();
+
+        let (names, groups) = names_and_groups(&spawn(Source::File(path), None));
+        assert_eq!(names, ["Café Radio", "España 24h"]);
+        assert_eq!(groups, ["Música", "Noticias"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latin1_stream_is_cached_byte_for_byte_and_reads_back_identically() {
+        let dir = temp_cache_dir("latin1-cache");
+        let cache_path = cache::path(&dir, "acct");
+        let (tx, rx) = channel();
+        let mut sink = PendingCache::create(&cache_path).unwrap();
+        let mut delivered = 0;
+        parse_stream(
+            LATIN1_PLAYLIST,
+            Some(LATIN1_PLAYLIST.len() as u64),
+            Header::Required,
+            &mut delivered,
+            &mut false,
+            Some(&mut sink),
+            &tx,
+        )
+        .unwrap();
+        assert!(sink.commit());
+        assert_eq!(fs::read(&cache_path).unwrap(), LATIN1_PLAYLIST);
+
+        assert!(load_cached(&cache_path, &tx));
+        drop(tx);
+        let mut percents = Vec::new();
+        let mut names = Vec::new();
+        for event in &rx {
+            if let LoadEvent::Batch {
+                channels, percent, ..
+            } = event
+            {
+                percents.push(percent);
+                names.extend(channels.into_iter().map(|c| c.name));
+            }
+        }
+        assert_eq!(percents[0], Some(100), "progress counts raw bytes");
+        assert_eq!(
+            names,
+            ["Café Radio", "España 24h", "Café Radio", "España 24h"],
+            "live and cached loads must decode identically"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1007,7 +1298,7 @@ mod tests {
             match event {
                 LoadEvent::EpgUrl(url) => epg_urls.push(url),
                 LoadEvent::Finished | LoadEvent::Failed(_) => break,
-                LoadEvent::Batch { .. } | LoadEvent::Reset => {}
+                LoadEvent::Batch { .. } | LoadEvent::Reset | LoadEvent::Warning(_) => {}
             }
         }
         assert_eq!(epg_urls, ["http://example.com/epg.xml"]);

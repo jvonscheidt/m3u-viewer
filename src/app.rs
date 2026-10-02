@@ -160,6 +160,10 @@ pub struct App {
     pub(crate) percent: Option<u8>,
     pub(crate) skipped: usize,
     pub(crate) error: Option<String>,
+    /// Non-fatal loader notice ([`LoadEvent::Warning`], e.g. a failed
+    /// refresh behind a cached playlist). Unlike `message` it survives key
+    /// presses; unlike `error` it leaves the rest of the status bar visible.
+    pub(crate) warning: Option<String>,
     pub(crate) file_name: String,
     /// Cursor in the visible group popup rows. Row zero is the synthetic
     /// "(all groups)" entry without a search, but the first real match while
@@ -237,6 +241,7 @@ impl App {
             percent: None,
             skipped: 0,
             error: None,
+            warning: None,
             file_name,
             group_cursor: 0,
             group_search: String::new(),
@@ -315,6 +320,7 @@ impl App {
             }
             // Consumed by the event loop in `main`, which owns EPG loading.
             LoadEvent::EpgUrl(_) => {}
+            LoadEvent::Warning(message) => self.warning = Some(message),
             LoadEvent::Finished => {
                 self.loading = false;
                 self.percent = Some(100);
@@ -1369,6 +1375,16 @@ mod tests {
         app.on_load_event(LoadEvent::Failed("boom".into()));
         assert!(!app.loading);
         assert_eq!(app.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn load_warning_is_kept_without_becoming_an_error() {
+        let mut app = loaded_app_with(None);
+        app.on_load_event(LoadEvent::Warning("refresh failed".into()));
+        app.on_load_event(LoadEvent::Finished);
+        assert!(app.error.is_none(), "a warning must not hide the list");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.warning.as_deref(), Some("refresh failed"));
     }
 
     #[test]
