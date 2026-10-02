@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{NaiveDate, Utc};
 use m3u_viewer::app::App;
-use m3u_viewer::config::{Config, XtreamConfig};
+use m3u_viewer::config::{Config, ConfigError, XtreamConfig};
 use m3u_viewer::epg::{self, EpgEvent, EpgSource};
 use m3u_viewer::loader::{self, LoadEvent, Source};
 use m3u_viewer::player::{Player, PlayerError};
@@ -304,6 +304,103 @@ fn load_store() -> Option<Store> {
     }
 }
 
+/// The config read at startup, plus why the file on disk could not be
+/// used, if it could not.
+struct StartupConfig {
+    config: Config,
+    /// Set when the config file exists but could not be read or parsed.
+    /// Startup then runs on defaults, and the file must never be
+    /// overwritten: it may hold the only copy of saved credentials.
+    unreadable: Option<UnreadableConfig>,
+}
+
+/// A config file that exists but failed to load.
+struct UnreadableConfig {
+    path: PathBuf,
+    error: ConfigError,
+}
+
+impl UnreadableConfig {
+    /// One-line status-bar notice; the full (often multi-line) parse error
+    /// goes to stderr and the log instead.
+    fn notice(&self) -> String {
+        format!(
+            "⚠ could not load {} — using defaults (see log)",
+            self.path.display()
+        )
+    }
+}
+
+/// Loads the config from `path`, falling back to defaults — but
+/// remembering the failure — when the file exists and is unreadable.
+fn load_config(path: Option<&Path>) -> StartupConfig {
+    let Some(path) = path else {
+        return StartupConfig {
+            config: Config::default(),
+            unreadable: None,
+        };
+    };
+    match Config::load(path) {
+        Ok(config) => {
+            // load() returns the default when the file is absent; don't
+            // log that as if credentials had been read.
+            if path.exists() {
+                log::info!("config loaded from: {}", path.display());
+            } else {
+                log::info!("no config file at: {}", path.display());
+            }
+            StartupConfig {
+                config,
+                unreadable: None,
+            }
+        }
+        Err(error) => {
+            log::warn!(
+                "config load error, using defaults ({}): {error}",
+                path.display()
+            );
+            StartupConfig {
+                config: Config::default(),
+                unreadable: Some(UnreadableConfig {
+                    path: path.to_path_buf(),
+                    error,
+                }),
+            }
+        }
+    }
+}
+
+/// Handles `--save-config`: writes the resolved settings to `path`.
+///
+/// # Errors
+///
+/// Refuses — before the TUI starts, so the message stays readable — when
+/// the existing config file failed to load. Startup is then running on
+/// defaults, so saving would silently replace the stored Xtream account
+/// and every hand-edited setting with nothing.
+fn save_config(args: &Args, startup: &StartupConfig, path: Option<&Path>) -> Result<()> {
+    if let Some(unreadable) = &startup.unreadable {
+        bail!(
+            "--save-config: refusing to overwrite {}, which could not be loaded:\n{}\n\
+             Fix the file or delete it, then run again.",
+            unreadable.path.display(),
+            unreadable.error
+        );
+    }
+    let Some(path) = path else {
+        eprintln!("warning: --save-config: no config directory on this platform");
+        return Ok(());
+    };
+    match config_to_save(args, &startup.config).save(path) {
+        Ok(()) => log::info!("config saved to: {}", path.display()),
+        Err(e) => {
+            log::warn!("config save error: {e}");
+            eprintln!("warning: {e}");
+        }
+    }
+    Ok(())
+}
+
 fn config_to_save(args: &Args, current: &Config) -> Config {
     let xtream = match &args.source {
         Source::Xtream(account) => {
@@ -342,29 +439,20 @@ fn main() -> Result<()> {
     init_logger(log_path.as_deref())?;
     log::info!("m3u-viewer {} starting", env!("CARGO_PKG_VERSION"));
 
-    let config = if let Some(ref path) = config_path {
-        match Config::load(path) {
-            Ok(cfg) => {
-                // load() returns the default when the file is absent; don't
-                // log that as if credentials had been read.
-                if path.exists() {
-                    log::info!("config loaded from: {}", path.display());
-                } else {
-                    log::info!("no config file at: {}", path.display());
-                }
-                cfg
-            }
-            Err(e) => {
-                log::warn!("config load error: {e}");
-                eprintln!("warning: could not load config: {e}");
-                Config::default()
-            }
-        }
-    } else {
-        Config::default()
-    };
+    // Startup warnings that would otherwise only reach stderr, which the
+    // alternate screen hides until the user quits; shown in the status bar.
+    let mut notices = Vec::new();
+    let startup = load_config(config_path.as_deref());
+    if let Some(unreadable) = &startup.unreadable {
+        eprintln!(
+            "warning: could not load config {}: {}",
+            unreadable.path.display(),
+            unreadable.error
+        );
+        notices.push(unreadable.notice());
+    }
 
-    let args = parse_args(raw_args.into_iter(), &config)?;
+    let args = parse_args(raw_args.into_iter(), &startup.config)?;
 
     if let Source::File(path) = &args.source
         && !path.is_file()
@@ -373,19 +461,9 @@ fn main() -> Result<()> {
     }
 
     if args.save_config {
-        let new_config = config_to_save(&args, &config);
-        match config_path {
-            Some(ref path) => {
-                if let Err(e) = new_config.save(path) {
-                    log::warn!("config save error: {e}");
-                    eprintln!("warning: {e}");
-                } else {
-                    log::info!("config saved to: {}", path.display());
-                }
-            }
-            None => eprintln!("warning: --save-config: no config directory on this platform"),
-        }
+        save_config(&args, &startup, config_path.as_deref())?;
     }
+    let config = startup.config;
 
     // Discovery failure is not fatal: browsing works without VLC, and the
     // error surfaces in the status bar on the first play attempt.
@@ -413,16 +491,14 @@ fn main() -> Result<()> {
     let epg_runtime = EpgRuntime::new(epg_source, args.user_agent);
     let events = loader::spawn(args.source, Store::default_dir());
 
+    let mut app = App::new(args.display_name, store);
+    app.set_regex_filter(config.regex_filter());
+    if !notices.is_empty() {
+        app.set_message(notices.join(" · "));
+    }
+
     let mut terminal = ratatui::init();
-    let result = run(
-        &mut terminal,
-        &events,
-        &player,
-        args.display_name,
-        store,
-        config.regex_filter(),
-        epg_runtime,
-    );
+    let result = run(&mut terminal, app, &events, &player, epg_runtime);
     ratatui::restore();
     result
 }
@@ -527,15 +603,11 @@ fn needs_redraw(dirty: bool, since_last_draw: Duration) -> bool {
 /// hand play requests to VLC until the user quits.
 fn run(
     terminal: &mut DefaultTerminal,
+    mut app: App,
     events: &Receiver<LoadEvent>,
     player: &Result<Player, PlayerError>,
-    display_name: String,
-    store: Option<Store>,
-    regex_filter: bool,
     mut epg_runtime: EpgRuntime,
 ) -> Result<()> {
-    let mut app = App::new(display_name, store);
-    app.set_regex_filter(regex_filter);
     if epg_runtime.rx.is_some() {
         app.set_epg_loading();
     }
@@ -908,6 +980,87 @@ mod tests {
         .unwrap();
 
         assert!(!config_to_save(&args, &current).vlc_prewarm());
+    }
+
+    /// Unique temp dir holding a `config.toml` with `contents`.
+    fn config_with(tag: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "m3u-viewer-main-config-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    const SAVED_ACCOUNT: &str = "[xtream]\nserver = \"http://example.com\"\n\
+        username = \"stored-user\"\npassword = \"stored-password\"\n";
+
+    #[test]
+    fn save_config_refuses_to_overwrite_an_unreadable_config() {
+        // Regression: a config that failed to parse fell back to defaults,
+        // and --save-config then wrote those defaults over it — deleting
+        // the stored Xtream credentials along with the typo.
+        let corrupt = format!("{SAVED_ACCOUNT}regex_filter = maybe\n");
+        let path = config_with("corrupt", &corrupt);
+        let startup = load_config(Some(&path));
+        assert!(startup.unreadable.is_some());
+        assert!(startup.config.xtream().is_none(), "falls back to defaults");
+
+        let args = parse_args(
+            ["list.m3u", "--save-config"].iter().map(OsString::from),
+            &startup.config,
+        )
+        .unwrap();
+        let error = save_config(&args, &startup, Some(&path)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("delete"), "{message}");
+        assert!(message.contains("regex_filter"), "names the parse error");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn save_config_keeps_the_account_of_a_readable_config() {
+        let path = config_with("readable", SAVED_ACCOUNT);
+        let startup = load_config(Some(&path));
+        assert!(startup.unreadable.is_none());
+        let args = parse_args(
+            ["list.m3u", "--save-config", "--vlc", "/opt/vlc"]
+                .iter()
+                .map(OsString::from),
+            &startup.config,
+        )
+        .unwrap();
+        save_config(&args, &startup, Some(&path)).unwrap();
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.xtream().unwrap().username(), "stored-user");
+        assert_eq!(saved.vlc_path(), Some(Path::new("/opt/vlc")));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unreadable_config_yields_a_one_line_status_notice() {
+        // The stderr warning is hidden behind the alternate screen, so the
+        // status bar must say that defaults are in use.
+        let path = config_with("notice", "not valid toml [[[");
+        let startup = load_config(Some(&path));
+        let notice = startup.unreadable.unwrap().notice();
+        assert!(notice.contains(&path.display().to_string()));
+        assert!(notice.contains("using defaults"));
+        assert!(!notice.contains('\n'));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn missing_config_is_not_reported_as_unreadable() {
+        let path = std::env::temp_dir().join("m3u-viewer-main-config-absent-4242.toml");
+        let startup = load_config(Some(&path));
+        assert!(startup.unreadable.is_none());
+        assert!(load_config(None).unreadable.is_none());
     }
 
     #[test]

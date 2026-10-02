@@ -75,7 +75,10 @@ m3u-viewer --version
   config directory so you can omit them on future invocations. Run
   once; then `m3u-viewer` with no arguments picks up the saved
   credentials automatically. The file is created if it does not exist
-  yet.
+  yet. An existing `config.toml` that cannot be read or parsed is never
+  overwritten: `--save-config` then stops with the parse error so you
+  can fix or delete the file (without the flag, the viewer starts on
+  defaults and says so in the status bar).
 - `--vlc <path>` — use this VLC executable instead of auto-detection.
   Without it, `vlc` is looked up on `PATH`, then in the standard install
   locations (e.g. `C:\Program Files\VideoLAN\VLC` on Windows,
