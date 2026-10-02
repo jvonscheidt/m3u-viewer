@@ -523,7 +523,7 @@ fn log_redirect(response: &ureq::http::Response<ureq::Body>) {
 /// Scripted local HTTP server for the timeout tests here and in
 /// [`crate::epg`].
 #[cfg(test)]
-// unwrap is fine in tests (see CLAUDE.md).
+// unwrap is fine in tests (see AGENTS.md).
 #[allow(clippy::unwrap_used)]
 pub(crate) mod test_server {
     use std::io::{Read as _, Write as _};
