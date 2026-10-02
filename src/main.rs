@@ -497,10 +497,43 @@ fn main() -> Result<()> {
         app.set_message(notices.join(" · "));
     }
 
-    let mut terminal = ratatui::init();
-    let result = run(&mut terminal, app, &events, &player, epg_runtime);
-    ratatui::restore();
-    result
+    let mut terminal = start_terminal(ratatui::try_init, || {
+        // Undo whatever part of the setup succeeded (raw mode may be on
+        // even though the alternate screen failed); with no console at
+        // all this fails too, and there is nothing left to restore.
+        let _ = ratatui::try_restore();
+    })?;
+    let _restore_on_exit = TerminalGuard;
+    run(&mut terminal, app, &events, &player, epg_runtime)
+}
+
+/// Restores the terminal when dropped, so every way out of the TUI — a
+/// normal return, an error propagated with `?`, or an unwinding panic —
+/// leaves the console usable.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
+/// Puts the terminal into TUI mode via `init`, turning a failure — no
+/// usable console, e.g. redirected stdin or some IDE/mintty hosts — into
+/// an error after running `restore`, instead of the panic
+/// `ratatui::init` raises.
+fn start_terminal<T>(
+    init: impl FnOnce() -> std::io::Result<T>,
+    restore: impl FnOnce(),
+) -> Result<T> {
+    init().map_err(|error| {
+        restore();
+        anyhow!(error).context(
+            "could not set up the terminal; m3u-viewer needs an interactive \
+             console (run it directly in a terminal, without redirecting \
+             stdin or stdout)",
+        )
+    })
 }
 
 /// EPG wiring owned by the event loop: the in-flight guide load, if one
@@ -718,6 +751,29 @@ mod tests {
         // keep repainting slowly rather than freezing.
         assert!(needs_redraw(false, REFRESH_INTERVAL));
         assert!(needs_redraw(false, REFRESH_INTERVAL * 3));
+    }
+
+    #[test]
+    fn terminal_setup_failure_is_an_error_not_a_panic() {
+        // Regression: ratatui::init() panicked when there was no usable
+        // console (redirected stdin, some IDE hosts).
+        let restored = std::cell::Cell::new(false);
+        let result = start_terminal(
+            || Err::<(), _>(std::io::Error::other("no console")),
+            || restored.set(true),
+        );
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("interactive console"), "{message}");
+        assert!(message.contains("no console"), "keeps the cause: {message}");
+        assert!(restored.get(), "partial setup must be undone");
+    }
+
+    #[test]
+    fn successful_terminal_setup_is_not_restored() {
+        let restored = std::cell::Cell::new(false);
+        let value = start_terminal(|| Ok(7), || restored.set(true)).unwrap();
+        assert_eq!(value, 7);
+        assert!(!restored.get());
     }
 
     fn date(text: &str) -> NaiveDate {
