@@ -1068,7 +1068,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('x')));
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Groups);
-        assert!(app.group_search.is_empty());
+        assert_eq!(app.group_search, "");
         assert_eq!(app.visible_groups, app.sorted_groups);
     }
 
@@ -1131,7 +1131,7 @@ mod tests {
         app.handle_key(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
         app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::ALT));
         app.handle_key(key(KeyCode::Char('\u{7f}')));
-        assert!(app.filter.is_empty());
+        assert_eq!(app.filter, "");
         app.handle_key(modified_key(
             KeyCode::Char('@'),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
@@ -1144,7 +1144,7 @@ mod tests {
         app.handle_key(modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL));
         app.handle_key(modified_key(KeyCode::Char('x'), KeyModifiers::ALT));
         app.handle_key(key(KeyCode::Char('\u{7f}')));
-        assert!(app.group_search.is_empty());
+        assert_eq!(app.group_search, "");
     }
 
     #[test]
@@ -1305,9 +1305,9 @@ mod tests {
 
         app.on_load_event(LoadEvent::Reset);
 
-        assert!(app.channels.is_empty());
-        assert!(app.groups.is_empty());
-        assert!(app.filtered.is_empty());
+        assert_eq!(app.channels, []);
+        assert_eq!(app.groups, Vec::<String>::new());
+        assert_eq!(app.filtered, Vec::<usize>::new());
         assert_eq!(app.filter, "bbc");
         assert_eq!(app.group_filter, None);
     }
@@ -1324,7 +1324,7 @@ mod tests {
         assert_eq!(filtered_names(&app), ["Cached"]);
 
         app.on_load_event(LoadEvent::Reset);
-        assert!(app.channels.is_empty());
+        assert_eq!(app.channels, []);
 
         app.on_load_event(LoadEvent::Batch {
             channels: vec![channel("Fresh", None)],
@@ -1383,7 +1383,7 @@ mod tests {
         assert_eq!(app.filtered, vec![0]);
         // Unfavoriting inside the view empties it immediately.
         app.handle_key(key(KeyCode::Char('f')));
-        assert!(app.filtered.is_empty());
+        assert_eq!(app.filtered, Vec::<usize>::new());
         // Pressing F again returns to the full list.
         app.handle_key(key(KeyCode::Char('F')));
         assert_eq!(app.view, View::All);
@@ -1411,7 +1411,7 @@ mod tests {
         // (empty) subset carried over from the All view.
         app.handle_key(key(KeyCode::Char('F')));
         assert_eq!(app.view, View::Favorites);
-        assert!(app.filter.is_empty());
+        assert_eq!(app.filter, "");
         assert_eq!(filtered_names(&app), ["BBC News", "CNN"]);
         let _ = std::fs::remove_dir_all(dir);
     }
