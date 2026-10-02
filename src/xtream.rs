@@ -21,22 +21,79 @@ use serde::Deserialize;
 use thiserror::Error;
 use ureq::ResponseExt as _;
 
-#[cfg(not(test))]
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(not(test))]
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
-#[cfg(test)]
-const RESPONSE_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(not(test))]
-const PLAYLIST_TIMEOUT: Duration = Duration::from_mins(1);
-#[cfg(test)]
-const PLAYLIST_TIMEOUT: Duration = Duration::from_millis(500);
-#[cfg(not(test))]
-const API_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const API_TIMEOUT: Duration = Duration::from_millis(500);
+/// Timeouts for every HTTP download (Xtream playlist and player API, and
+/// XMLTV guides), shared through [`http_agent`].
+///
+/// The aim is to fail fast on a dead or hung server while never cutting
+/// off a large download that is still making progress on a slow link.
+/// How the fields map onto ureq 3.3, whose timeout semantics are subtle:
+/// while waiting on the socket, ureq measures the timeout of the *current*
+/// phase from "now" (so it restarts on every read or write), and the
+/// timeout of each *preceding* phase from the moment that phase finished.
+/// Once such a deadline has passed, ureq does not abort outright: each
+/// further socket wait gets a 1 s timeout, so the first gap longer than
+/// that fails the request.
+///
+/// - [`connect`](Self::connect) → `timeout_resolve` + `timeout_connect`
+///   (DNS, TCP, and TLS handshake).
+/// - [`headers`](Self::headers) → `timeout_send_request`. As the phase
+///   before "receive response", it doubles as a deadline for the response
+///   headers, counted from when the request was sent.
+/// - [`idle`](Self::idle) → `timeout_recv_body`. As the current phase
+///   during the body, it restarts on every socket read: a true inactivity
+///   timeout that never fires while bytes keep arriving.
+/// - `timeout_recv_response` is deliberately left unset: as the phase
+///   before the body, its deadline (counted from when the headers
+///   arrived) also applies to every body read, so any value would cut off
+///   a long download at its first pause of more than a second.
+/// - [`total`](Self::total) → `timeout_global`, the only end-to-end cap.
+///   Softened the same way: past it, a download survives only as long as
+///   no gap exceeds 1 s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HttpTimeouts {
+    /// Name resolution and connection setup (including TLS), each.
+    pub(crate) connect: Duration,
+    /// From sending the request until the response headers are complete.
+    /// Generous because panels build big `get.php` / `xmltv.php` replies
+    /// before sending the first byte.
+    pub(crate) headers: Duration,
+    /// Longest silence tolerated while reading the response body.
+    pub(crate) idle: Duration,
+    /// Backstop for the whole request, body included; `None` for no cap.
+    pub(crate) total: Option<Duration>,
+}
+
+impl HttpTimeouts {
+    /// Production values. `total` is a safety net against a server that
+    /// drip-feeds just often enough to dodge `idle` and would otherwise
+    /// pin a loader thread forever. One hour at a mere 50 kB/s is still
+    /// ~180 MB — several times the largest real playlists, stream lists,
+    /// or guides — so it never truncates a download that is progressing.
+    pub(crate) const STANDARD: Self = Self {
+        connect: Duration::from_secs(10),
+        headers: Duration::from_mins(1),
+        idle: Duration::from_secs(30),
+        total: Some(Duration::from_hours(1)),
+    };
+}
+
+/// Builds the HTTP agent used for all downloads, configured with
+/// `timeouts` (see [`HttpTimeouts`] for how they map onto ureq). Up to 3
+/// redirects are followed and recorded so they can be logged.
+pub(crate) fn http_agent(timeouts: HttpTimeouts) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_resolve(Some(timeouts.connect))
+        .timeout_connect(Some(timeouts.connect))
+        .timeout_send_request(Some(timeouts.headers))
+        .timeout_recv_response(None)
+        .timeout_recv_body(Some(timeouts.idle))
+        .timeout_global(timeouts.total)
+        .max_redirects(3)
+        .max_redirects_will_error(true)
+        .save_redirect_history(true)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
 
 /// Why the playlist could not be fetched from the server.
 #[derive(Debug, Error)]
@@ -191,18 +248,6 @@ fn cache_identity_hash(host: &str, username: &str, password: &str) -> u64 {
         })
 }
 
-fn http_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_connect(Some(CONNECT_TIMEOUT))
-        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
-        .timeout_recv_body(Some(RESPONSE_TIMEOUT))
-        .max_redirects(3)
-        .max_redirects_will_error(true)
-        .save_redirect_history(true)
-        .build();
-    ureq::Agent::new_with_config(config)
-}
-
 /// Credentials for one Xtream Codes account.
 pub struct Account {
     server: String,
@@ -242,8 +287,16 @@ impl Account {
             username,
             password,
             user_agent: None,
-            agent: http_agent(),
+            agent: http_agent(HttpTimeouts::STANDARD),
         }
+    }
+
+    /// Replaces the HTTP timeouts, so tests can exercise them in
+    /// milliseconds instead of minutes.
+    #[cfg(test)]
+    fn with_timeouts(mut self, timeouts: HttpTimeouts) -> Self {
+        self.agent = http_agent(timeouts);
+        self
     }
 
     /// Sends `user_agent` as the `User-Agent` header on playlist requests;
@@ -305,22 +358,15 @@ impl Account {
     }
 
     /// Issues a GET for `url` (custom user agent applied) and returns the
-    /// response only when it is a 2xx.
-    fn request(
-        &self,
-        url: String,
-        timeout: Duration,
-    ) -> Result<ureq::http::Response<ureq::Body>, XtreamError> {
+    /// response only when it is a 2xx. Timeouts come from the agent (see
+    /// [`HttpTimeouts`]): no per-request cap, since a fixed one would cut
+    /// off big playlists and stream lists on slow links.
+    fn request(&self, url: String) -> Result<ureq::http::Response<ureq::Body>, XtreamError> {
         let mut request = self.agent.get(url);
         if let Some(ref user_agent) = self.user_agent {
             request = request.header("User-Agent", user_agent);
         }
-        let response = match request
-            .config()
-            .timeout_global(Some(timeout))
-            .build()
-            .call()
-        {
+        let response = match request.call() {
             Ok(response) => response,
             Err(ureq::Error::StatusCode(code)) => return Err(XtreamError::Status(code)),
             Err(other) => return Err(XtreamError::Http(Box::new(other))),
@@ -343,7 +389,7 @@ impl Account {
     /// [`XtreamError::Status`] for a non-success HTTP response,
     /// [`XtreamError::Http`] when the request cannot be made at all.
     pub fn fetch(&self) -> Result<(impl Read + use<>, Option<u64>), XtreamError> {
-        let response = self.request(self.playlist_url(), PLAYLIST_TIMEOUT)?;
+        let response = self.request(self.playlist_url())?;
         let total = response
             .headers()
             .get("content-length")
@@ -392,7 +438,7 @@ impl Account {
         &self,
         action: &str,
     ) -> Result<Vec<T>, XtreamError> {
-        let response = self.request(self.api_url(action), API_TIMEOUT)?;
+        let response = self.request(self.api_url(action))?;
         // Unlimited body: full stream lists routinely exceed ureq's
         // 10 MB default (55k streams ≈ 20 MB of JSON).
         let reader = response
@@ -481,11 +527,90 @@ fn log_redirect(response: &ureq::http::Response<ureq::Body>) {
     );
 }
 
+/// Scripted local HTTP server for the timeout tests here and in
+/// [`crate::epg`].
+#[cfg(test)]
+// unwrap is fine in tests (see AGENTS.md).
+#[allow(clippy::unwrap_used)]
+pub(crate) mod test_server {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    use super::HttpTimeouts;
+
+    /// Millisecond-scale timeouts, so stall tests fail within a second.
+    /// `total` is only a backstop against a hanging test.
+    pub(crate) const FAST: HttpTimeouts = HttpTimeouts {
+        connect: Duration::from_millis(500),
+        headers: Duration::from_millis(300),
+        idle: Duration::from_millis(300),
+        total: Some(Duration::from_secs(20)),
+    };
+
+    /// Gap between body chunks in the slow-but-steady tests. It must
+    /// exceed one second: once a ureq deadline has passed, ureq keeps
+    /// reading with a 1 s socket timeout instead of failing at once, so
+    /// only gaps longer than that expose a body that is wrongly capped.
+    pub(crate) const TRICKLE_GAP: Duration = Duration::from_millis(1200);
+
+    /// [`FAST`], but with an idle timeout that tolerates [`TRICKLE_GAP`].
+    pub(crate) const PATIENT: HttpTimeouts = HttpTimeouts {
+        idle: Duration::from_millis(1500),
+        ..FAST
+    };
+
+    /// Accepts one connection, reads the request, writes `head` (status
+    /// line and headers, may be empty), then each of `chunks` after
+    /// sleeping `gap`, and finally holds the connection open until the
+    /// client hangs up — so "stalled" servers never send anything more.
+    /// Bodies must therefore be length-delimited to complete.
+    pub(crate) fn serve(
+        head: String,
+        chunks: Vec<Vec<u8>>,
+        gap: Duration,
+    ) -> (u16, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            for chunk in chunks {
+                thread::sleep(gap);
+                if stream.write_all(&chunk).is_err() {
+                    return;
+                }
+            }
+            // Returns once the client closes (0) or resets (error).
+            while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+        });
+        (port, handle)
+    }
+
+    /// `200 OK` response head announcing a `length`-byte body.
+    pub(crate) fn ok_head(length: usize) -> String {
+        format!("HTTP/1.1 200 OK\r\ncontent-length: {length}\r\n\r\n")
+    }
+}
+
 #[cfg(test)]
 // unwrap is fine in tests (see AGENTS.md).
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::test_server::{FAST, PATIENT, TRICKLE_GAP, ok_head, serve};
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn scheme_is_added_and_slash_trimmed() {
@@ -751,17 +876,68 @@ mod tests {
         let _ = server.join();
     }
 
+    fn account_with(port: u16, timeouts: HttpTimeouts) -> Account {
+        Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into()).with_timeouts(timeouts)
+    }
+
+    fn fast_account(port: u16) -> Account {
+        account_with(port, FAST)
+    }
+
     #[test]
-    fn stalled_server_times_out() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
-            std::thread::sleep(PLAYLIST_TIMEOUT + Duration::from_millis(250));
-        });
-        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
-        let error = account.fetch().err().unwrap();
-        assert!(matches!(error, XtreamError::Http(_)));
-        let _ = server.join();
+    fn slow_but_steady_body_is_not_cut_off() {
+        // Regression: a fixed deadline (`recv_response`, which ureq
+        // anchors at the headers and enforces on body reads, plus a
+        // per-request global cap) truncated big playlists on slow links.
+        // Here the body takes ~2.4 s, longer than every timeout except
+        // the `total` backstop, and must still arrive complete.
+        let chunks = vec![
+            b"#EXTM3U\n#EXTINF:-1,One\nhttp://u/1\n".to_vec(),
+            b"#EXTINF:-1,Two\nhttp://u/2\n".to_vec(),
+        ];
+        let expected = String::from_utf8(chunks.concat()).unwrap();
+        let (port, server) = serve(ok_head(expected.len()), chunks, TRICKLE_GAP);
+        let (mut reader, _) = account_with(port, PATIENT).fetch().unwrap();
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        assert_eq!(text, expected);
+        drop(reader);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn server_silent_after_accept_times_out() {
+        let (port, server) = serve(String::new(), Vec::new(), Duration::ZERO);
+        let started = Instant::now();
+        let error = fast_account(port).fetch().err().unwrap();
+        assert!(matches!(error, XtreamError::Http(_)), "got: {error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn body_stalling_mid_download_times_out() {
+        let chunks = vec![b"#EXTM3U\n".to_vec()];
+        let (port, server) = serve(ok_head(1000), chunks, Duration::ZERO);
+        let started = Instant::now();
+        let (mut reader, _) = fast_account(port).fetch().unwrap();
+        let mut text = String::new();
+        let error = reader.read_to_string(&mut text).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "error: {error}");
+        drop(reader);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn slow_but_steady_player_api_reply_is_not_cut_off() {
+        let chunks = vec![
+            br#"[{"category_id":1,"category_name":"News"},"#.to_vec(),
+            br#"{"category_id":2,"category_name":"Sports"}]"#.to_vec(),
+        ];
+        let length = chunks.iter().map(Vec::len).sum();
+        let (port, server) = serve(ok_head(length), chunks, TRICKLE_GAP);
+        let categories = account_with(port, PATIENT).fetch_live_categories().unwrap();
+        assert_eq!(categories.len(), 2);
+        server.join().unwrap();
     }
 }

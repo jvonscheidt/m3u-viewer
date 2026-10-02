@@ -21,8 +21,11 @@ use std::thread;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use flate2::bufread::GzDecoder;
 use quick_xml::Reader as XmlReader;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
 use thiserror::Error;
+
+use crate::xtream::{HttpTimeouts, http_agent};
 
 /// Programmes ending before "now" are dropped at parse time; so are ones
 /// starting further ahead than this. Twelve hours keeps now/next working
@@ -139,6 +142,80 @@ pub fn format_time(epoch: i64) -> String {
     )
 }
 
+/// How the document's bytes map to characters, taken from its XML
+/// declaration. quick-xml is built without its `encoding` feature, so it
+/// hands over raw bytes and decoding happens here — leniently, so one bad
+/// byte costs one character (U+FFFD), not the whole guide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextEncoding {
+    /// UTF-8, the XML default.
+    Utf8,
+    /// ISO-8859-1 and its aliases, decoded as Windows-1252 (as browsers
+    /// do): the same characters byte for byte, except that 0x80–0x9F hold
+    /// `€`, curly quotes, and dashes instead of unused control codes.
+    Windows1252,
+}
+
+impl TextEncoding {
+    /// Maps an XML declaration's `encoding` label; labels other than the
+    /// Latin-1 / Windows-1252 family fall back to UTF-8.
+    fn from_label(label: &[u8]) -> Self {
+        // The WHATWG Encoding Standard's labels for windows-1252, minus
+        // the ASCII ones: a feed declaring ASCII yet carrying non-ASCII
+        // bytes is far more likely UTF-8, the default anyway.
+        const WINDOWS_1252_LABELS: [&[u8]; 14] = [
+            b"cp1252",
+            b"cp819",
+            b"csisolatin1",
+            b"ibm819",
+            b"iso-8859-1",
+            b"iso-ir-100",
+            b"iso8859-1",
+            b"iso88591",
+            b"iso_8859-1",
+            b"iso_8859-1:1987",
+            b"l1",
+            b"latin1",
+            b"windows-1252",
+            b"x-cp1252",
+        ];
+        let label = label.trim_ascii();
+        if WINDOWS_1252_LABELS
+            .iter()
+            .any(|known| label.eq_ignore_ascii_case(known))
+        {
+            Self::Windows1252
+        } else {
+            Self::Utf8
+        }
+    }
+
+    /// Decodes raw document bytes; never fails.
+    fn decode(self, bytes: &[u8]) -> Cow<'_, str> {
+        match self {
+            Self::Windows1252 if !bytes.is_ascii() => {
+                Cow::Owned(bytes.iter().copied().map(windows_1252_char).collect())
+            }
+            // Pure ASCII is identical in both encodings; this borrows.
+            _ => String::from_utf8_lossy(bytes),
+        }
+    }
+}
+
+/// The character a Windows-1252 byte stands for. Bytes the code page
+/// leaves undefined map to the same-valued code point, as in WHATWG.
+fn windows_1252_char(byte: u8) -> char {
+    const C1: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
+        'ž', 'Ÿ',
+    ];
+    match byte {
+        0x80..=0x9f => C1[usize::from(byte - 0x80)],
+        _ => char::from(byte),
+    }
+}
+
 /// Which element's text is currently being collected.
 enum TextTarget {
     None,
@@ -148,7 +225,9 @@ enum TextTarget {
 
 /// Parses an XMLTV document, keeping only programmes that overlap the
 /// window from `now` through the configured 12-hour lookahead. Programmes with
-/// missing or malformed attributes are skipped, not errors.
+/// missing or malformed attributes are skipped, not errors. Text is read
+/// as UTF-8, or as Windows-1252 when the XML declaration names Latin-1;
+/// invalid UTF-8 becomes U+FFFD instead of failing the document.
 ///
 /// # Errors
 ///
@@ -168,16 +247,22 @@ pub fn parse_xmltv<R: BufRead>(input: R, now: i64) -> Result<Guide, EpgError> {
     let mut pending: Option<(String, Programme)> = None;
     let mut target = TextTarget::None;
     let mut text = String::new();
+    let mut encoding = TextEncoding::Utf8;
 
     loop {
         match reader.read_event_into(&mut buf)? {
+            XmlEvent::Decl(declaration) => {
+                if let Some(Ok(label)) = declaration.encoding() {
+                    encoding = TextEncoding::from_label(&label);
+                }
+            }
             XmlEvent::Start(element) => match element.local_name().as_ref() {
-                b"channel" => channel_id = attr_value(&element, b"id"),
+                b"channel" => channel_id = attr_value(&element, b"id", encoding),
                 b"display-name" if channel_id.is_some() => {
                     target = TextTarget::DisplayName;
                     text.clear();
                 }
-                b"programme" => pending = programme_from_attrs(&element, now),
+                b"programme" => pending = programme_from_attrs(&element, now, encoding),
                 // Only the first <title> counts; feeds often repeat it
                 // once per language.
                 b"title" if pending.as_ref().is_some_and(|(_, p)| p.title.is_empty()) => {
@@ -186,14 +271,16 @@ pub fn parse_xmltv<R: BufRead>(input: R, now: i64) -> Result<Guide, EpgError> {
                 }
                 _ => {}
             },
+            // Entity references arrive as separate GeneralRef events, so
+            // text and CDATA only need decoding, not unescaping.
             XmlEvent::Text(t) => {
                 if !matches!(target, TextTarget::None) {
-                    text.push_str(&t.decode().map_err(quick_xml::Error::from)?);
+                    text.push_str(&encoding.decode(&t));
                 }
             }
             XmlEvent::CData(t) => {
                 if !matches!(target, TextTarget::None) {
-                    text.push_str(&String::from_utf8_lossy(&t));
+                    text.push_str(&encoding.decode(&t));
                 }
             }
             // Handle references when quick-xml reports them separately;
@@ -265,27 +352,37 @@ fn resolve_reference(reference: &quick_xml::events::BytesRef) -> Option<char> {
     }
 }
 
-/// Reads one attribute of `element` (unescaped); `None` when absent or
-/// undecodable.
-fn attr_value(element: &BytesStart, name: &[u8]) -> Option<String> {
-    element
+/// Reads one attribute of `element`, decoded like text (see
+/// [`TextEncoding`]) and then unescaped and normalized; `None` when absent
+/// or when it references an unknown entity.
+fn attr_value(element: &BytesStart, name: &[u8], encoding: TextEncoding) -> Option<String> {
+    let attr = element
         .attributes()
         .flatten()
-        .find(|attr| attr.key.as_ref() == name)
-        .and_then(|attr| {
-            attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .ok()
-        })
+        .find(|attr| attr.key.as_ref() == name)?;
+    // quick-xml's unescaping/normalization insists on UTF-8, so hand it
+    // the already decoded value rather than the raw bytes.
+    let decoded = Attribute {
+        key: attr.key,
+        value: Cow::Owned(encoding.decode(&attr.value).into_owned().into_bytes()),
+    };
+    decoded
+        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+        .ok()
         .map(Cow::into_owned)
 }
 
 /// Builds the programme skeleton from a `<programme>` start tag; `None`
 /// when attributes are missing/malformed or the programme lies outside
 /// the kept window.
-fn programme_from_attrs(element: &BytesStart, now: i64) -> Option<(String, Programme)> {
-    let channel = attr_value(element, b"channel")?;
-    let start = parse_xmltv_time(&attr_value(element, b"start")?)?;
-    let stop = parse_xmltv_time(&attr_value(element, b"stop")?)?;
+fn programme_from_attrs(
+    element: &BytesStart,
+    now: i64,
+    encoding: TextEncoding,
+) -> Option<(String, Programme)> {
+    let channel = attr_value(element, b"channel", encoding)?;
+    let start = parse_xmltv_time(&attr_value(element, b"start", encoding)?)?;
+    let stop = parse_xmltv_time(&attr_value(element, b"stop", encoding)?)?;
     (stop > now && start <= now + KEEP_AHEAD_SECS).then(|| {
         (
             channel,
@@ -385,7 +482,7 @@ pub fn spawn(source: EpgSource, user_agent: Option<String>) -> Receiver<EpgEvent
         let described = source.describe();
         log::info!("loading EPG from {described}");
         let now = Utc::now().timestamp();
-        let event = match load(&source, user_agent.as_deref(), now) {
+        let event = match load(&source, user_agent.as_deref(), now, HttpTimeouts::STANDARD) {
             Ok(guide) => {
                 log::info!(
                     "EPG loaded: {} channels with programmes",
@@ -404,11 +501,19 @@ pub fn spawn(source: EpgSource, user_agent: Option<String>) -> Receiver<EpgEvent
     rx
 }
 
-fn load(source: &EpgSource, user_agent: Option<&str>, now: i64) -> Result<Guide, EpgError> {
+/// Fetches and parses the guide. URLs go through the shared download
+/// agent configured with `timeouts`, so a server that accepts and then
+/// hangs fails the load instead of blocking this thread forever.
+fn load(
+    source: &EpgSource,
+    user_agent: Option<&str>,
+    now: i64,
+    timeouts: HttpTimeouts,
+) -> Result<Guide, EpgError> {
     let reader: Box<dyn BufRead> = match source {
         EpgSource::File(path) => Box::new(BufReader::new(File::open(path)?)),
         EpgSource::Url(url) => {
-            let mut request = ureq::get(url);
+            let mut request = http_agent(timeouts).get(url);
             if let Some(user_agent) = user_agent {
                 request = request.header("User-Agent", user_agent);
             }
@@ -698,6 +803,101 @@ mod tests {
             stamp(1),
         );
         assert_eq!(parse(&xml).channel_count(), 0);
+    }
+
+    /// Encodes `text` as ISO-8859-1; every char must be below U+0100.
+    fn latin1(text: &str) -> Vec<u8> {
+        text.chars()
+            .map(|c| u8::try_from(u32::from(c)).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn latin1_declared_feed_decodes_accented_text_and_attributes() {
+        // Regression: text was decoded as strict UTF-8 and one Latin-1
+        // byte failed the whole guide.
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="ISO-8859-1"?>
+<tv>
+  <channel id="café&amp;co.tv"><display-name>Télé Café</display-name></channel>
+  <programme start="{}" stop="{}" channel="café&amp;co.tv"><title>Café &amp; Crème</title></programme>
+  <programme start="{}" stop="{}" channel="café&amp;co.tv"><title><![CDATA[Où est Gérard?]]></title></programme>
+</tv>"#,
+            stamp(-1),
+            stamp(1),
+            stamp(1),
+            stamp(2),
+        );
+        let guide = parse_xmltv(latin1(&xml).as_slice(), NOW).unwrap();
+        let (current, next) = guide.now_next(Some("café&co.tv"), "x", NOW);
+        assert_eq!(current.unwrap().title, "Café & Crème");
+        assert_eq!(next.unwrap().title, "Où est Gérard?");
+        let (by_name, _) = guide.now_next(None, "TÉLÉ CAFÉ", NOW);
+        assert_eq!(by_name.unwrap().title, "Café & Crème");
+    }
+
+    #[test]
+    fn invalid_utf8_byte_costs_one_character_not_the_guide() {
+        // No declaration, so UTF-8 — but one Latin-1 byte slipped in.
+        let xml = format!(
+            r#"<tv>
+<programme start="{}" stop="{}" channel="one.tv"><title>Caf@ Bar</title></programme>
+<programme start="{}" stop="{}" channel="two.tv"><title>Fine</title></programme>
+</tv>"#,
+            stamp(-1),
+            stamp(1),
+            stamp(-1),
+            stamp(1),
+        );
+        // Latin-1 "é" (0xE9) in place of `@`: invalid UTF-8.
+        let (before, after) = xml.split_once('@').unwrap();
+        let bytes = [before.as_bytes(), b"\xe9", after.as_bytes()].concat();
+        assert!(std::str::from_utf8(&bytes).is_err());
+        let guide = parse_xmltv(bytes.as_slice(), NOW).unwrap();
+        let (one, _) = guide.now_next(Some("one.tv"), "x", NOW);
+        assert_eq!(one.unwrap().title, "Caf\u{fffd} Bar");
+        let (two, _) = guide.now_next(Some("two.tv"), "x", NOW);
+        assert_eq!(two.unwrap().title, "Fine");
+    }
+
+    #[test]
+    fn windows_1252_labels_and_c1_characters_decode() {
+        for label in ["ISO-8859-1", "latin1", " windows-1252 ", "CP1252"] {
+            assert_eq!(
+                TextEncoding::from_label(label.as_bytes()),
+                TextEncoding::Windows1252,
+                "{label}"
+            );
+        }
+        for label in ["UTF-8", "US-ASCII"] {
+            assert_eq!(
+                TextEncoding::from_label(label.as_bytes()),
+                TextEncoding::Utf8
+            );
+        }
+        assert_eq!(
+            TextEncoding::Windows1252.decode(b"\x80 \x92s \x96 \xe9\x81"),
+            "€ ’s – é\u{81}"
+        );
+    }
+
+    #[test]
+    fn stalled_epg_server_fails_instead_of_hanging() {
+        // Regression: EPG downloads used ureq's default agent without any
+        // timeouts, so a server that accepted and then went silent blocked
+        // the EPG thread forever — both before the headers and mid-body.
+        use crate::xtream::test_server::{FAST, ok_head, serve};
+        use std::time::{Duration, Instant};
+
+        let partial = vec![b"<tv><programme start=".to_vec()];
+        for (head, chunks) in [(String::new(), Vec::new()), (ok_head(10_000), partial)] {
+            let (port, server) = serve(head, chunks, Duration::ZERO);
+            let source = EpgSource::Url(format!("http://127.0.0.1:{port}/xmltv.php"));
+            let started = Instant::now();
+            assert!(load(&source, None, NOW, FAST).is_err());
+            assert!(started.elapsed() < Duration::from_secs(5));
+            server.join().unwrap();
+        }
     }
 
     #[test]
