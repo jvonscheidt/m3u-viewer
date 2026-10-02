@@ -23,6 +23,16 @@
 //! lock on its temp file for as long as it is open; the OS releases that
 //! lock when the process exits, however it exits. See
 //! [`sweep_stale_temps`] for the exact rule.
+//!
+//! # Location
+//!
+//! The cache lives in the platform's per-user *cache* directory (see
+//! [`CacheDirs::platform_default`]): it is big, re-downloadable data that
+//! must not be synced along with a roaming profile. Versions up to 0.9.1
+//! kept it in a `cache/` subdirectory of the config directory; the first
+//! load with this version deletes the playlists found there (see
+//! [`CacheDirs::tidy`]) instead of moving them, since they carry stream
+//! URLs with possibly outdated credentials and would be re-keyed anyway.
 
 use std::fs::{self, File, TryLockError};
 use std::io::Write;
@@ -30,6 +40,117 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::private_file;
+
+/// Directories used by the Xtream playlist cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheDirs {
+    /// Where cached playlists are stored.
+    dir: PathBuf,
+    /// Where older versions stored them; cleaned up by [`Self::tidy`].
+    legacy_dir: Option<PathBuf>,
+}
+
+impl CacheDirs {
+    /// Caches playlists in `dir`, with no older location to clean up.
+    #[must_use]
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            legacy_dir: None,
+        }
+    }
+
+    /// Caches playlists in `dir`, and deletes the playlists an older
+    /// version left in `legacy_dir` (see [`Self::tidy`]).
+    #[must_use]
+    pub fn with_legacy_dir(dir: PathBuf, legacy_dir: PathBuf) -> Self {
+        Self {
+            dir,
+            legacy_dir: Some(legacy_dir),
+        }
+    }
+
+    /// The per-user cache directory — `%LOCALAPPDATA%\m3u-viewer\cache` on
+    /// Windows (not the roaming profile), `~/.cache/m3u-viewer` on Linux,
+    /// `~/Library/Caches/m3u-viewer` on macOS — with the `cache/`
+    /// subdirectory of the config directory as the legacy location.
+    /// `None` on platforms without a home directory.
+    #[must_use]
+    pub fn platform_default() -> Option<Self> {
+        directories::ProjectDirs::from("", "", "m3u-viewer").map(|dirs| {
+            Self::with_legacy_dir(
+                dirs.cache_dir().to_path_buf(),
+                dirs.config_dir().join("cache"),
+            )
+        })
+    }
+
+    /// Where cached playlists are stored.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Housekeeping before a load: deletes the playlist caches an older
+    /// version left in the legacy directory, then sweeps abandoned temp
+    /// files from the cache directory ([`sweep_stale_temps`]).
+    ///
+    /// In the legacy directory only `xtream-*.m3u` playlists and their
+    /// temp files are deleted, and the directory itself only if that
+    /// leaves it empty; nothing else in the config directory is touched.
+    /// Older versions do not lock their temp files, so a legacy temp file
+    /// is deleted only once it is unmodified for [`STALE_AFTER`] — a
+    /// younger one may still be written by an older viewer running
+    /// alongside, and is left for a later launch.
+    pub fn tidy(&self) {
+        if let Some(legacy) = &self.legacy_dir
+            && *legacy != self.dir
+        {
+            remove_legacy_caches(legacy);
+        }
+        sweep_stale_temps(&self.dir);
+    }
+}
+
+/// See [`CacheDirs::tidy`].
+fn remove_legacy_caches(legacy: &Path) {
+    let Ok(entries) = fs::read_dir(legacy) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let path = entry.path();
+        let remove = if is_cache_file_name(name) {
+            true
+        } else if let Some((target, _)) = private_file::parse_tmp_name(name) {
+            is_cache_file_name(target) && unmodified_for(&path, STALE_AFTER)
+        } else {
+            false
+        };
+        if remove {
+            match fs::remove_file(&path) {
+                Ok(()) => log::info!("removed legacy playlist cache {}", path.display()),
+                Err(error) => log::debug!("could not remove {}: {error}", path.display()),
+            }
+        }
+    }
+    // Only succeeds once the directory is empty, i.e. holds nothing else.
+    if fs::remove_dir(legacy).is_ok() {
+        log::info!("removed legacy cache directory {}", legacy.display());
+    }
+}
+
+/// Whether the file at `path` was last modified more than `age` ago.
+fn unmodified_for(path: &Path, age: Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed > age)
+}
 
 /// File-name prefix of every cached playlist.
 const FILE_PREFIX: &str = "xtream-";
@@ -43,13 +164,11 @@ const FILE_SUFFIX: &str = ".m3u";
 /// can only be a leftover.
 const STALE_AFTER: Duration = Duration::from_hours(2);
 
-/// Where an account's cached playlist lives under the app's config
-/// directory, keyed by [`crate::xtream::Account::cache_key`].
+/// Where an account's cached playlist lives in the cache directory
+/// ([`CacheDirs::dir`]), keyed by [`crate::xtream::Account::cache_key`].
 #[must_use]
-pub fn path(config_dir: &Path, account_key: &str) -> PathBuf {
-    config_dir
-        .join("cache")
-        .join(format!("{FILE_PREFIX}{account_key}{FILE_SUFFIX}"))
+pub fn path(cache_dir: &Path, account_key: &str) -> PathBuf {
+    cache_dir.join(format!("{FILE_PREFIX}{account_key}{FILE_SUFFIX}"))
 }
 
 /// Whether `name` is the file name of a cached playlist (not a temp file).
@@ -110,11 +229,7 @@ fn is_abandoned(path: &Path) -> bool {
         Err(TryLockError::WouldBlock) => false,
         Err(TryLockError::Error(error)) => {
             log::debug!("cannot lock-check {}: {error}", path.display());
-            file.metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > STALE_AFTER)
+            unmodified_for(path, STALE_AFTER)
         }
     }
 }
@@ -245,12 +360,122 @@ mod tests {
     }
 
     #[test]
-    fn path_is_namespaced_under_a_cache_subdirectory() {
-        let dir = PathBuf::from("C:/config");
+    fn path_is_a_prefixed_file_in_the_cache_directory() {
+        let dir = PathBuf::from("C:/cache");
         assert_eq!(
             path(&dir, "example.com-user"),
-            PathBuf::from("C:/config/cache/xtream-example.com-user.m3u")
+            PathBuf::from("C:/cache/xtream-example.com-user.m3u")
         );
+    }
+
+    #[test]
+    fn platform_cache_is_outside_the_config_directory() {
+        // Regression: the cache lived under the config directory, which
+        // on Windows is the roaming profile, so tens of MB of playlist
+        // got synced to network profile storage. Paths only — nothing is
+        // created or deleted in the real user directories.
+        let Some(dirs) = CacheDirs::platform_default() else {
+            return;
+        };
+        let config_dir = directories::ProjectDirs::from("", "", "m3u-viewer")
+            .unwrap()
+            .config_dir()
+            .to_path_buf();
+        assert!(
+            !dirs.dir().starts_with(&config_dir),
+            "{} is inside {}",
+            dirs.dir().display(),
+            config_dir.display()
+        );
+        assert_eq!(dirs.legacy_dir, Some(config_dir.join("cache")));
+    }
+
+    /// Writes `contents` to `path`, backdating its modification time by
+    /// `age`.
+    fn write_aged(path: &Path, contents: &[u8], age: Duration) {
+        fs::write(path, contents).unwrap();
+        let modified = std::time::SystemTime::now() - age;
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    #[test]
+    fn tidy_deletes_legacy_playlists_but_nothing_else_in_the_config_dir() {
+        // Regression: after the move to the cache directory, the old
+        // config_dir/cache/ playlists — full of stream URLs with possibly
+        // outdated credentials — would have stayed on disk forever.
+        let root = temp_dir("legacy-mixed");
+        let config_dir = root.join("config");
+        let legacy = config_dir.join("cache");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(config_dir.join("config.toml"), "user = 1\n").unwrap();
+        fs::write(config_dir.join("favorites.json"), "[]").unwrap();
+        let old_caches = [
+            legacy.join("xtream-example_com-u-0123456789abcdef.m3u"),
+            legacy.join("xtream-example_com-u.m3u"),
+        ];
+        for cache in &old_caches {
+            fs::write(cache, "#EXTM3U\n").unwrap();
+        }
+        let stale_tmp = foreign_tmp(&old_caches[0], other_pid());
+        write_aged(&stale_tmp, b"#EXTM3U\n", STALE_AFTER * 2);
+        // An older viewer may still be writing this one.
+        let fresh_tmp = foreign_tmp(&old_caches[1], other_pid());
+        fs::write(&fresh_tmp, b"#EXTM3U\n").unwrap();
+        let unrelated = legacy.join("notes.txt");
+        fs::write(&unrelated, "mine").unwrap();
+
+        let dirs = CacheDirs::with_legacy_dir(root.join("new-cache"), legacy.clone());
+        dirs.tidy();
+
+        for gone in old_caches.iter().chain([&stale_tmp]) {
+            assert!(!gone.exists(), "{} left behind", gone.display());
+        }
+        for kept in [&fresh_tmp, &unrelated] {
+            assert!(kept.exists(), "{} was removed", kept.display());
+        }
+        assert_eq!(
+            fs::read_to_string(config_dir.join("config.toml")).unwrap(),
+            "user = 1\n"
+        );
+        assert!(config_dir.join("favorites.json").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tidy_removes_the_legacy_directory_once_it_is_empty() {
+        let root = temp_dir("legacy-empty");
+        let config_dir = root.join("config");
+        let legacy = config_dir.join("cache");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(config_dir.join("config.toml"), "").unwrap();
+        fs::write(legacy.join("xtream-a-b-0123456789abcdef.m3u"), "#EXTM3U\n").unwrap();
+
+        let dirs = CacheDirs::with_legacy_dir(root.join("new-cache"), legacy.clone());
+        dirs.tidy();
+        // Nothing left to do on later launches.
+        dirs.tidy();
+
+        assert!(!legacy.exists());
+        assert!(config_dir.join("config.toml").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tidy_never_treats_the_cache_directory_as_its_own_legacy() {
+        let dir = temp_dir("legacy-same");
+        fs::create_dir_all(&dir).unwrap();
+        let current = path(&dir, "acct");
+        fs::write(&current, "#EXTM3U\n").unwrap();
+
+        CacheDirs::with_legacy_dir(dir.clone(), dir.clone()).tidy();
+
+        assert!(current.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

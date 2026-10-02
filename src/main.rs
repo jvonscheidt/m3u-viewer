@@ -411,7 +411,7 @@ fn main() -> Result<()> {
         }
     });
     let epg_runtime = EpgRuntime::new(epg_source, args.user_agent);
-    let events = loader::spawn(args.source, Store::default_dir());
+    let events = loader::spawn(args.source, loader::CacheDirs::platform_default());
 
     let mut terminal = ratatui::init();
     let result = run(

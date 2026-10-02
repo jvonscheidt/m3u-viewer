@@ -6,11 +6,12 @@
 //! immediately and fill in while the data is still arriving.
 //!
 //! For Xtream sources, `load_xtream` additionally shows a cached copy of
-//! the last successful load first (if one exists in `cache_dir`), so the
-//! list is populated instantly instead of waiting on the network; the
-//! live fetch then runs as usual and, on arriving at its first real
-//! batch, a [`LoadEvent::Reset`] clears the cached rows before the fresh
-//! ones replace them. The private cache module handles the on-disk side.
+//! the last successful load first (if one exists in the [`CacheDirs`]
+//! given to [`spawn`]), so the list is populated instantly instead of
+//! waiting on the network; the live fetch then runs as usual and, on
+//! arriving at its first real batch, a [`LoadEvent::Reset`] clears the
+//! cached rows before the fresh ones replace them. The private cache
+//! module handles the on-disk side.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
+pub use crate::cache::CacheDirs;
 use crate::cache::{self, PendingCache};
 use crate::playlist::{Channel, GroupId, PlaylistBuilder, decode_line};
 use crate::xtream::Account;
@@ -104,12 +106,13 @@ impl fmt::Debug for LoadEvent {
 
 /// Spawns the loader thread for `source` and returns the event receiver.
 ///
-/// `cache_dir` is the app's config directory (see [`crate::store::Store::default_dir`]);
-/// `None` on platforms without one simply disables Xtream playlist caching.
+/// `cache` says where Xtream playlists are cached (normally
+/// [`CacheDirs::platform_default`]); `None` (e.g. on platforms without a
+/// home directory) simply disables Xtream playlist caching.
 /// The thread finishes on its own; failures are reported as
 /// [`LoadEvent::Failed`] rather than panics.
 #[must_use]
-pub fn spawn(source: Source, cache_dir: Option<PathBuf>) -> Receiver<LoadEvent> {
+pub fn spawn(source: Source, cache: Option<CacheDirs>) -> Receiver<LoadEvent> {
     let (tx, rx) = channel();
     thread::spawn(move || {
         let result = match source {
@@ -119,7 +122,7 @@ pub fn spawn(source: Source, cache_dir: Option<PathBuf>) -> Receiver<LoadEvent> 
             }
             Source::Xtream(account) => {
                 log::info!("loading Xtream playlist: {}", account.display_name());
-                load_xtream(&account, cache_dir.as_deref(), &tx)
+                load_xtream(&account, cache.as_ref(), &tx)
             }
         };
         // A send failure just means the UI is gone; nothing left to do.
@@ -204,14 +207,14 @@ fn show_cached(input: impl Read, path: &Path, tx: &Sender<LoadEvent>) -> bool {
 /// logged or reach the UI.
 fn load_xtream(
     account: &Account,
-    cache_dir: Option<&Path>,
+    cache: Option<&CacheDirs>,
     tx: &Sender<LoadEvent>,
 ) -> Result<(), String> {
-    let cache_path = cache_dir.map(|dir| cache::path(dir, &account.cache_key()));
-    if let Some(dir) = cache_path.as_deref().and_then(Path::parent) {
+    if let Some(cache) = cache {
         // Before this load creates a temp file of its own.
-        cache::sweep_stale_temps(dir);
+        cache.tidy();
     }
+    let cache_path = cache.map(|cache| cache::path(cache.dir(), &account.cache_key()));
     let cache_shown = cache_path
         .as_deref()
         .is_some_and(|path| load_cached(path, tx));
@@ -917,8 +920,10 @@ mod tests {
             "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
         );
 
-        let (channels, warnings, error) =
-            drain_with_warnings(&spawn(Source::Xtream(account), Some(dir.clone())));
+        let (channels, warnings, error) = drain_with_warnings(&spawn(
+            Source::Xtream(account),
+            Some(CacheDirs::new(dir.clone())),
+        ));
         assert_eq!(channels, 1, "the cached channel should still be showing");
         assert!(
             error.is_none(),
@@ -969,8 +974,10 @@ mod tests {
             &account.cache_key(),
             "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
         );
-        let (channels, warnings, error) =
-            drain_with_warnings(&spawn(Source::Xtream(account), Some(dir.clone())));
+        let (channels, warnings, error) = drain_with_warnings(&spawn(
+            Source::Xtream(account),
+            Some(CacheDirs::new(dir.clone())),
+        ));
         assert_eq!(channels, 1);
         assert!(error.is_none(), "got: {error:?}");
         assert_eq!(warnings.len(), 1, "got: {warnings:?}");
@@ -1008,7 +1015,7 @@ mod tests {
             "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
         );
 
-        let rx = spawn(Source::Xtream(account), Some(dir.clone()));
+        let rx = spawn(Source::Xtream(account), Some(CacheDirs::new(dir.clone())));
         let mut saw_cached_batch = false;
         let mut saw_reset = false;
         let mut names_after_reset = Vec::new();
@@ -1059,13 +1066,43 @@ mod tests {
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(&abandoned, "#EXTM3U\n#EXTINF:-1,Half\n").unwrap();
 
-        let (channels, error) = drain(&spawn(Source::Xtream(account), Some(dir.clone())));
+        let (channels, error) = drain(&spawn(
+            Source::Xtream(account),
+            Some(CacheDirs::new(dir.clone())),
+        ));
         assert_eq!(channels, 1);
         assert!(error.is_none(), "got: {error:?}");
         assert!(!abandoned.exists(), "abandoned temp file left behind");
         let leftovers = fs::read_dir(cache_path.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "only the fresh cache should remain");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xtream_load_caches_in_the_new_dir_and_drops_the_legacy_one() {
+        // Regression: the cache lived under the (roaming) config directory;
+        // after the move, the old copies must not linger there.
+        let root = temp_cache_dir("migrate");
+        let legacy = root.join("config").join("cache");
+        let new_dir = root.join("cache");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(root.join("config").join("config.toml"), "").unwrap();
+        let port = serve_once("#EXTM3U\n#EXTINF:-1,Fresh\nhttp://u/fresh\n");
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let cache_key = account.cache_key();
+        let old_cache = legacy.join(format!("xtream-{cache_key}.m3u"));
+        fs::write(&old_cache, "#EXTM3U\n#EXTINF:-1,Old\nhttp://u/old\n").unwrap();
+
+        let dirs = CacheDirs::with_legacy_dir(new_dir.clone(), legacy.clone());
+        let (channels, error) = drain(&spawn(Source::Xtream(account), Some(dirs)));
+        assert_eq!(channels, 1, "the legacy copy must not be shown");
+        assert!(error.is_none(), "got: {error:?}");
+
+        assert!(!legacy.exists(), "legacy cache directory left behind");
+        assert!(root.join("config").join("config.toml").exists());
+        let cached = fs::read_to_string(cache::path(&new_dir, &cache_key)).unwrap();
+        assert!(cached.contains("Fresh"), "got: {cached}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1078,7 +1115,10 @@ mod tests {
         let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
         let cache_key = account.cache_key();
 
-        let (channels, error) = drain(&spawn(Source::Xtream(account), Some(dir.clone())));
+        let (channels, error) = drain(&spawn(
+            Source::Xtream(account),
+            Some(CacheDirs::new(dir.clone())),
+        ));
         assert_eq!(channels, 3);
         assert!(error.is_none());
 
