@@ -4,8 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+# Read-only by default; only jobs that write to the release opt in.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,8 +15,12 @@ jobs:
   create-release:
     name: create release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Create GitHub release for the tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,8 +46,13 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
+    # Uploads its archive to the release.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Same pinned toolchain as CI, from rust-toolchain.toml.
       - name: Install toolchain
         run: |
