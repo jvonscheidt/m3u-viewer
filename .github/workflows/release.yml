@@ -79,7 +79,24 @@ jobs:
     # token needed for submitting a PR. See https://aka.ms/winget-create-token
     env:
       WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+      # Pinned release of github.com/microsoft/winget-create. To bump, take
+      # the new tag and the sha256 digest of its wingetcreate.exe asset
+      # (gh release view <tag> -R microsoft/winget-create --json assets).
+      WINGETCREATE_VERSION: v1.12.13.0
+      WINGETCREATE_SHA256: 24042bd37915805615e6cf969ac57c6439124c3fe85823327f5f3fb24bd9ffea
     steps:
+      - name: Download and verify wingetcreate
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          curl.exe --fail --silent --show-error --location `
+            --output wingetcreate.exe `
+            "https://github.com/microsoft/winget-create/releases/download/$env:WINGETCREATE_VERSION/wingetcreate.exe"
+          $actual = (Get-FileHash -Algorithm SHA256 wingetcreate.exe).Hash
+          if ($actual -ne $env:WINGETCREATE_SHA256) {
+            Write-Error "wingetcreate.exe SHA256 mismatch: expected $env:WINGETCREATE_SHA256, got $actual"
+            exit 1
+          }
+          Write-Output "wingetcreate.exe $env:WINGETCREATE_VERSION verified ($actual)"
       - name: Submit package using wingetcreate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -92,7 +109,6 @@ jobs:
             --json assets `
             --jq '.assets[] | select(.name | endswith("x86_64-pc-windows-msvc.zip")) | .url'
 
-          curl.exe -JLO https://aka.ms/wingetcreate/latest
           .\wingetcreate.exe update $packageId `
             --version $packageVersion `
             --urls "$installerUrl" `
