@@ -19,8 +19,9 @@ Prebuilt archives for Windows, Linux, and macOS are attached to each
 
 ### Build & run
 
-Requires a stable [Rust toolchain](https://rustup.rs) (pinned via
-`rust-toolchain.toml`) and, for playback, [VLC](https://www.videolan.org).
+Requires [Rust](https://rustup.rs) 1.99.0 (pinned via
+`rust-toolchain.toml`; rustup installs it automatically) and, for
+playback, [VLC](https://www.videolan.org).
 
 ```console
 $ cargo build --release
@@ -45,7 +46,9 @@ m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
 m3u-viewer --version
 ```
 
-- `<playlist.m3u>` — the playlist to open (`.m3u` or `.m3u8`, UTF-8).
+- `<playlist.m3u>` — the playlist to open (`.m3u` or `.m3u8`). UTF-8 is
+  expected; lines that aren't valid UTF-8 are read as Windows-1252
+  (a superset of Latin-1) instead of aborting the load.
 - `--xtream <server>` — instead of a file, load the playlist of an
   Xtream Codes account. `<server>` is the provider's base URL (e.g.
   `http://provider.example:8080`; `http://` is assumed if omitted).
@@ -54,8 +57,9 @@ m3u-viewer --version
   arrives. If the provider has disabled the M3U download (some panels
   block `get.php` entirely), the live channel list is fetched through
   the Xtream player API (`player_api.php`) instead, with categories as
-  groups. Note that the credentials are visible in your shell history
-  and process list.
+  groups. Slow downloads are never cut off while data keeps arriving;
+  a server that stops sending for 30 s fails the load. Note that the
+  credentials are visible in your shell history and process list.
 - `--epg <url-or-file>` — load an [XMLTV](https://wiki.xmltv.org)
   programme guide (plain or gzipped) and show what's airing now and
   next. Usually unnecessary: playlists that name a guide in their
@@ -143,7 +147,7 @@ macOS `~/Library/Application Support/m3u-viewer/`.
 | `config.toml` | Xtream credentials, user agent, EPG source, and VLC path (written by `--save-config`); hand-edited toggles like `regex_filter`, `vlc_reuse_instance`, and `vlc_prewarm` |
 | `favorites.json` | Favorited channel URLs |
 | `recents.json` | Recently played channel URLs (newest first, capped at 50) |
-| `cache/` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs |
+| `cache/` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs. If the refresh fails, the cached list stays on screen with a warning in the status bar |
 | `m3u-viewer.log` | Diagnostic log (startup, loading, playback timings); appended across runs and rotated to `m3u-viewer.log.old` once it spans 30 days |
 
 Favorites and recents are keyed by stream URL, so they survive playlist
@@ -176,7 +180,10 @@ Deleting the directory resets everything.
 
 #### Loading & parsing
 
-- Invocation: `m3u-viewer <playlist.m3u>`; also accepts `.m3u8` (UTF-8).
+- Invocation: `m3u-viewer <playlist.m3u>`; also accepts `.m3u8`.
+- Encoding (since 0.9.1): UTF-8; lines that aren't valid UTF-8 (typical
+  of Latin-1 / Windows-1252 playlists) are decoded as Windows-1252 rather
+  than failing the load.
 - Alternative source (since 0.2.0): `--xtream <server> --username <u>
   --password <p>` downloads the account playlist over HTTP
   (`get.php?type=m3u_plus`) and streams it through the same parser;
@@ -191,6 +198,15 @@ Deleting the directory resets everything.
   `group-title`, and the stream URL on the following line.
 - Malformed entries are skipped, counted, and reported in the status bar —
   a bad line must never abort loading.
+- Xtream cache (since 0.9.1): the cached copy is keyed on the account's
+  server, username, and password, so a changed password never reuses
+  stream URLs carrying the old one. (Upgrading from an earlier version
+  re-keys the cache once, so the first launch loads live.) A failed
+  live refresh keeps the cached list on screen and says so in the status
+  bar, with any password masked in the message.
+- Network timeouts (since 0.9.1): 10 s to connect, 60 s for the server to
+  start answering, and 30 s without data mid-download; a download that
+  keeps progressing is never cut off (1 h hard cap).
 - Parsing runs on a background thread; the UI appears immediately and fills
   in as entries stream in, with a progress indicator until the file is
   fully loaded.
@@ -230,12 +246,21 @@ Deleting the directory resets everything.
   selection.
 - Only programmes within a 12-hour window around load time are kept,
   bounding memory even for multi-day guides over very large playlists.
+- Encoding (since 0.9.1): feeds declaring ISO-8859-1 / Latin-1 /
+  Windows-1252 are decoded as Windows-1252; otherwise UTF-8, with an
+  invalid byte replaced rather than discarding the whole guide.
 - `e` toggles the EPG display without discarding the loaded guide.
 
 #### Playback (VLC)
 
 - `Enter` launches the selected channel's URL in VLC as a detached
   process; the viewer stays open.
+- Only network stream URLs are launched (since 0.9.1): `http`, `https`,
+  `rtsp`, `rtsps`, `rtmp`, `rtmps`, `rtp`, `udp`, `mms`, `mmsh`, and
+  `srt`. Anything else — local file paths, `file:`/`smb:` URLs, network
+  share (UNC) paths, or lines starting with `-` — is refused with a
+  status-bar message, so a hostile playlist can't pass options to VLC
+  or make Windows connect to a remote file share.
 - VLC discovery: `vlc` on `PATH`, standard install locations per OS
   (e.g. `C:\Program Files\VideoLAN\VLC\vlc.exe` on Windows), overridable
   via config file or `--vlc <path>`.
@@ -248,7 +273,7 @@ Deleting the directory resets everything.
   (e.g. `★`) in the list.
 - A favorites view (`F`) lists only favorites.
 - Persisted by channel URL (survives playlist re-ordering) in the platform
-  config directory (e.g. `%APPDATA%\m3u-viewer\favorites.json`).
+  config directory (e.g. `%APPDATA%\m3u-viewer\config\favorites.json`).
 
 #### Recent channels
 
