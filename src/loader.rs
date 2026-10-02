@@ -208,6 +208,10 @@ fn load_xtream(
     tx: &Sender<LoadEvent>,
 ) -> Result<(), String> {
     let cache_path = cache_dir.map(|dir| cache::path(dir, &account.cache_key()));
+    if let Some(dir) = cache_path.as_deref().and_then(Path::parent) {
+        // Before this load creates a temp file of its own.
+        cache::sweep_stale_temps(dir);
+    }
     let cache_shown = cache_path
         .as_deref()
         .is_some_and(|path| load_cached(path, tx));
@@ -1037,6 +1041,30 @@ mod tests {
             !cached_text.contains("Cached"),
             "stale cache kept: {cached_text}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xtream_load_sweeps_temp_files_abandoned_by_an_earlier_run() {
+        // Regression: a viewer quit mid-download left its playlist-sized
+        // temp file behind, and no later run ever removed it.
+        let dir = temp_cache_dir("sweep");
+        let port = serve_once("#EXTM3U\n#EXTINF:-1,Fresh\nhttp://u/fresh\n");
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let cache_path = cache::path(&dir, &account.cache_key());
+        let mut name = cache_path.file_name().unwrap().to_os_string();
+        let crashed_pid = std::process::id().wrapping_add(1);
+        name.push(format!(".tmp.{crashed_pid}.1700000000000000000.0"));
+        let abandoned = cache_path.with_file_name(name);
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(&abandoned, "#EXTM3U\n#EXTINF:-1,Half\n").unwrap();
+
+        let (channels, error) = drain(&spawn(Source::Xtream(account), Some(dir.clone())));
+        assert_eq!(channels, 1);
+        assert!(error.is_none(), "got: {error:?}");
+        assert!(!abandoned.exists(), "abandoned temp file left behind");
+        let leftovers = fs::read_dir(cache_path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "only the fresh cache should remain");
         let _ = fs::remove_dir_all(&dir);
     }
 
