@@ -107,7 +107,7 @@ impl PendingCache {
     /// A pending cache for `path` whose temp file is open read-only, so
     /// every write to it fails the way a full disk would.
     #[cfg(test)]
-    // unwrap is fine in test helpers (see CLAUDE.md).
+    // unwrap is fine in test helpers (see AGENTS.md).
     #[allow(clippy::unwrap_used)]
     pub(crate) fn failing_for_test(path: &Path) -> Self {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
