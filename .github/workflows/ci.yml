@@ -7,6 +7,9 @@ on:
   # Advisories get published against unchanged code, so audit weekly too.
   schedule:
     - cron: "0 6 * * 1"
+  # release.yml runs these same checks against the tagged commit before
+  # anything is published.
+  workflow_call:
 
 # Nothing in CI writes to the repository.
 permissions:

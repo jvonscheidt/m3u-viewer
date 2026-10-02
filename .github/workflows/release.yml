@@ -12,11 +12,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Release gate, part 1: the tag must name the version in Cargo.toml.
+  verify-tag:
+    name: verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install
+      - name: Check tag against Cargo.toml version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash scripts/check-release-tag.sh "$TAG"
+
+  # Release gate, part 2: the full CI suite against the tagged commit.
+  checks:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   # Builds run read-only and pass their archives on as artifacts. The
   # compile step (and every build script in the dependency tree) never
   # holds a write token, and nothing is published until all targets build.
   build:
     name: build (${{ matrix.target }})
+    needs: [verify-tag, checks]
     strategy:
       fail-fast: false
       matrix:
