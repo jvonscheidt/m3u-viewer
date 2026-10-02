@@ -156,7 +156,7 @@ its tens of megabytes are never synced with a roaming profile — on Windows
 
 | File | Contents |
 | --- | --- |
-| `xtream-*.m3u` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs. If the refresh fails, the cached list stays on screen with a warning in the status bar |
+| `xtream-*.m3u` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs. If the refresh fails, the cached list stays on screen with a warning in the status bar. After a password change, the first successful refresh deletes the account's cache from the old password |
 | `xtream-*.m3u.tmp.*` | Playlist being downloaded; replaces the cached copy once complete. Left behind if the viewer quits or crashes mid-download, and deleted by the next launch that loads an Xtream playlist (never while another running viewer is still writing it) |
 
 Up to 0.9.1 the cache was kept in a `cache\` subdirectory of the config

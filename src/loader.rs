@@ -214,7 +214,7 @@ fn load_xtream(
         // Before this load creates a temp file of its own.
         cache.tidy();
     }
-    let cache_path = cache.map(|cache| cache::path(cache.dir(), &account.cache_key()));
+    let cache_path = cache.map(|cache| cache::path(cache.dir(), account));
     let cache_shown = cache_path
         .as_deref()
         .is_some_and(|path| load_cached(path, tx));
@@ -897,12 +897,47 @@ mod tests {
         dir
     }
 
-    /// Pre-populates the on-disk cache for `cache_key` with `body`, as if
+    /// Pre-populates the on-disk cache for `account` with `body`, as if
     /// left behind by a previous successful load.
-    fn seed_cache(dir: &Path, cache_key: &str, body: &str) {
-        let path = cache::path(dir, cache_key);
+    fn seed_cache(dir: &Path, account: &Account, body: &str) {
+        let path = cache::path(dir, account);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, body).unwrap();
+    }
+
+    /// An account for tests that only need its cache file name; its
+    /// server is never contacted.
+    fn offline_account() -> Account {
+        Account::new("example.com", "u".into(), "p".into())
+    }
+
+    #[test]
+    fn refresh_after_a_password_change_deletes_the_old_passwords_cache() {
+        // Regression: the cache key includes the password, so after a
+        // password change the old cache (with old-credential URLs) was
+        // never read again — and never deleted either.
+        let dir = temp_cache_dir("password-change");
+        let port = serve_once("#EXTM3U\n#EXTINF:-1,Fresh\nhttp://u/fresh\n");
+        let server = format!("127.0.0.1:{port}");
+        let old = Account::new(&server, "u".into(), "old-pw".into());
+        let old_cache = cache::path(&dir, &old);
+        seed_cache(&dir, &old, "#EXTM3U\n#EXTINF:-1,Old\nhttp://u/u/old-pw/1\n");
+        let other_user = Account::new(&server, "someone-else".into(), "pw".into());
+        seed_cache(&dir, &other_user, "#EXTM3U\n");
+        let account = Account::new(&server, "u".into(), "new-pw".into());
+        let cache_path = cache::path(&dir, &account);
+
+        let (channels, error) = drain(&spawn(
+            Source::Xtream(account),
+            Some(CacheDirs::new(dir.clone())),
+        ));
+        assert_eq!(channels, 1);
+        assert!(error.is_none(), "got: {error:?}");
+
+        assert!(cache_path.exists(), "fresh cache not written");
+        assert!(!old_cache.exists(), "old-password cache left behind");
+        assert!(cache::path(&dir, &other_user).exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -916,7 +951,7 @@ mod tests {
         let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
         seed_cache(
             &dir,
-            &account.cache_key(),
+            &account,
             "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
         );
 
@@ -971,7 +1006,7 @@ mod tests {
         let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "s3cret-pw".into());
         seed_cache(
             &dir,
-            &account.cache_key(),
+            &account,
             "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
         );
         let (channels, warnings, error) = drain_with_warnings(&spawn(
@@ -1008,10 +1043,10 @@ mod tests {
         let body = "#EXTM3U\n#EXTINF:-1 group-title=\"News\",Fresh\nhttp://u/fresh\n";
         let port = serve_once(body);
         let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
-        let cache_key = account.cache_key();
+        let cache_path = cache::path(&dir, &account);
         seed_cache(
             &dir,
-            &cache_key,
+            &account,
             "#EXTM3U\n#EXTINF:-1,Cached\nhttp://u/cached\n",
         );
 
@@ -1039,7 +1074,7 @@ mod tests {
         assert!(saw_reset, "live refresh should reset before replacing");
         assert_eq!(names_after_reset, ["Fresh"]);
 
-        let cached_text = fs::read_to_string(cache::path(&dir, &cache_key)).unwrap();
+        let cached_text = fs::read_to_string(&cache_path).unwrap();
         assert!(
             cached_text.contains("Fresh"),
             "cache not updated: {cached_text}"
@@ -1058,7 +1093,7 @@ mod tests {
         let dir = temp_cache_dir("sweep");
         let port = serve_once("#EXTM3U\n#EXTINF:-1,Fresh\nhttp://u/fresh\n");
         let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
-        let cache_path = cache::path(&dir, &account.cache_key());
+        let cache_path = cache::path(&dir, &account);
         let mut name = cache_path.file_name().unwrap().to_os_string();
         let crashed_pid = std::process::id().wrapping_add(1);
         name.push(format!(".tmp.{crashed_pid}.1700000000000000000.0"));
@@ -1090,6 +1125,7 @@ mod tests {
         let port = serve_once("#EXTM3U\n#EXTINF:-1,Fresh\nhttp://u/fresh\n");
         let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
         let cache_key = account.cache_key();
+        let new_cache = cache::path(&new_dir, &account);
         let old_cache = legacy.join(format!("xtream-{cache_key}.m3u"));
         fs::write(&old_cache, "#EXTM3U\n#EXTINF:-1,Old\nhttp://u/old\n").unwrap();
 
@@ -1100,7 +1136,7 @@ mod tests {
 
         assert!(!legacy.exists(), "legacy cache directory left behind");
         assert!(root.join("config").join("config.toml").exists());
-        let cached = fs::read_to_string(cache::path(&new_dir, &cache_key)).unwrap();
+        let cached = fs::read_to_string(&new_cache).unwrap();
         assert!(cached.contains("Fresh"), "got: {cached}");
         let _ = fs::remove_dir_all(&root);
     }
@@ -1113,7 +1149,7 @@ mod tests {
         let dir = temp_cache_dir("api-fallback");
         let port = serve_panel(3);
         let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
-        let cache_key = account.cache_key();
+        let cache_path = cache::path(&dir, &account);
 
         let (channels, error) = drain(&spawn(
             Source::Xtream(account),
@@ -1122,7 +1158,7 @@ mod tests {
         assert_eq!(channels, 3);
         assert!(error.is_none());
 
-        let cached_text = fs::read_to_string(cache::path(&dir, &cache_key)).unwrap();
+        let cached_text = fs::read_to_string(&cache_path).unwrap();
         assert!(cached_text.starts_with("#EXTM3U\n"));
         assert!(cached_text.contains("tvg-id=\"one.tv\""));
         assert!(cached_text.contains("group-title=\"News\""));
@@ -1137,7 +1173,7 @@ mod tests {
         // file over the good cache. Covers both mirroring paths: the
         // get.php stream (parse_stream) and the player API (write_m3u_entry).
         let dir = temp_cache_dir("write-failure");
-        let cache_path = cache::path(&dir, "acct");
+        let cache_path = cache::path(&dir, &offline_account());
         let good = "#EXTM3U\n#EXTINF:-1,Good\nhttp://u/good\n";
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(&cache_path, good).unwrap();
@@ -1189,7 +1225,7 @@ mod tests {
         use std::fmt::Write as _;
 
         let dir = temp_cache_dir("read-failure");
-        let cache_path = cache::path(&dir, "acct");
+        let cache_path = cache::path(&dir, &offline_account());
         let mut body = String::from("#EXTM3U\n");
         for index in 0..=BATCH_SIZE {
             writeln!(
@@ -1223,7 +1259,7 @@ mod tests {
     #[test]
     fn cache_read_failure_before_any_batch_shows_nothing() {
         let dir = temp_cache_dir("read-failure-early");
-        let cache_path = cache::path(&dir, "acct");
+        let cache_path = cache::path(&dir, &offline_account());
         let (tx, rx) = channel();
         let input = "#EXTM3U\n#EXTINF:-1,A\nhttp://u/a\n"
             .as_bytes()
@@ -1281,7 +1317,7 @@ mod tests {
     #[test]
     fn latin1_stream_is_cached_byte_for_byte_and_reads_back_identically() {
         let dir = temp_cache_dir("latin1-cache");
-        let cache_path = cache::path(&dir, "acct");
+        let cache_path = cache::path(&dir, &offline_account());
         let (tx, rx) = channel();
         let mut sink = PendingCache::create(&cache_path).unwrap();
         let mut delivered = 0;

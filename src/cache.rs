@@ -33,6 +33,17 @@
 //! load with this version deletes the playlists found there (see
 //! [`CacheDirs::tidy`]) instead of moving them, since they carry stream
 //! URLs with possibly outdated credentials and would be re-keyed anyway.
+//!
+//! # File names and superseded caches
+//!
+//! A cached playlist is named `xtream-<account>-<key>.m3u`: `<key>` is
+//! [`Account::cache_key`] (readable host and username plus a hash that
+//! also covers the password), `<account>` a separate 16-hex-digit hash of
+//! the unsanitized host and username alone. After a password change the
+//! account gets a new `<key>`, and the cache under the old one is useless
+//! — its stream URLs embed the old password. [`PendingCache::commit`]
+//! therefore deletes the account's other caches; see [`prune_superseded`]
+//! for why that never hits another account's cache.
 
 use std::fs::{self, File, TryLockError};
 use std::io::Write;
@@ -40,6 +51,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::private_file;
+use crate::xtream::Account;
 
 /// Directories used by the Xtream playlist cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,16 +176,105 @@ const FILE_SUFFIX: &str = ".m3u";
 /// can only be a leftover.
 const STALE_AFTER: Duration = Duration::from_hours(2);
 
-/// Where an account's cached playlist lives in the cache directory
-/// ([`CacheDirs::dir`]), keyed by [`crate::xtream::Account::cache_key`].
+/// Where `account`'s cached playlist lives in the cache directory
+/// ([`CacheDirs::dir`]): `xtream-<account>-<key>.m3u`, see the
+/// [module docs](self#file-names-and-superseded-caches).
 #[must_use]
-pub fn path(cache_dir: &Path, account_key: &str) -> PathBuf {
-    cache_dir.join(format!("{FILE_PREFIX}{account_key}{FILE_SUFFIX}"))
+pub fn path(cache_dir: &Path, account: &Account) -> PathBuf {
+    cache_dir.join(format!(
+        "{FILE_PREFIX}{:016x}-{}{FILE_SUFFIX}",
+        account_hash(account),
+        account.cache_key()
+    ))
+}
+
+/// Stable non-cryptographic (FNV-1a) hash of the unsanitized host and
+/// username — the account's identity without its password, so it stays
+/// the same across password changes. Hashed like the identity part of
+/// [`Account::cache_key`]: scheme stripped from the server URL, fields
+/// NUL-separated.
+fn account_hash(account: &Account) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let (server, username, _) = account.credentials();
+    let host = server.split_once("://").map_or(server, |(_, rest)| rest);
+    host.bytes()
+        .chain(std::iter::once(0))
+        .chain(username.bytes())
+        .fold(OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
 }
 
 /// Whether `name` is the file name of a cached playlist (not a temp file).
 fn is_cache_file_name(name: &str) -> bool {
     name.starts_with(FILE_PREFIX) && name.ends_with(FILE_SUFFIX)
+}
+
+/// The parts of a cached playlist's file name that identify its account.
+#[derive(Debug, PartialEq, Eq)]
+struct AccountFile<'a> {
+    /// `<account>`: hash of the unsanitized host and username.
+    account_hash: &'a str,
+    /// `<key>` without its trailing hash: the sanitized host and username.
+    readable: &'a str,
+}
+
+impl<'a> AccountFile<'a> {
+    /// Parses `xtream-<16 hex>-<readable>-<16 hex>.m3u`; `None` for any
+    /// other name, including temp files and pre-0.9.2 names.
+    fn parse(name: &'a str) -> Option<Self> {
+        let is_hash = |text: &str| text.len() == 16 && text.bytes().all(|b| b.is_ascii_hexdigit());
+        let stem = name.strip_prefix(FILE_PREFIX)?.strip_suffix(FILE_SUFFIX)?;
+        let (account_hash, key) = stem.split_once('-')?;
+        let (readable, credentials_hash) = key.rsplit_once('-')?;
+        (is_hash(account_hash) && is_hash(credentials_hash) && !readable.is_empty()).then_some(
+            Self {
+                account_hash,
+                readable,
+            },
+        )
+    }
+}
+
+/// Deletes the other caches of the account whose fresh cache was just
+/// committed at `path` — copies keyed on an older password, full of
+/// stream URLs that no longer play and that still embed it.
+///
+/// A file counts as the same account only when its name parses (see
+/// [`AccountFile::parse`]) and both its account hash and its readable
+/// host-and-username part equal `path`'s. The readable part alone is not
+/// enough: sanitizing maps different accounts (`a.b`/`u-1` and `a_b`/`u_1`)
+/// to the same text, and those differ in the account hash, which covers
+/// the unsanitized host and username. Two different accounts would need
+/// both an identical sanitized name and a 64-bit hash collision.
+/// Temp files, unparsable names, and legacy-format names are never
+/// touched. Best-effort, like everything here.
+fn prune_superseded(path: &Path) {
+    let (Some(dir), Some(own_name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let Some(own) = AccountFile::parse(own_name) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if name != own_name && AccountFile::parse(name).as_ref() == Some(&own) {
+            let superseded = entry.path();
+            match fs::remove_file(&superseded) {
+                Ok(()) => log::info!("removed superseded cache {}", superseded.display()),
+                Err(error) => log::debug!("could not remove {}: {error}", superseded.display()),
+            }
+        }
+    }
 }
 
 /// Deletes playlist temp files in `dir` that no running viewer is writing:
@@ -303,8 +404,9 @@ impl PendingCache {
 
     /// Atomically replaces the cache with the temp file — only if every
     /// write succeeded; otherwise the temp file is discarded and the
-    /// previous cache stays untouched. Returns whether the cache was
-    /// replaced.
+    /// previous cache stays untouched. Once replaced, the account's caches
+    /// under older passwords are deleted ([`prune_superseded`]). Returns
+    /// whether the cache was replaced.
     pub fn commit(mut self) -> bool {
         let Some(file) = self.file.take() else {
             return false;
@@ -313,6 +415,9 @@ impl PendingCache {
         drop(file);
         // promote() removes the temp file itself when it fails.
         self.committed = private_file::promote(&self.tmp, &self.path).is_ok();
+        if self.committed {
+            prune_superseded(&self.path);
+        }
         self.committed
     }
 
@@ -359,13 +464,154 @@ mod tests {
         dir
     }
 
+    /// An account on `example.com` (never contacted) with `username`.
+    fn account(username: &str) -> Account {
+        Account::new("example.com", username.into(), "p".into())
+    }
+
     #[test]
-    fn path_is_a_prefixed_file_in_the_cache_directory() {
+    fn path_names_the_account_and_its_cache_key() {
         let dir = PathBuf::from("C:/cache");
+        let account = account("user");
+        let cache_path = path(&dir, &account);
+        assert_eq!(cache_path.parent(), Some(dir.as_path()));
+        let name = cache_path.file_name().unwrap().to_str().unwrap();
+        let key = account.cache_key();
+        let hash = name
+            .strip_prefix("xtream-")
+            .and_then(|rest| rest.strip_suffix(&format!("-{key}.m3u")))
+            .unwrap();
+        assert_eq!(hash, format!("{:016x}", account_hash(&account)));
         assert_eq!(
-            path(&dir, "example.com-user"),
-            PathBuf::from("C:/cache/xtream-example.com-user.m3u")
+            AccountFile::parse(name),
+            Some(AccountFile {
+                account_hash: hash,
+                readable: "example_com-user",
+            })
         );
+    }
+
+    #[test]
+    fn account_hash_ignores_the_password_and_scheme_only() {
+        let base = account_hash(&Account::new("example.com", "u".into(), "one".into()));
+        for same in [
+            Account::new("example.com", "u".into(), "two".into()),
+            Account::new("http://example.com", "u".into(), "one".into()),
+        ] {
+            assert_eq!(account_hash(&same), base);
+        }
+        for other in [
+            Account::new("example.org", "u".into(), "one".into()),
+            Account::new("example.com", "v".into(), "one".into()),
+            // Same bytes, split differently between host and username.
+            Account::new("example.co", "mu".into(), "one".into()),
+        ] {
+            assert_ne!(account_hash(&other), base);
+        }
+    }
+
+    #[test]
+    fn only_current_format_names_parse_as_account_files() {
+        for name in [
+            "xtream-example_com-u-0123456789abcdef.m3u",
+            "xtream-0123456789abcdef-example_com-u.m3u",
+            "xtream-0123456789abcdef--0123456789abcdef.m3u",
+            "xtream-0123456789abcdef-example_com-u-0123456789abcdef.m3u.tmp.1.2.3",
+            "other-0123456789abcdef-example_com-u-0123456789abcdef.m3u",
+        ] {
+            assert_eq!(AccountFile::parse(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn commit_deletes_the_same_accounts_caches_under_older_passwords() {
+        // Regression: after a password change (which re-keys the cache) the
+        // old cache, full of stream URLs embedding the old password, stayed
+        // on disk forever.
+        let dir = temp_dir("prune");
+        fs::create_dir_all(&dir).unwrap();
+        let old_passwords = ["old-1", "old-2"].map(|password| {
+            path(
+                &dir,
+                &Account::new("example.com", "u".into(), password.into()),
+            )
+        });
+        for old in &old_passwords {
+            fs::write(old, "#EXTM3U\n").unwrap();
+        }
+        let current = Account::new("https://example.com", "u".into(), "new".into());
+        let cache_path = path(&dir, &current);
+
+        let mut pending = PendingCache::create(&cache_path).unwrap();
+        pending.write(b"#EXTM3U\n");
+        assert!(pending.commit());
+
+        assert!(cache_path.exists());
+        for old in &old_passwords {
+            assert!(!old.exists(), "{} left behind", old.display());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_keeps_other_accounts_even_with_the_same_readable_name() {
+        // Review note: sanitizing maps "a.b.com"/"u-1" and "a_b_com"/"u_1"
+        // to the same readable name; pruning by that prefix alone would
+        // delete the other account's cache.
+        let dir = temp_dir("prune-keep");
+        fs::create_dir_all(&dir).unwrap();
+        let lookalike = path(&dir, &Account::new("a_b_com", "u_1".into(), "p".into()));
+        let other_user = path(&dir, &Account::new("a.b.com", "u-2".into(), "p".into()));
+        let legacy_name = dir.join("xtream-a_b_com-u_1-0123456789abcdef.m3u");
+        let unrelated = dir.join("notes.txt");
+        let current = Account::new("a.b.com", "u-1".into(), "p".into());
+        let cache_path = path(&dir, &current);
+        let in_flight = foreign_tmp(&cache_path, other_pid());
+        for kept in [
+            &lookalike,
+            &other_user,
+            &legacy_name,
+            &unrelated,
+            &in_flight,
+        ] {
+            fs::write(kept, "#EXTM3U\n").unwrap();
+        }
+        let readable = |path: &Path| {
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            AccountFile::parse(&name).unwrap().readable.to_owned()
+        };
+        assert_eq!(readable(&lookalike), readable(&cache_path));
+
+        let mut pending = PendingCache::create(&cache_path).unwrap();
+        pending.write(b"#EXTM3U\n");
+        assert!(pending.commit());
+
+        for kept in [
+            &lookalike,
+            &other_user,
+            &legacy_name,
+            &unrelated,
+            &in_flight,
+        ] {
+            assert!(kept.exists(), "{} was removed", kept.display());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_commit_prunes_nothing() {
+        let dir = temp_dir("prune-failed");
+        fs::create_dir_all(&dir).unwrap();
+        let old = path(&dir, &Account::new("example.com", "u".into(), "old".into()));
+        fs::write(&old, "#EXTM3U\n").unwrap();
+        let cache_path = path(&dir, &Account::new("example.com", "u".into(), "new".into()));
+
+        let mut pending = PendingCache::failing_for_test(&cache_path);
+        pending.write(b"#EXTM3U\n");
+        assert!(!pending.commit());
+
+        assert!(old.exists(), "the only usable cache must survive");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -469,7 +715,7 @@ mod tests {
     fn tidy_never_treats_the_cache_directory_as_its_own_legacy() {
         let dir = temp_dir("legacy-same");
         fs::create_dir_all(&dir).unwrap();
-        let current = path(&dir, "acct");
+        let current = path(&dir, &account("acct"));
         fs::write(&current, "#EXTM3U\n").unwrap();
 
         CacheDirs::with_legacy_dir(dir.clone(), dir.clone()).tidy();
@@ -481,13 +727,13 @@ mod tests {
     #[test]
     fn missing_cache_opens_as_none() {
         let dir = temp_dir("missing");
-        assert!(open(&path(&dir, "acct")).is_none());
+        assert!(open(&path(&dir, &account("acct"))).is_none());
     }
 
     #[test]
     fn create_write_commit_and_reopen_round_trips() {
         let dir = temp_dir("roundtrip");
-        let cache_path = path(&dir, "acct");
+        let cache_path = path(&dir, &account("acct"));
         let mut pending = PendingCache::create(&cache_path).unwrap();
         pending.write(b"#EXTM3U\n");
         assert!(!cache_path.exists());
@@ -504,7 +750,7 @@ mod tests {
     #[test]
     fn dropped_cache_never_reaches_the_cache_path() {
         let dir = temp_dir("discard");
-        let cache_path = path(&dir, "acct");
+        let cache_path = path(&dir, &account("acct"));
         let pending = PendingCache::create(&cache_path).unwrap();
         let tmp = pending.tmp.clone();
         drop(pending);
@@ -531,12 +777,12 @@ mod tests {
         // PendingCache drop, and the playlist-sized temp file stayed in
         // the cache directory forever.
         let dir = temp_dir("sweep-abandoned");
-        let cache_path = path(&dir, "acct");
+        let cache_path = path(&dir, &account("acct"));
         let cache_dir = cache_path.parent().unwrap();
         fs::create_dir_all(cache_dir).unwrap();
         let abandoned = [
             foreign_tmp(&cache_path, other_pid()),
-            foreign_tmp(&path(&dir, "other"), other_pid().wrapping_add(1)),
+            foreign_tmp(&path(&dir, &account("other")), other_pid().wrapping_add(1)),
         ];
         for tmp in &abandoned {
             fs::write(tmp, b"#EXTM3U\n").unwrap();
@@ -553,7 +799,7 @@ mod tests {
     #[test]
     fn sweep_keeps_caches_unrelated_files_and_temps_in_use() {
         let dir = temp_dir("sweep-keep");
-        let cache_path = path(&dir, "acct");
+        let cache_path = path(&dir, &account("acct"));
         let cache_dir = cache_path.parent().unwrap();
         fs::create_dir_all(cache_dir).unwrap();
         fs::write(&cache_path, b"#EXTM3U\n").unwrap();
@@ -583,7 +829,7 @@ mod tests {
     #[test]
     fn pending_cache_locks_its_temp_file_against_sweeps() {
         let dir = temp_dir("sweep-pending");
-        let pending = PendingCache::create(&path(&dir, "acct")).unwrap();
+        let pending = PendingCache::create(&path(&dir, &account("acct"))).unwrap();
         let probe = File::open(&pending.tmp).unwrap();
         assert!(
             matches!(probe.try_lock(), Err(TryLockError::WouldBlock)),
@@ -600,7 +846,7 @@ mod tests {
         // the mirroring, and the truncated temp file was still promoted
         // over the good cache.
         let dir = temp_dir("write-failure");
-        let cache_path = path(&dir, "acct");
+        let cache_path = path(&dir, &account("acct"));
         let good = "#EXTM3U\n#EXTINF:-1,Good\nhttp://u/good\n";
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         fs::write(&cache_path, good).unwrap();
