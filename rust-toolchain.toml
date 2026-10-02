@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned so new clippy lints in a stable release cannot break CI on
+# their own; bump deliberately and fix whatever new lints flag.
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
