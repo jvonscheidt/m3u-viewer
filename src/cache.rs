@@ -104,14 +104,15 @@ impl CacheDirs {
     }
 
     /// Housekeeping before a load: deletes the playlist caches an older
-    /// version left in the legacy directory, then sweeps abandoned temp
-    /// files from the cache directory ([`sweep_stale_temps`]).
+    /// version left in the legacy directory, then sweeps the cache
+    /// directory of temp files left by viewers that quit or crashed
+    /// mid-download.
     ///
     /// In the legacy directory only `xtream-*.m3u` playlists and their
     /// temp files are deleted, and the directory itself only if that
     /// leaves it empty; nothing else in the config directory is touched.
     /// Older versions do not lock their temp files, so a legacy temp file
-    /// is deleted only once it is unmodified for [`STALE_AFTER`] — a
+    /// is deleted only once it is unmodified for two hours — a
     /// younger one may still be written by an older viewer running
     /// alongside, and is left for a later launch.
     pub fn tidy(&self) {
