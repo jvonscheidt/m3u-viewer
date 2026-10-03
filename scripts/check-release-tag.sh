@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Release gate: fail unless the pushed tag is exactly "v" + the package
 # version in Cargo.toml, so a tag can never publish a binary that reports
-# a different version.
+# a different version. Also reports whether the version is a SemVer
+# prerelease; when $GITHUB_OUTPUT is set, it writes `version` and
+# `prerelease` (true/false) there as step outputs.
 #
 # Usage: scripts/check-release-tag.sh <tag>
 # Run from the repository root; needs cargo and jq.
@@ -25,4 +27,18 @@ if [ "$tag" != "v$version" ]; then
   exit 1
 fi
 
-echo "tag $tag matches Cargo.toml version $version"
+# SemVer prerelease: a "-" in the version before any "+build" metadata,
+# e.g. 1.0.0-rc1 (but not 1.0.0+build-5).
+case "${version%%+*}" in
+  *-*) prerelease=true ;;
+  *) prerelease=false ;;
+esac
+
+echo "tag $tag matches Cargo.toml version $version (prerelease=$prerelease)"
+
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  {
+    echo "version=$version"
+    echo "prerelease=$prerelease"
+  } >>"$GITHUB_OUTPUT"
+fi
