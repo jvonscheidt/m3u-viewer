@@ -6,7 +6,7 @@
 //! panels disable that M3U download; for those, [`Account`] also exposes
 //! the JSON player API (`player_api.php`) — [`Category`] and
 //! [`LiveStream`] lists from which the loader synthesizes the channel
-//! list itself.
+//! list itself, parsing each record leniently.
 //!
 //! Xtream embeds credentials in request URLs. Those URLs must never be
 //! logged; diagnostics report only status, content metadata, and redirect
@@ -17,9 +17,12 @@ use std::io::Read;
 use std::time::Duration;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use serde::Deserialize;
 use thiserror::Error;
 use ureq::ResponseExt as _;
+
+use player_api::{RawCategory, RawLiveStream, RawRecord};
+
+mod player_api;
 
 /// Timeouts for every HTTP download (Xtream playlist and player API, and
 /// XMLTV guides), shared through [`http_agent`].
@@ -116,13 +119,12 @@ pub enum XtreamError {
 }
 
 /// One live category from `player_api.php?action=get_live_categories`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct Category {
-    /// Panel-assigned id, referenced by [`LiveStream::category_id`].
-    #[serde(rename = "category_id", deserialize_with = "required_scalar")]
+    /// Panel-assigned id (`category_id`), referenced by
+    /// [`LiveStream::category_id`].
     pub(crate) id: String,
-    /// Human-readable name; becomes the channel group.
-    #[serde(rename = "category_name")]
+    /// Human-readable name (`category_name`); becomes the channel group.
     pub(crate) name: String,
 }
 
@@ -141,19 +143,15 @@ impl Category {
 }
 
 /// One live stream from `player_api.php?action=get_live_streams`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct LiveStream {
     /// Display name; `None` when the panel sent none.
-    #[serde(default, deserialize_with = "lenient_scalar")]
     pub(crate) name: Option<String>,
     /// Id from which [`Account::live_stream_url`] builds the URL.
-    #[serde(deserialize_with = "lenient_u64")]
     pub(crate) stream_id: u64,
     /// Category (group) of the stream, when the panel sets one.
-    #[serde(default, deserialize_with = "lenient_scalar")]
     pub(crate) category_id: Option<String>,
     /// EPG channel id (`tvg-id` equivalent), when set.
-    #[serde(default, deserialize_with = "lenient_scalar")]
     pub(crate) epg_channel_id: Option<String>,
 }
 
@@ -181,46 +179,6 @@ impl LiveStream {
     pub fn epg_channel_id(&self) -> Option<&str> {
         self.epg_channel_id.as_deref()
     }
-}
-
-/// Panels are inconsistent about JSON scalar types — ids arrive as
-/// numbers or strings, optional fields as `null` or `""`. Normalizes all
-/// of that to an optional string.
-fn scalar_to_string(value: serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(text) if !text.is_empty() => Some(text),
-        serde_json::Value::Number(number) => Some(number.to_string()),
-        _ => None,
-    }
-}
-
-fn lenient_scalar<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(scalar_to_string(value))
-}
-
-fn required_scalar<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    scalar_to_string(value).ok_or_else(|| serde::de::Error::custom("expected a string or number"))
-}
-
-fn lenient_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match &value {
-        serde_json::Value::Number(number) => number.as_u64(),
-        serde_json::Value::String(text) => text.parse().ok(),
-        _ => None,
-    }
-    .ok_or_else(|| serde::de::Error::custom("expected an unsigned number"))
 }
 
 /// Replaces anything that isn't ASCII alphanumeric with `_`, so the result
@@ -433,11 +391,10 @@ impl Account {
         )
     }
 
-    /// Downloads and parses `action`'s JSON array from the player API.
-    fn fetch_api_list<T: serde::de::DeserializeOwned>(
-        &self,
-        action: &str,
-    ) -> Result<Vec<T>, XtreamError> {
+    /// Downloads and parses `action`'s list from the player API. Records
+    /// are parsed one by one; unusable ones are skipped and their count
+    /// logged, so one bad entry does not cost the whole list.
+    fn fetch_api_list<R: RawRecord>(&self, action: &str) -> Result<Vec<R::Record>, XtreamError> {
         let response = self.request(self.api_url(action))?;
         // Unlimited body: full stream lists routinely exceed ureq's
         // 10 MB default (55k streams ≈ 20 MB of JSON).
@@ -446,14 +403,15 @@ impl Account {
             .into_with_config()
             .limit(u64::MAX)
             .reader();
-        let value: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(reader))?;
-        match &value {
-            serde_json::Value::Array(_) => Ok(serde_json::from_value(value)?),
-            serde_json::Value::Object(object) if api_auth_failed(object) => {
-                Err(XtreamError::AuthFailed)
-            }
-            _ => Err(XtreamError::UnexpectedApiReply),
+        let list = player_api::parse_api_list::<R>(reader)?;
+        if list.skipped > 0 {
+            log::warn!(
+                "player API {action}: skipped {} unusable record(s), kept {}",
+                list.skipped,
+                list.records.len()
+            );
         }
+        Ok(list.records)
     }
 
     /// Fetches the live categories (channel groups) from the player API.
@@ -461,9 +419,10 @@ impl Account {
     /// # Errors
     ///
     /// [`XtreamError`] when the request fails, the server answers with a
-    /// non-2xx status, or the reply is not the expected JSON array.
+    /// non-2xx status, or the reply is not a list (a malformed or unusable
+    /// record is skipped, not an error).
     pub fn fetch_live_categories(&self) -> Result<Vec<Category>, XtreamError> {
-        self.fetch_api_list("get_live_categories")
+        self.fetch_api_list::<RawCategory>("get_live_categories")
     }
 
     /// Fetches all live streams from the player API.
@@ -471,9 +430,10 @@ impl Account {
     /// # Errors
     ///
     /// [`XtreamError`] when the request fails, the server answers with a
-    /// non-2xx status, or the reply is not the expected JSON array.
+    /// non-2xx status, or the reply is not a list (a malformed or unusable
+    /// record is skipped, not an error).
     pub fn fetch_live_streams(&self) -> Result<Vec<LiveStream>, XtreamError> {
-        self.fetch_api_list("get_live_streams")
+        self.fetch_api_list::<RawLiveStream>("get_live_streams")
     }
 
     /// Playable URL for a live stream id, in the layout every Xtream
@@ -493,19 +453,6 @@ impl Account {
             utf8_percent_encode(&self.password, NON_ALPHANUMERIC).to_string(),
         )
     }
-}
-
-fn api_auth_failed(object: &serde_json::Map<String, serde_json::Value>) -> bool {
-    let Some(auth) = object
-        .get("user_info")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|user_info| user_info.get("auth"))
-    else {
-        return false;
-    };
-    matches!(auth, serde_json::Value::Bool(false))
-        || auth.as_u64() == Some(0)
-        || auth.as_str() == Some("0")
 }
 
 fn log_redirect(response: &ureq::http::Response<ureq::Body>) {
@@ -783,18 +730,6 @@ mod tests {
     }
 
     #[test]
-    fn player_api_auth_failure_accepts_common_panel_scalar_types() {
-        for auth in [
-            serde_json::Value::Bool(false),
-            serde_json::Value::Number(0.into()),
-            serde_json::Value::String("0".into()),
-        ] {
-            let object = serde_json::json!({"user_info": {"auth": auth}});
-            assert!(api_auth_failed(object.as_object().unwrap()));
-        }
-    }
-
-    #[test]
     fn unexpected_player_api_object_is_not_reported_as_invalid_json() {
         let body = r#"{"error":"maintenance"}"#;
         let (port, server) = serve_once("HTTP/1.1 200 OK", body);
@@ -828,6 +763,19 @@ mod tests {
         assert_eq!(streams[1].epg_channel_id, None);
         assert_eq!(streams[2].name, None);
         assert_eq!(streams[2].category_id, None);
+    }
+
+    #[test]
+    fn live_streams_with_one_bad_record_still_load() {
+        // Regression: one record with a null stream id failed the whole
+        // list, and with it the player-API fallback.
+        let body = r#"[{"name":"One","stream_id":1},{"name":"Bad","stream_id":null},{"name":"Two","stream_id":"2.0"}]"#;
+        let (port, server) = serve_once("HTTP/1.1 200 OK", body);
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let streams = account.fetch_live_streams().unwrap();
+        let _ = server.join();
+        let ids: Vec<u64> = streams.iter().map(LiveStream::stream_id).collect();
+        assert_eq!(ids, [1, 2]);
     }
 
     #[test]
