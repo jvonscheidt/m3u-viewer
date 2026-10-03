@@ -15,7 +15,8 @@ use crate::loader::LoadEvent;
 use crate::playlist::{Channel, GroupId};
 use crate::store::Store;
 
-/// How the current filter text is matched against a channel's search key.
+/// How the current filter text is matched against a channel's name and
+/// group (each on its own — see [`App::matches`]).
 /// Rebuilt by [`App::rebuild_filter_matcher`] whenever the filter text or
 /// the regex-filter setting changes.
 #[derive(Debug)]
@@ -110,11 +111,9 @@ impl PlayRequest {
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub(crate) channels: Vec<Channel>,
-    /// Lowercase "name group" per channel, precomputed so a filter pass
-    /// over a million entries stays within the latency budget.
-    search_keys: Vec<String>,
-    /// Lowercase channel name per channel, cached so sorting never
-    /// re-lowercases a name it has already seen.
+    /// Lowercase channel name per channel, cached so neither sorting nor a
+    /// filter pass over a million entries re-lowercases a name it has
+    /// already seen.
     name_keys: Vec<String>,
     /// All channel indices, sorted alphabetically by name (case
     /// insensitive) and merge-updated as batches arrive — see
@@ -129,6 +128,9 @@ pub struct App {
     sorted_scratch: Vec<usize>,
     filtered_scratch: Vec<usize>,
     pub(crate) groups: Vec<String>,
+    /// Lowercase name per group id (parallel to `groups`), computed once
+    /// per group rather than once per channel in it.
+    group_keys: Vec<String>,
     /// `groups` ids in alphabetical order, for the group popup. Rebuilt
     /// from scratch whenever groups change: the interned group table
     /// stays orders of magnitude smaller than the channel list, so a
@@ -227,12 +229,12 @@ impl App {
     pub fn new(file_name: String, store: Option<Store>) -> Self {
         Self {
             channels: Vec::new(),
-            search_keys: Vec::new(),
             name_keys: Vec::new(),
             sorted_channels: Vec::new(),
             sorted_scratch: Vec::new(),
             filtered_scratch: Vec::new(),
             groups: Vec::new(),
+            group_keys: Vec::new(),
             sorted_groups: Vec::new(),
             filter: String::new(),
             filter_matcher: FilterMatcher::None,
@@ -282,18 +284,16 @@ impl App {
                 percent,
             } => {
                 if !new_groups.is_empty() {
+                    self.group_keys
+                        .extend(new_groups.iter().map(|name| name.to_lowercase()));
                     self.groups.extend(new_groups);
                     self.rebuild_sorted_groups();
                 }
                 self.skipped = skipped;
                 self.percent = percent;
                 let start = self.channels.len();
-                for channel in &channels {
-                    let name_lower = channel.name.to_lowercase();
-                    self.search_keys
-                        .push(self.search_key(&name_lower, channel.group));
-                    self.name_keys.push(name_lower);
-                }
+                self.name_keys
+                    .extend(channels.iter().map(|channel| channel.name.to_lowercase()));
                 self.channels.extend(channels);
                 for index in start..self.channels.len() {
                     self.url_index
@@ -304,10 +304,10 @@ impl App {
             }
             LoadEvent::Reset => {
                 self.channels.clear();
-                self.search_keys.clear();
                 self.name_keys.clear();
                 self.sorted_channels.clear();
                 self.groups.clear();
+                self.group_keys.clear();
                 self.sorted_groups.clear();
                 self.visible_groups.clear();
                 self.group_search.clear();
@@ -777,27 +777,39 @@ impl App {
                 .sorted_groups
                 .iter()
                 .copied()
-                .filter(|&id| self.groups[id].to_lowercase().contains(&needle))
+                .filter(|&id| self.group_keys[id].contains(&needle))
                 .collect();
         }
     }
 
     /// Group restriction and text filter (view membership is handled in
     /// [`Self::recompute_filter`]).
+    ///
+    /// The filter is tried against the channel name and the group name
+    /// separately — a channel matches if either does — so anchors like
+    /// `hd$` apply to each, and no pattern can match across the boundary
+    /// between the two.
     fn matches(&self, index: usize) -> bool {
-        let group_ok = self
-            .group_filter
-            .is_none_or(|id| self.channels[index].group == Some(id));
-        group_ok
-            && match &self.filter_matcher {
-                FilterMatcher::None => true,
-                FilterMatcher::Substring(needle) => self.search_keys[index].contains(needle),
-                FilterMatcher::Regex(re) => re.is_match(&self.search_keys[index]),
+        let group = self.channels[index].group;
+        if self.group_filter.is_some_and(|id| group != Some(id)) {
+            return false;
+        }
+        let name = self.name_keys[index].as_str();
+        let group_key = group.and_then(|id| self.group_keys.get(id));
+        match &self.filter_matcher {
+            FilterMatcher::None => true,
+            FilterMatcher::Substring(needle) => {
+                name.contains(needle.as_str())
+                    || group_key.is_some_and(|key| key.contains(needle.as_str()))
             }
+            FilterMatcher::Regex(re) => {
+                re.is_match(name) || group_key.is_some_and(|key| re.is_match(key))
+            }
+        }
     }
 
     /// Recompiles [`Self::filter_matcher`] from the current filter text and
-    /// `regex_filter` setting. Search keys are already lowercased, so plain
+    /// `regex_filter` setting. Name and group keys are already lowercased, so plain
     /// substring matching stays a lowercase-needle `contains`; regex
     /// patterns are compiled case-insensitively for the same effect. A
     /// pattern that fails to compile — most often because the user is
@@ -817,16 +829,6 @@ impl App {
         } else {
             FilterMatcher::Substring(self.filter.to_lowercase())
         };
-    }
-
-    /// Lowercase haystack for filtering: `name_lower` plus the group name.
-    fn search_key(&self, name_lower: &str, group: Option<GroupId>) -> String {
-        let mut key = name_lower.to_owned();
-        if let Some(name) = group.and_then(|id| self.groups.get(id)) {
-            key.push(' ');
-            key.push_str(&name.to_lowercase());
-        }
-        key
     }
 
     fn move_up(&mut self, by: usize) {
@@ -1386,6 +1388,50 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         assert_eq!(app.filtered, vec![2]);
+    }
+
+    #[test]
+    fn filter_matches_name_and_group_separately() {
+        // Regression: the filter ran over "name group" as one string, so
+        // `$` anchored only at the group's end and patterns could match
+        // across the gap between name and group.
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![
+                channel("Sky HD", Some(0)),
+                channel("BBC News", Some(1)),
+                channel("Arte", Some(2)),
+            ],
+            new_groups: vec!["Movies".into(), "Sports".into(), "Culture HD".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "hd$".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        // Name ending in HD, and group ending in HD.
+        assert_eq!(filtered_names(&app), ["Arte", "Sky HD"]);
+
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "news sports".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(filtered_names(&app), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn substring_filter_also_matches_name_and_group_separately() {
+        let mut app = loaded_app();
+        app.set_regex_filter(false);
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "news news".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        // "BBC News" in group "News" used to match as "bbc news news".
+        assert_eq!(app.filtered, Vec::<usize>::new());
     }
 
     #[test]
