@@ -47,6 +47,32 @@ pub enum EpgError {
     /// The request itself failed (DNS, connect, TLS, …).
     #[error("request failed: {0}")]
     Http(#[from] Box<ureq::Error>),
+    /// `error` happened after a redirect had taken the request to another
+    /// host (`to` is its `scheme://host[:port]`).
+    #[error("redirected to {to}, a different host — {hint}; then {error}", hint = crate::http::DIVERTED_HINT)]
+    Redirected {
+        /// Where the redirect led.
+        to: String,
+        /// What then went wrong there.
+        #[source]
+        error: Box<EpgError>,
+    },
+}
+
+impl From<crate::http::GetError> for EpgError {
+    fn from(error: crate::http::GetError) -> Self {
+        let base = match error.kind {
+            crate::http::GetErrorKind::Status(code) => Self::Status(code),
+            crate::http::GetErrorKind::Request(error) => Self::Http(error),
+        };
+        match error.diverted_to {
+            Some(to) => Self::Redirected {
+                to,
+                error: Box::new(base),
+            },
+            None => base,
+        }
+    }
 }
 
 /// One programme (a scheduled broadcast) on one channel.
@@ -513,20 +539,9 @@ fn load(
     let reader: Box<dyn BufRead> = match source {
         EpgSource::File(path) => Box::new(BufReader::new(File::open(path)?)),
         EpgSource::Url(url) => {
-            let mut request = http_agent(timeouts).get(url);
-            if let Some(user_agent) = user_agent {
-                request = request.header("User-Agent", user_agent);
-            }
-            let response = match request.call() {
-                Ok(response) => response,
-                Err(ureq::Error::StatusCode(code)) => return Err(EpgError::Status(code)),
-                Err(other) => return Err(EpgError::Http(Box::new(other))),
-            };
-            // Panels answer with custom non-2xx codes that ureq lets
-            // through; those must not be parsed as XML.
-            if !response.status().is_success() {
-                return Err(EpgError::Status(response.status().as_u16()));
-            }
+            // Non-2xx replies (panels use custom codes ureq lets through)
+            // are errors, so they are never parsed as XML.
+            let response = crate::http::get(&http_agent(timeouts), url, user_agent)?;
             // Unlimited body: full guides routinely exceed ureq's 10 MB
             // default.
             Box::new(BufReader::new(
@@ -898,6 +913,47 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(5));
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn diverted_epg_request_error_names_the_new_host() {
+        // Regression: like the playlist, a guide URL diverted to another
+        // host failed with no hint that it never reached the provider.
+        use crate::xtream::test_server::{FAST, serve};
+        use std::time::Duration;
+
+        let (target, target_server) = serve(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".into(),
+            vec![],
+            Duration::ZERO,
+        );
+        let (start, start_server) = serve(
+            format!(
+                "HTTP/1.1 301 Moved Permanently\r\nlocation: \
+                 http://localhost:{target}//n\r\ncontent-length: 0\r\n\r\n"
+            ),
+            vec![],
+            Duration::ZERO,
+        );
+        let source = EpgSource::Url(format!("http://127.0.0.1:{start}/xmltv.php"));
+        let error = load(&source, None, NOW, FAST).unwrap_err();
+        assert!(
+            matches!(&error, EpgError::Redirected { error, .. } if matches!(**error, EpgError::Status(503))),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "redirected to http://localhost:{target}, a different host"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("DNS filtering or DNS spoofing"),
+            "{message}"
+        );
+        start_server.join().unwrap();
+        target_server.join().unwrap();
     }
 
     #[test]
