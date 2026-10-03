@@ -527,28 +527,29 @@ fn programme_from_attrs(
 }
 
 /// Decodes an XMLTV timestamp — `YYYYMMDDHHMMSS ±HHMM`, where seconds and
-/// the offset may be omitted; a missing offset is read as UTC — into Unix
+/// the offset may be omitted, and the space before the offset too
+/// (`20240101120000+0100`); a missing offset is read as UTC — into Unix
 /// seconds. `None` for anything malformed (the programme is skipped).
 fn parse_xmltv_time(value: &str) -> Option<i64> {
     let value = value.trim();
-    let (digits, offset) = match value.split_once(' ') {
-        Some((digits, offset)) => (digits, Some(offset.trim())),
-        None => (value, None),
-    };
-    if !matches!(digits.len(), 12 | 14) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let digits_end = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, offset) = value.split_at(digits_end);
+    if !matches!(digits.len(), 12 | 14) {
         return None;
     }
     let mut padded = digits.to_owned();
     while padded.len() < 14 {
         padded.push('0');
     }
-    match offset {
-        Some(offset) => DateTime::parse_from_str(&format!("{padded} {offset}"), "%Y%m%d%H%M%S %z")
-            .ok()
-            .map(|time| time.timestamp()),
-        None => NaiveDateTime::parse_from_str(&padded, "%Y%m%d%H%M%S")
+    match offset.trim_start() {
+        "" => NaiveDateTime::parse_from_str(&padded, "%Y%m%d%H%M%S")
             .ok()
             .map(|naive| Utc.from_utc_datetime(&naive).timestamp()),
+        offset => DateTime::parse_from_str(&format!("{padded} {offset}"), "%Y%m%d%H%M%S %z")
+            .ok()
+            .map(|time| time.timestamp()),
     }
 }
 
@@ -1014,6 +1015,49 @@ mod tests {
         assert_eq!(parse_xmltv_time(""), None);
         assert_eq!(parse_xmltv_time("20260705"), None);
         assert_eq!(parse_xmltv_time("2026070510000"), None);
+    }
+
+    #[test]
+    fn timestamps_accept_an_offset_without_a_space() {
+        // Regression: only "digits offset" split on a space was accepted,
+        // so feeds writing "20240101120000+0100" lost every programme.
+        let spaced = parse_xmltv_time("20240101120000 +0100");
+        assert!(spaced.is_some());
+        assert_eq!(parse_xmltv_time("20240101120000+0100"), spaced);
+        assert_eq!(parse_xmltv_time("202401011200+0100"), spaced);
+        assert_eq!(
+            parse_xmltv_time("20240101110000-0000"),
+            parse_xmltv_time("20240101110000")
+        );
+        for garbage in [
+            "20240101120000+01",
+            "20240101120000+0100x",
+            "20240101120000 +0100 junk",
+            "20240101120000x",
+            "2024010112000+0100",
+            "+0100",
+            "20241301120000+0100",
+        ] {
+            assert_eq!(parse_xmltv_time(garbage), None, "{garbage}");
+        }
+    }
+
+    #[test]
+    fn programmes_with_unspaced_offsets_are_kept() {
+        let at = |hours_from_now: i64| {
+            DateTime::from_timestamp(NOW + hours(hours_from_now), 0)
+                .unwrap()
+                .format("%Y%m%d%H%M%S+0000")
+                .to_string()
+        };
+        let xml = format!(
+            r#"<tv><programme start="{}" stop="{}" channel="one.tv"><title>Unspaced</title></programme></tv>"#,
+            at(-1),
+            at(1),
+        );
+        let guide = parse(&xml);
+        let (current, _) = guide.now_next(Some("one.tv"), "x", NOW);
+        assert_eq!(current.unwrap().title, "Unspaced");
     }
 
     #[test]
