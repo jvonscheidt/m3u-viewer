@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use thiserror::Error;
-use ureq::ResponseExt as _;
 
 use player_api::{RawCategory, RawLiveStream, RawRecord};
 
@@ -81,8 +80,9 @@ impl HttpTimeouts {
 }
 
 /// Builds the HTTP agent used for all downloads, configured with
-/// `timeouts` (see [`HttpTimeouts`] for how they map onto ureq). Up to 3
-/// redirects are followed and recorded so they can be logged.
+/// `timeouts` (see [`HttpTimeouts`] for how they map onto ureq). It does
+/// not follow redirects: [`crate::http::get`] does, so a failure can name
+/// the host a redirect led to.
 pub(crate) fn http_agent(timeouts: HttpTimeouts) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_resolve(Some(timeouts.connect))
@@ -91,9 +91,7 @@ pub(crate) fn http_agent(timeouts: HttpTimeouts) -> ureq::Agent {
         .timeout_recv_response(None)
         .timeout_recv_body(Some(timeouts.idle))
         .timeout_global(timeouts.total)
-        .max_redirects(3)
-        .max_redirects_will_error(true)
-        .save_redirect_history(true)
+        .max_redirects(0)
         .build();
     ureq::Agent::new_with_config(config)
 }
@@ -116,6 +114,32 @@ pub enum XtreamError {
     /// The player API returned valid JSON, but not the requested list.
     #[error("player API returned an unexpected reply instead of a channel list")]
     UnexpectedApiReply,
+    /// `error` happened after a redirect had taken the request to another
+    /// host (`to` is its `scheme://host[:port]`).
+    #[error("redirected to {to}, a different host — {hint}; then {error}", hint = crate::http::DIVERTED_HINT)]
+    Redirected {
+        /// Where the redirect led.
+        to: String,
+        /// What then went wrong there.
+        #[source]
+        error: Box<XtreamError>,
+    },
+}
+
+impl From<crate::http::GetError> for XtreamError {
+    fn from(error: crate::http::GetError) -> Self {
+        let base = match error.kind {
+            crate::http::GetErrorKind::Status(code) => Self::Status(code),
+            crate::http::GetErrorKind::Request(error) => Self::Http(error),
+        };
+        match error.diverted_to {
+            Some(to) => Self::Redirected {
+                to,
+                error: Box::new(base),
+            },
+            None => base,
+        }
+    }
 }
 
 /// One live category from `player_api.php?action=get_live_categories`.
@@ -319,23 +343,12 @@ impl Account {
     /// response only when it is a 2xx. Timeouts come from the agent (see
     /// [`HttpTimeouts`]): no per-request cap, since a fixed one would cut
     /// off big playlists and stream lists on slow links.
-    fn request(&self, url: String) -> Result<ureq::http::Response<ureq::Body>, XtreamError> {
-        let mut request = self.agent.get(url);
-        if let Some(ref user_agent) = self.user_agent {
-            request = request.header("User-Agent", user_agent);
-        }
-        let response = match request.call() {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(code)) => return Err(XtreamError::Status(code)),
-            Err(other) => return Err(XtreamError::Http(Box::new(other))),
-        };
-        // ureq only turns 4xx/5xx into errors; panels answer with custom
-        // codes like 884, which must not pass for success either.
-        if !response.status().is_success() {
-            return Err(XtreamError::Status(response.status().as_u16()));
-        }
-        log_redirect(&response);
-        Ok(response)
+    fn request(&self, url: &str) -> Result<ureq::http::Response<ureq::Body>, XtreamError> {
+        Ok(crate::http::get(
+            &self.agent,
+            url,
+            self.user_agent.as_deref(),
+        )?)
     }
 
     /// Requests the playlist, returning a streaming body reader and the
@@ -347,7 +360,7 @@ impl Account {
     /// [`XtreamError::Status`] for a non-success HTTP response,
     /// [`XtreamError::Http`] when the request cannot be made at all.
     pub fn fetch(&self) -> Result<(impl Read + use<>, Option<u64>), XtreamError> {
-        let response = self.request(self.playlist_url())?;
+        let response = self.request(&self.playlist_url())?;
         let total = response
             .headers()
             .get("content-length")
@@ -395,7 +408,7 @@ impl Account {
     /// are parsed one by one; unusable ones are skipped and their count
     /// logged, so one bad entry does not cost the whole list.
     fn fetch_api_list<R: RawRecord>(&self, action: &str) -> Result<Vec<R::Record>, XtreamError> {
-        let response = self.request(self.api_url(action))?;
+        let response = self.request(&self.api_url(action))?;
         // Unlimited body: full stream lists routinely exceed ureq's
         // 10 MB default (55k streams ≈ 20 MB of JSON).
         let reader = response
@@ -453,25 +466,6 @@ impl Account {
             utf8_percent_encode(&self.password, NON_ALPHANUMERIC).to_string(),
         )
     }
-}
-
-fn log_redirect(response: &ureq::http::Response<ureq::Body>) {
-    let Some(history) = response.get_redirect_history() else {
-        return;
-    };
-    if history.is_empty() {
-        return;
-    }
-    let final_uri = response.get_uri();
-    let destination = match (final_uri.scheme_str(), final_uri.authority()) {
-        (Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
-        (_, Some(authority)) => authority.to_string(),
-        _ => "<relative URI>".to_owned(),
-    };
-    log::warn!(
-        "xtream request followed {} redirect(s) to {destination}",
-        history.len()
-    );
 }
 
 /// Scripted local HTTP server for the timeout tests here and in
@@ -821,6 +815,55 @@ mod tests {
                 .to_string()
                 .contains("check server URL and credentials")
         );
+        let _ = server.join();
+    }
+
+    #[test]
+    fn diverted_request_error_names_the_new_host_and_dns_filtering() {
+        // Regression: a provider domain diverted by DNS to another host
+        // (whose certificate then failed) read as a bare "certificate
+        // expired", with nothing pointing at the redirect.
+        let (target, target_server) = serve(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".into(),
+            vec![],
+            Duration::ZERO,
+        );
+        let (start, start_server) = serve(
+            format!(
+                "HTTP/1.1 301 Moved Permanently\r\nlocation: \
+                 http://localhost:{target}//n?password=secret\r\ncontent-length: 0\r\n\r\n"
+            ),
+            vec![],
+            Duration::ZERO,
+        );
+        let account = Account::new(&format!("127.0.0.1:{start}"), "u".into(), "secret".into())
+            .with_timeouts(FAST);
+        let message = account.fetch().err().unwrap().to_string();
+        // The agent keeps the redirect's connection pooled; the scripted
+        // servers only finish once it is closed.
+        drop(account);
+        assert!(
+            message.contains(&format!(
+                "redirected to http://localhost:{target}, a different host"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("DNS filtering or DNS spoofing"),
+            "{message}"
+        );
+        assert!(message.contains("HTTP 503"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+        start_server.join().unwrap();
+        target_server.join().unwrap();
+    }
+
+    #[test]
+    fn same_host_failure_has_no_diversion_hint() {
+        let (port, server) = serve_once("HTTP/1.1 401 Unauthorized", "");
+        let account = Account::new(&format!("127.0.0.1:{port}"), "u".into(), "p".into());
+        let message = account.fetch().err().unwrap().to_string();
+        assert!(!message.contains("redirect"), "{message}");
         let _ = server.join();
     }
 

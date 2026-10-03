@@ -34,4 +34,5 @@ pub mod xtream;
 
 // Persistence implementation details are intentionally not public API.
 mod cache;
+mod http;
 mod private_file;
