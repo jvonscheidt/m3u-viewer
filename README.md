@@ -63,9 +63,14 @@ m3u-viewer --version
   arrives. If the provider has disabled the M3U download (some panels
   block `get.php` entirely), the live channel list is fetched through
   the Xtream player API (`player_api.php`) instead, with categories as
-  groups. Slow downloads are never cut off while data keeps arriving;
-  a server that stops sending for 30 s fails the load. Note that the
-  credentials are visible in your shell history and process list.
+  groups; entries the panel sends incomplete (no usable stream id, nulls)
+  are skipped and counted in the log rather than failing the whole list.
+  Slow downloads are never cut off while data keeps arriving; a server
+  that stops sending for 30 s fails the load. If a download fails after
+  the server redirected it to a different host, the error names that
+  host — usually a sign of DNS filtering or spoofing on your network.
+  Note that the credentials are visible in your shell history and
+  process list.
 - `--epg <url-or-file>` — load an [XMLTV](https://wiki.xmltv.org)
   programme guide (plain or gzipped) and show what's airing now and
   next. Usually unnecessary: playlists that name a guide in their
@@ -115,9 +120,11 @@ now/next with times for the selected channel:
 
 Channels are matched by `tvg-id`, falling back to the channel name.
 The guide loads in the background (`epg…` in the status bar; `epg ✗`
-plus a log entry if it fails) and never blocks browsing. Only a
-12-hour window around "now" is kept, so even multi-day guides for
-huge playlists stay cheap. `e` hides/shows the EPG display.
+plus a log entry if it fails) and never blocks browsing. Broken markup
+or a download that breaks off midway keeps every programme read up to
+that point. Only a 12-hour window around "now" is kept, so even
+multi-day guides for huge playlists stay cheap. `e` hides/shows the EPG
+display.
 
 ### Filtering
 
@@ -233,6 +240,19 @@ directory just makes the next launch download the playlist live.
 - Network timeouts (since 0.9.1): 10 s to connect, 60 s for the server to
   start answering, and 30 s without data mid-download; a download that
   keeps progressing is never cut off (1 h hard cap).
+- Player API (since 0.9.2): lists are parsed record by record and
+  streamed rather than built as one JSON tree; records without a usable
+  id are skipped and counted, and lists keyed by id instead of arrays
+  are accepted.
+- Redirects (since 0.9.2): up to 3 are followed, each logged by scheme
+  and host only. When one leads to a different host and the request then
+  fails, the error leads with that host and a hint that DNS filtering or
+  spoofing is the likely cause.
+- Failures stay visible and non-fatal (since 0.9.2): a loader or EPG
+  thread that dies is reported instead of leaving "loading" on screen;
+  a missing console is an error message, not a crash; log problems never
+  stop the viewer; and the UI keeps responding during huge loads (each
+  frame applies only a bounded slice of the incoming batches).
 - Parsing runs on a background thread; the UI appears immediately and fills
   in as entries stream in, with a progress indicator until the file is
   fully loaded.
@@ -257,6 +277,9 @@ directory just makes the next launch download the playlist live.
   `PgUp`/`PgDn`/`Home`/`End` page through it, for accounts with hundreds
   of groups.
 - Filter and group restriction combine (AND).
+- Load errors and warnings (since 0.9.2) show in a band above the status
+  bar, word-wrapped over up to three rows; longer text ends in
+  "… (see log)". The status bar keeps counts, tags, and key hints.
 
 #### Programme guide (EPG, since 0.6.0)
 
@@ -276,6 +299,11 @@ directory just makes the next launch download the playlist live.
 - Encoding (since 0.9.1): feeds declaring ISO-8859-1 / Latin-1 /
   Windows-1252 are decoded as Windows-1252; otherwise UTF-8, with an
   invalid byte replaced rather than discarding the whole guide.
+- Tolerance (since 0.9.2): mismatched or unclosed tags and bare `&` are
+  accepted, a truncated document keeps everything parsed before the cut,
+  concatenated (multi-member) gzip feeds are read in full, and
+  timestamps may omit the space before the offset
+  (`20240101120000+0100`).
 - `e` toggles the EPG display without discarding the loaded guide.
 
 #### Playback (VLC)
