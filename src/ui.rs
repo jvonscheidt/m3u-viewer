@@ -179,6 +179,12 @@ fn draw_epg_bar(frame: &mut Frame, area: Rect, programmes: Option<ProgrammePair<
 }
 
 /// One-line status bar; doubles as the filter input line in filter mode.
+///
+/// A load error is shown as one segment among the rest rather than in
+/// place of it, so view, filter and group state stay visible after a
+/// failed load. The transient message comes first: it answers the key the
+/// user just pressed (e.g. "vlc not found"), so it must not be the part a
+/// long error pushes off the edge of a narrow terminal.
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let line = if app.mode == Mode::Filter {
         let mut spans = vec![
@@ -196,8 +202,6 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         }
         spans.push(Span::raw("  (Enter apply · Esc clear)"));
         Line::from(spans)
-    } else if let Some(error) = &app.error {
-        Line::from(Span::styled(format!("error: {error}"), Style::new().red()))
     } else {
         let mut spans = vec![Span::styled(
             format!(
@@ -220,6 +224,18 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
                 .percent
                 .map_or_else(|| "  loading…".to_owned(), |p| format!("  loading {p}%"));
             spans.push(Span::styled(progress, Style::new().yellow()));
+        }
+        if let Some(message) = &app.message {
+            spans.push(Span::styled(
+                format!("  {message}"),
+                Style::new().yellow().bold(),
+            ));
+        }
+        if let Some(error) = &app.error {
+            spans.push(Span::styled(
+                format!("  error: {error}"),
+                Style::new().red(),
+            ));
         }
         if let Some(warning) = &app.warning {
             spans.push(Span::styled(
@@ -247,12 +263,6 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
                 ""
             };
             spans.push(Span::raw(format!("  filter:{}{tag}", app.filter)));
-        }
-        if let Some(message) = &app.message {
-            spans.push(Span::styled(
-                format!("  {message}"),
-                Style::new().yellow().bold(),
-            ));
         }
         spans.push(Span::styled(
             "  (/ filter · g groups · ? help · q quit)",
@@ -401,6 +411,30 @@ mod tests {
         let screen = render(&mut app);
         assert!(screen.contains("3/3 channels"));
         assert!(screen.contains("⚠ showing cached playlist"));
+    }
+
+    #[test]
+    fn load_error_does_not_hide_playback_feedback_or_state() {
+        // Regression: once `error` was set the status bar showed nothing
+        // else — no playback message, group/filter tags, counts or hints.
+        let mut app = app_with_channels(3);
+        app.on_load_event(LoadEvent::Failed("boom".into()));
+        app.group_filter = Some(0);
+        app.set_message("✗ vlc not found".into());
+        let screen = render(&mut app);
+        assert!(screen.contains("3/3 channels"), "screen: {screen}");
+        assert!(screen.contains("✗ vlc not found"), "screen: {screen}");
+        assert!(screen.contains("error: boom"), "screen: {screen}");
+        assert!(screen.contains("group:News"), "screen: {screen}");
+    }
+
+    #[test]
+    fn load_error_status_keeps_the_key_hints() {
+        let mut app = app_with_channels(3);
+        app.on_load_event(LoadEvent::Failed("boom".into()));
+        let screen = render(&mut app);
+        assert!(screen.contains("error: boom"), "screen: {screen}");
+        assert!(screen.contains("? help"), "screen: {screen}");
     }
 
     #[test]
