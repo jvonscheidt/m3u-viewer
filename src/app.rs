@@ -5,7 +5,9 @@
 //! binary's event loop feeds keys and [`LoadEvent`]s in here.
 
 use std::collections::HashMap;
+use std::collections::hash_map::{Entry, RandomState};
 use std::fmt;
+use std::hash::BuildHasher;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
@@ -190,7 +192,7 @@ pub struct App {
     /// config directory (the features degrade to a status message).
     pub(crate) store: Option<Store>,
     /// First channel index per URL, for resolving recents to rows.
-    url_index: HashMap<String, usize>,
+    url_index: UrlIndex,
     play_request: Option<PlayRequest>,
     /// Programme guide, once an EPG source was found and loaded.
     pub(crate) epg: EpgState,
@@ -259,7 +261,7 @@ impl App {
             message: None,
             view: View::All,
             store,
-            url_index: HashMap::new(),
+            url_index: UrlIndex::default(),
             play_request: None,
             epg: EpgState::Absent,
             epg_visible: true,
@@ -296,9 +298,7 @@ impl App {
                     .extend(channels.iter().map(|channel| channel.name.to_lowercase()));
                 self.channels.extend(channels);
                 for index in start..self.channels.len() {
-                    self.url_index
-                        .entry(self.channels[index].url.clone())
-                        .or_insert(index);
+                    self.url_index.insert(&self.channels, index);
                 }
                 self.absorb_channels(start);
             }
@@ -675,7 +675,7 @@ impl App {
             (View::Recents, Some(store)) => store
                 .recents()
                 .iter()
-                .filter_map(|url| self.url_index.get(url).copied())
+                .filter_map(|url| self.url_index.get(&self.channels, url))
                 .filter(|&index| self.matches(index))
                 .collect(),
             (View::All, _) => self
@@ -900,6 +900,55 @@ impl App {
     }
 }
 
+/// Maps each distinct channel URL to the first channel index carrying it.
+///
+/// Keyed by a hash of the URL rather than the URL itself, so the index
+/// holds no second copy of every URL (around 100 MB at a million
+/// channels); the URL is read back from the channel list to confirm a
+/// hit. The rare URL whose hash collides with a different URL's goes to a
+/// small side table keyed by the full string, so collisions cost memory,
+/// never correctness.
+#[derive(Debug, Default)]
+struct UrlIndex<S = RandomState> {
+    hasher: S,
+    by_hash: HashMap<u64, usize>,
+    collisions: HashMap<String, usize>,
+}
+
+impl<S: BuildHasher> UrlIndex<S> {
+    /// Records `channels[index]`, unless its URL is already indexed.
+    fn insert(&mut self, channels: &[Channel], index: usize) {
+        let url = &channels[index].url;
+        match self.by_hash.entry(self.hasher.hash_one(url)) {
+            Entry::Vacant(slot) => {
+                slot.insert(index);
+            }
+            Entry::Occupied(slot) => {
+                if channels[*slot.get()].url != *url {
+                    // A genuine 64-bit hash collision between distinct
+                    // URLs: the only case that stores a copy of the URL.
+                    self.collisions.entry(url.clone()).or_insert(index);
+                }
+            }
+        }
+    }
+
+    /// First channel index whose URL is `url`.
+    fn get(&self, channels: &[Channel], url: &str) -> Option<usize> {
+        let &index = self.by_hash.get(&self.hasher.hash_one(url))?;
+        if channels[index].url == url {
+            Some(index)
+        } else {
+            self.collisions.get(url).copied()
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_hash.clear();
+        self.collisions.clear();
+    }
+}
+
 /// Merges two channel-index lists, each already sorted by `keys[index]`,
 /// into `out` — the linear-time counterpart to re-sorting the
 /// concatenation, used to fold a newly arrived batch into a running
@@ -981,6 +1030,49 @@ mod tests {
         });
         app.on_load_event(LoadEvent::Finished);
         app
+    }
+
+    /// Hashes everything to the same value, forcing every distinct URL
+    /// into a hash collision.
+    #[derive(Default)]
+    struct CollidingHasher;
+
+    impl std::hash::Hasher for CollidingHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _bytes: &[u8]) {}
+    }
+
+    #[test]
+    fn url_index_resolves_urls_despite_hash_collisions() {
+        let channels = vec![
+            channel("A", None),
+            channel("B", None),
+            channel("A", None), // duplicate URL: first index wins
+            channel("C", None),
+        ];
+        let mut index = UrlIndex::<std::hash::BuildHasherDefault<CollidingHasher>>::default();
+        for i in 0..channels.len() {
+            index.insert(&channels, i);
+        }
+        assert_eq!(index.get(&channels, "http://example.com/A"), Some(0));
+        assert_eq!(index.get(&channels, "http://example.com/B"), Some(1));
+        assert_eq!(index.get(&channels, "http://example.com/C"), Some(3));
+        assert_eq!(index.get(&channels, "http://example.com/D"), None);
+        index.clear();
+        assert_eq!(index.get(&channels, "http://example.com/A"), None);
+    }
+
+    #[test]
+    fn url_index_keeps_the_first_of_duplicate_urls() {
+        let channels = vec![channel("A", None), channel("A", None)];
+        let mut index = UrlIndex::<RandomState>::default();
+        index.insert(&channels, 0);
+        index.insert(&channels, 1);
+        assert_eq!(index.get(&channels, "http://example.com/A"), Some(0));
+        assert_eq!(index.get(&channels, "http://example.com/B"), None);
     }
 
     #[test]
