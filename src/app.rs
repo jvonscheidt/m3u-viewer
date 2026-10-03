@@ -492,7 +492,7 @@ impl App {
             KeyCode::Esc => {
                 self.filter.clear();
                 self.group_filter = None;
-                self.recompute_filter();
+                self.filter_changed();
             }
             KeyCode::Up => self.move_up(1),
             KeyCode::Down => self.move_down(1),
@@ -516,16 +516,16 @@ impl App {
             KeyCode::Esc => {
                 self.filter.clear();
                 self.mode = Mode::Normal;
-                self.recompute_filter();
+                self.filter_changed();
             }
             KeyCode::Enter => self.mode = Mode::Normal,
             KeyCode::Backspace => {
                 self.filter.pop();
-                self.recompute_filter();
+                self.filter_changed();
             }
             KeyCode::Char(c) if is_text_input(c, key.modifiers) => {
                 self.filter.push(c);
-                self.recompute_filter();
+                self.filter_changed();
             }
             _ => {}
         }
@@ -648,20 +648,27 @@ impl App {
             self.filter.clear();
             self.group_filter = None;
         }
-        self.recompute_filter();
+        self.filter_changed();
     }
 
     /// Switches between regex and plain substring filtering (mirrors
     /// [`crate::config::Config::regex_filter`]) and re-applies the filter.
     pub fn set_regex_filter(&mut self, enabled: bool) {
         self.regex_filter = enabled;
+        self.filter_changed();
+    }
+
+    /// Recompiles the matcher for a changed filter text or mode, then
+    /// re-applies it. The only place the matcher is rebuilt, so a regex is
+    /// compiled once per edit rather than once per list rebuild or batch.
+    fn filter_changed(&mut self) {
+        self.rebuild_filter_matcher();
         self.recompute_filter();
     }
 
-    /// Rebuilds the filtered index list from scratch and clamps the
-    /// selection.
+    /// Rebuilds the filtered index list from scratch with the current
+    /// matcher and clamps the selection.
     fn recompute_filter(&mut self) {
-        self.rebuild_filter_matcher();
         self.filtered = match (self.view, &self.store) {
             // Recents ordering comes from the store (newest first), not
             // alphabetically.
@@ -692,9 +699,8 @@ impl App {
         self.clamp_selection();
     }
 
-    /// Merge-updates [`Self::sorted_channels`] (and, for the "all
-    /// channels" view, [`Self::filtered`]) with the channels appended at
-    /// `start..self.channels.len()`.
+    /// Merge-updates [`Self::sorted_channels`] and [`Self::filtered`] with
+    /// the channels appended at `start..self.channels.len()`.
     ///
     /// The new slice is sorted once (cheap: one batch) and merged into
     /// the already-sorted running lists in a single linear pass, so
@@ -721,23 +727,36 @@ impl App {
             &self.name_keys,
         );
         std::mem::swap(&mut self.sorted_channels, &mut self.sorted_scratch);
-        if self.view == View::All {
-            let matching: Vec<usize> = new_indices
-                .iter()
-                .copied()
-                .filter(|&index| self.matches(index))
-                .collect();
-            merge_by_key_into(
-                &mut self.filtered_scratch,
-                &self.filtered,
-                &matching,
-                &self.name_keys,
-            );
-            std::mem::swap(&mut self.filtered, &mut self.filtered_scratch);
-        } else {
-            // Favorites/recents views need the store checks and (for
-            // recents) store-defined ordering.
-            self.recompute_filter();
+        match (self.view, &self.store) {
+            // Store-defined (newest first) order, not alphabetical; the
+            // rebuild walks at most RECENTS_CAP entries, so it stays cheap
+            // no matter how large the playlist grows.
+            (View::Recents, Some(_)) => self.recompute_filter(),
+            // Only the new batch can add rows: the alphabetical views
+            // filter just those and merge them in, instead of re-checking
+            // (and, for favorites, re-hashing the URL of) every channel
+            // already loaded on each batch.
+            (View::All, _) | (View::Favorites, Some(_)) => {
+                let favorites_only = self.store.as_ref().filter(|_| self.view == View::Favorites);
+                let matching: Vec<usize> = new_indices
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        favorites_only
+                            .is_none_or(|store| store.is_favorite(&self.channels[index].url))
+                            && self.matches(index)
+                    })
+                    .collect();
+                merge_by_key_into(
+                    &mut self.filtered_scratch,
+                    &self.filtered,
+                    &matching,
+                    &self.name_keys,
+                );
+                std::mem::swap(&mut self.filtered, &mut self.filtered_scratch);
+            }
+            // A storeless favorites/recents view stays empty.
+            (View::Favorites | View::Recents, None) => {}
         }
         if let Some(selected_channel) = selected_channel
             && let Some(position) = self
@@ -1131,6 +1150,64 @@ mod tests {
         app.handle_key(key(KeyCode::Char('f')));
         app.handle_key(key(KeyCode::Char('F')));
         assert_eq!(app.view, View::Favorites);
+        assert_eq!(filtered_names(&app), ["apple", "Zebra"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn favorites_view_absorbs_streamed_batches_incrementally() {
+        let (mut store, dir) = temp_store("fav-stream");
+        for name in ["Zebra", "apple", "Kiwi"] {
+            store
+                .toggle_favorite(&format!("http://example.com/{name}"))
+                .unwrap();
+        }
+        let mut app = App::new("test.m3u".into(), Some(store));
+        app.handle_key(key(KeyCode::Char('F')));
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('e'))); // "Zebra", "apple"
+        app.handle_key(key(KeyCode::Enter));
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Zebra", None), channel("Mango", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![
+                channel("apple", None),
+                channel("Kiwi", None),
+                channel("Melon", None),
+            ],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(filtered_names(&app), ["apple", "Zebra"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recents_view_picks_up_channels_from_later_batches() {
+        let (mut store, dir) = temp_store("rec-stream");
+        store.push_recent("http://example.com/Zebra").unwrap();
+        store.push_recent("http://example.com/apple").unwrap();
+        let mut app = App::new("test.m3u".into(), Some(store));
+        app.handle_key(key(KeyCode::Char('R')));
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Zebra", None), channel("Mango", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(50),
+        });
+        assert_eq!(filtered_names(&app), ["Zebra"]);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("apple", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        // Newest first, not alphabetical.
         assert_eq!(filtered_names(&app), ["apple", "Zebra"]);
         let _ = std::fs::remove_dir_all(dir);
     }
