@@ -5,9 +5,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table};
 
-use crate::app::{App, EpgState, Mode, View};
+use crate::app::{App, EpgState, MAX_NOTICE_ROWS, Mode, View};
 use crate::epg::{Programme, format_time};
 
 type ProgrammePair<'a> = (Option<&'a Programme>, Option<&'a Programme>);
@@ -21,22 +21,24 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// against a fixed clock).
 fn draw_at(frame: &mut Frame, app: &App, now: i64) {
     let selected_programmes = selected_programmes(app, now);
-    if app.visible_guide().is_some() {
-        let [list_area, epg_area, status_area] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
-        draw_channels(frame, list_area, app, now, selected_programmes);
+    let notice = notice_lines(app, usize::from(frame.area().width));
+    let notice_rows = u16::try_from(notice.len()).unwrap_or(u16::MAX);
+    let epg_rows = u16::from(app.visible_guide().is_some());
+    let [list_area, epg_area, notice_area, status_area] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(epg_rows),
+        Constraint::Length(notice_rows),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    draw_channels(frame, list_area, app, now, selected_programmes);
+    if epg_rows > 0 {
         draw_epg_bar(frame, epg_area, selected_programmes);
-        draw_status(frame, status_area, app);
-    } else {
-        let [list_area, status_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-        draw_channels(frame, list_area, app, now, selected_programmes);
-        draw_status(frame, status_area, app);
     }
+    if !notice.is_empty() {
+        frame.render_widget(Paragraph::new(notice), notice_area);
+    }
+    draw_status(frame, status_area, app);
     match app.mode {
         Mode::Groups | Mode::GroupSearch => draw_group_popup(frame, app),
         Mode::Help => draw_help_popup(frame),
@@ -99,7 +101,10 @@ fn draw_channels(
             } else {
                 Style::new()
             };
-            let mut cells = vec![format!("{star}{}", channel.name)];
+            let mut cells = vec![Cell::from(Line::from(vec![
+                Span::raw(star),
+                Span::raw(channel.name.as_str()),
+            ]))];
             if let Some(guide) = guide {
                 let current = if app.offset + row == app.selected {
                     selected_programmes.and_then(|(current, _)| current)
@@ -108,10 +113,11 @@ fn draw_channels(
                         .now_next(channel.tvg_id.as_deref(), &channel.name, now)
                         .0
                 };
-                let airing = current.map_or_else(String::new, |programme| programme.title.clone());
-                cells.push(airing);
+                cells.push(Cell::from(
+                    current.map_or("", |programme| programme.title.as_str()),
+                ));
             }
-            cells.push(group.to_owned());
+            cells.push(Cell::from(group));
             Row::new(cells).style(row_style)
         });
     // With a guide, the freed-up width goes to a "now playing" column.
@@ -163,7 +169,7 @@ fn draw_epg_bar(frame: &mut Frame, area: Rect, programmes: Option<ProgrammePair<
             ),
             Style::new().dim(),
         ));
-        spans.push(Span::raw(programme.title.clone()));
+        spans.push(Span::raw(programme.title.as_str()));
     }
     if let Some(programme) = next {
         if current.is_some() {
@@ -173,17 +179,23 @@ fn draw_epg_bar(frame: &mut Frame, area: Rect, programmes: Option<ProgrammePair<
             format!("next {} ", format_time(programme.start)),
             Style::new().dim(),
         ));
-        spans.push(Span::raw(programme.title.clone()));
+        spans.push(Span::raw(programme.title.as_str()));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// One-line status bar; doubles as the filter input line in filter mode.
+///
+/// A load error is shown as one segment among the rest rather than in
+/// place of it, so view, filter and group state stay visible after a
+/// failed load. The transient message comes first: it answers the key the
+/// user just pressed (e.g. "vlc not found"), so it must not be the part a
+/// long error pushes off the edge of a narrow terminal.
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let line = if app.mode == Mode::Filter {
         let mut spans = vec![
             Span::raw("/"),
-            Span::raw(app.filter.clone()),
+            Span::raw(app.filter.as_str()),
             Span::styled("█", Style::new().dim()),
         ];
         if app.filter_regex_invalid() {
@@ -196,8 +208,6 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         }
         spans.push(Span::raw("  (Enter apply · Esc clear)"));
         Line::from(spans)
-    } else if let Some(error) = &app.error {
-        Line::from(Span::styled(format!("error: {error}"), Style::new().red()))
     } else {
         let mut spans = vec![Span::styled(
             format!(
@@ -221,10 +231,10 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
                 .map_or_else(|| "  loading…".to_owned(), |p| format!("  loading {p}%"));
             spans.push(Span::styled(progress, Style::new().yellow()));
         }
-        if let Some(warning) = &app.warning {
+        if let Some(message) = &app.message {
             spans.push(Span::styled(
-                format!("  ⚠ {warning}"),
-                Style::new().yellow(),
+                format!("  {message}"),
+                Style::new().yellow().bold(),
             ));
         }
         match &app.epg {
@@ -248,12 +258,6 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             };
             spans.push(Span::raw(format!("  filter:{}{tag}", app.filter)));
         }
-        if let Some(message) = &app.message {
-            spans.push(Span::styled(
-                format!("  {message}"),
-                Style::new().yellow().bold(),
-            ));
-        }
         spans.push(Span::styled(
             "  (/ filter · g groups · ? help · q quit)",
             Style::new().dim(),
@@ -261,6 +265,102 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(spans)
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The load error and refresh warning, word-wrapped to `width` for the
+/// band above the status bar. They carry whole error chains (e.g. both
+/// failed refresh paths), which a one-line status bar used to cut off
+/// mid-word. Together they take at most [`MAX_NOTICE_ROWS`] rows; anything
+/// longer ends in "…" and the full text is in the log.
+fn notice_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let notices = [
+        app.error
+            .as_deref()
+            .map(|error| (format!("error: {error}"), Style::new().red())),
+        app.warning
+            .as_deref()
+            .map(|warning| (format!("⚠ {warning}"), Style::new().yellow())),
+    ];
+    let notices: Vec<_> = notices.into_iter().flatten().collect();
+    let mut lines = Vec::new();
+    for (index, (text, style)) in notices.iter().enumerate() {
+        // Leave at least one row for each notice still to come.
+        let budget = MAX_NOTICE_ROWS - lines.len() - (notices.len() - index - 1);
+        lines.extend(
+            wrap_capped(text, width, budget)
+                .into_iter()
+                .map(|row| Line::styled(row, *style)),
+        );
+    }
+    lines
+}
+
+/// Word-wraps `text` to `width` columns in at most `max_rows` rows, cutting
+/// the last row with "… (see log)" (or just "…" if that doesn't fit) when
+/// the text is longer. Words wider than a row are split.
+fn wrap_capped(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+    const MORE: &str = "… (see log)";
+    let width = width.max(1);
+    let mut rows = wrap(text, width);
+    if rows.len() > max_rows {
+        rows.truncate(max_rows.max(1));
+        if let Some(last) = rows.last_mut() {
+            let more = if text_width(MORE) < width {
+                MORE
+            } else {
+                "…"
+            };
+            while text_width(last) + text_width(more) > width {
+                if last.pop().is_none() {
+                    break;
+                }
+            }
+            last.truncate(last.trim_end().len());
+            last.push_str(more);
+        }
+    }
+    rows
+}
+
+/// Greedy word wrap by display width.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0;
+    for word in text.split_whitespace() {
+        let word_width = text_width(word);
+        let separator = usize::from(!row.is_empty());
+        if row_width + separator + word_width <= width {
+            if separator == 1 {
+                row.push(' ');
+            }
+            row.push_str(word);
+            row_width += separator + word_width;
+            continue;
+        }
+        if !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            row_width = 0;
+        }
+        for ch in word.chars() {
+            let ch_width = text_width(ch.encode_utf8(&mut [0; 4]));
+            if row_width + ch_width > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
+            row.push(ch);
+            row_width += ch_width;
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// Terminal display width of `text`.
+fn text_width(text: &str) -> usize {
+    Span::raw(text).width()
 }
 
 /// Centered popup listing "(all groups)" plus every interned group, in
@@ -274,7 +374,7 @@ fn draw_group_popup(frame: &mut Frame, app: &App) {
             .chain(
                 app.visible_groups
                     .iter()
-                    .map(|&id| ListItem::new(app.groups[id].clone())),
+                    .map(|&id| ListItem::new(app.groups[id].as_str())),
             )
             .collect::<Vec<_>>()
     } else if app.visible_groups.is_empty() {
@@ -282,7 +382,7 @@ fn draw_group_popup(frame: &mut Frame, app: &App) {
     } else {
         app.visible_groups
             .iter()
-            .map(|&id| ListItem::new(app.groups[id].clone()))
+            .map(|&id| ListItem::new(app.groups[id].as_str()))
             .collect()
     };
     let list = List::new(items)
@@ -373,6 +473,16 @@ mod tests {
         render_at(app, 0)
     }
 
+    /// Renders an 80×12 screen and returns it row by row.
+    fn render_rows(app: &mut App) -> Vec<String> {
+        render(app)
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(80)
+            .map(|row| row.iter().collect())
+            .collect()
+    }
+
     fn render_at(app: &mut App, now: i64) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         app.update_viewports(12);
@@ -395,12 +505,95 @@ mod tests {
     }
 
     #[test]
-    fn load_warning_shows_next_to_the_channel_count() {
+    fn load_warning_shows_with_the_channel_count() {
         let mut app = app_with_channels(3);
         app.on_load_event(LoadEvent::Warning("showing cached playlist".into()));
         let screen = render(&mut app);
         assert!(screen.contains("3/3 channels"));
         assert!(screen.contains("⚠ showing cached playlist"));
+    }
+
+    /// The real warning from a refresh that failed on both paths.
+    const LONG_WARNING: &str = "showing cached playlist — refresh failed: M3U download \
+        failed: request failed: io: invalid peer certificate: certificate expired: \
+        verification time 1791044335 (UNIX), but certificate is not valid after \
+        1637572709 (153471626 seconds ago); player API: request failed: io: invalid \
+        peer certificate: certificate expired: verification time 1791044336 (UNIX), \
+        but certificate is not valid after 1637572709 (153471627 seconds ago)";
+
+    #[test]
+    fn long_load_warning_wraps_above_the_status_bar() {
+        // Regression: the warning was one status-bar segment, cut off at the
+        // terminal edge ("refresh failed: M3U download failed: req").
+        let mut app = app_with_channels(3);
+        app.on_load_event(LoadEvent::Warning(LONG_WARNING.into()));
+        let rows = render_rows(&mut app);
+        let status = rows.last().unwrap();
+        assert!(status.contains("3/3 channels"), "status: {status}");
+        assert!(status.contains("q quit"), "hints cut off: {status}");
+        let notice = rows[rows.len() - 1 - MAX_NOTICE_ROWS..rows.len() - 1].join("\n");
+        assert!(notice.contains("certificate expired"), "notice:\n{notice}");
+        assert!(
+            notice.trim_end().ends_with("… (see log)"),
+            "notice:\n{notice}"
+        );
+    }
+
+    #[test]
+    fn short_load_warning_takes_one_row() {
+        let mut app = app_with_channels(20);
+        app.on_load_event(LoadEvent::Warning("refresh failed: timeout".into()));
+        let rows = render_rows(&mut app);
+        assert!(rows[rows.len() - 2].contains("⚠ refresh failed: timeout"));
+        assert!(rows[rows.len() - 3].contains("Channel "), "rows: {rows:#?}");
+    }
+
+    #[test]
+    fn selection_stays_visible_above_the_notice_band() {
+        let mut app = app_with_channels(40);
+        app.on_load_event(LoadEvent::Warning(LONG_WARNING.into()));
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let rows = render_rows(&mut app);
+        let list = &rows[..rows.len() - 1 - MAX_NOTICE_ROWS];
+        assert!(
+            list.iter().any(|row| row.contains("Channel 39")),
+            "rows: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn wrap_capped_splits_words_and_marks_overflow() {
+        assert_eq!(wrap_capped("aa bb cc", 5, 3), ["aa bb", "cc"]);
+        assert_eq!(wrap_capped("abcdefgh", 3, 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap_capped("aa bb cc dd", 5, 1), ["aa b…"]);
+        let cut = wrap_capped(&"word ".repeat(20), 20, 2);
+        assert_eq!(cut.len(), 2);
+        assert!(cut[1].ends_with("… (see log)"), "{cut:?}");
+        assert!(cut.iter().all(|row| text_width(row) <= 20), "{cut:?}");
+    }
+
+    #[test]
+    fn load_error_does_not_hide_playback_feedback_or_state() {
+        // Regression: once `error` was set the status bar showed nothing
+        // else — no playback message, group/filter tags, counts or hints.
+        let mut app = app_with_channels(3);
+        app.on_load_event(LoadEvent::Failed("boom".into()));
+        app.group_filter = Some(0);
+        app.set_message("✗ vlc not found".into());
+        let screen = render(&mut app);
+        assert!(screen.contains("3/3 channels"), "screen: {screen}");
+        assert!(screen.contains("✗ vlc not found"), "screen: {screen}");
+        assert!(screen.contains("error: boom"), "screen: {screen}");
+        assert!(screen.contains("group:News"), "screen: {screen}");
+    }
+
+    #[test]
+    fn load_error_status_keeps_the_key_hints() {
+        let mut app = app_with_channels(3);
+        app.on_load_event(LoadEvent::Failed("boom".into()));
+        let screen = render(&mut app);
+        assert!(screen.contains("error: boom"), "screen: {screen}");
+        assert!(screen.contains("? help"), "screen: {screen}");
     }
 
     #[test]

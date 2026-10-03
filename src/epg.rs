@@ -19,7 +19,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
-use flate2::bufread::GzDecoder;
+use flate2::bufread::MultiGzDecoder;
 use quick_xml::Reader as XmlReader;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
@@ -115,9 +115,20 @@ pub struct Guide {
     programmes: HashMap<String, Vec<Programme>>,
     /// Lowercased `<display-name>` → first XMLTV channel id using that name.
     display_names: HashMap<String, String>,
+    /// Why the document could not be read to its end, when it couldn't;
+    /// the guide then holds what was parsed before that point.
+    partial: Option<String>,
 }
 
 impl Guide {
+    /// Why only part of the document was loaded, or `None` when it was
+    /// read to the end. A partial guide still holds every programme
+    /// parsed before the read or parse error.
+    #[must_use]
+    pub fn partial_load_warning(&self) -> Option<&str> {
+        self.partial.as_deref()
+    }
+
     /// Number of channels that carry at least one programme.
     #[must_use]
     pub fn channel_count(&self) -> usize {
@@ -255,110 +266,230 @@ enum TextTarget {
 /// as UTF-8, or as Windows-1252 when the XML declaration names Latin-1;
 /// invalid UTF-8 becomes U+FFFD instead of failing the document.
 ///
+/// Real-world feeds are often not well-formed, so parsing is tolerant:
+/// end tags are not matched against start tags, recoverable markup errors
+/// (such as a stray `&`) are skipped, and a `<title>` or `<programme>`
+/// left unclosed ends where the next element begins. When the document
+/// breaks off — a dropped connection, or markup the parser cannot get
+/// past — everything parsed until then is kept, and
+/// [`Guide::partial_load_warning`] says why the rest is missing.
+///
 /// # Errors
 ///
-/// [`EpgError::Xml`] when the document is not well-formed XML (which
-/// includes I/O failures of the underlying reader).
+/// [`EpgError::Xml`] when reading or parsing fails before a single
+/// `<channel>` or `<programme>` element was seen (which includes I/O
+/// failures of the underlying reader) — so a source that is not XMLTV at
+/// all still reports an error rather than an empty guide.
 pub fn parse_xmltv<R: BufRead>(input: R, now: i64) -> Result<Guide, EpgError> {
     // No trim_text: per-event trimming could eat spaces around separately
     // reported entity references. Collected text is trimmed once, when its
     // element ends.
     let mut reader = XmlReader::from_reader(input);
-    let mut guide = Guide::default();
+    let config = reader.config_mut();
+    // One misspelled or misplaced end tag must not cost the whole guide.
+    config.check_end_names = false;
+    config.allow_unmatched_ends = true;
+    // Titles like "Tom & Jerry" with an unescaped `&` keep the `&`.
+    config.allow_dangling_amp = true;
+    let mut builder = GuideBuilder::new(now);
+    // Recoverable markup errors skipped along the way.
+    let mut skipped_errors = 0_usize;
     let mut buf = Vec::new();
-    // Id of the <channel> being read, while inside one.
-    let mut channel_id: Option<String> = None;
-    // Channel id and partially built programme of the <programme> being
-    // read — `None` when it was dropped (bad attributes or out of window).
-    let mut pending: Option<(String, Programme)> = None;
-    let mut target = TextTarget::None;
-    let mut text = String::new();
-    let mut encoding = TextEncoding::Utf8;
-
     loop {
-        match reader.read_event_into(&mut buf)? {
+        match reader.read_event_into(&mut buf) {
+            Ok(XmlEvent::Eof) => break,
+            Ok(event) => builder.handle(event),
+            // quick-xml has already skipped past ill-formed markup and
+            // can carry on from there.
+            Err(quick_xml::Error::IllFormed(error)) => {
+                log::debug!(
+                    "XMLTV: skipping ill-formed markup near byte {}: {error}",
+                    reader.error_position()
+                );
+                skipped_errors += 1;
+            }
+            // Anything else (I/O, syntax) ends the document for quick-xml.
+            Err(error) if builder.elements_seen > 0 => {
+                let message = format!(
+                    "the XMLTV document broke off near byte {}: {error}",
+                    reader.error_position()
+                );
+                log::warn!("{message}; keeping what was parsed until then");
+                builder.guide.partial = Some(message);
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        buf.clear();
+    }
+    if skipped_errors > 0 {
+        log::warn!("XMLTV: skipped {skipped_errors} piece(s) of ill-formed markup");
+    }
+    Ok(builder.finish())
+}
+
+/// Builds a [`Guide`] from XMLTV events, one at a time.
+struct GuideBuilder {
+    guide: Guide,
+    /// Reference time for the kept window.
+    now: i64,
+    /// Text encoding named by the XML declaration.
+    encoding: TextEncoding,
+    /// `<channel>` and `<programme>` start tags seen, usable or not: tells
+    /// a guide cut short from a source that never was one.
+    elements_seen: usize,
+    /// Id of the `<channel>` being read, while inside one.
+    channel_id: Option<String>,
+    /// Channel id and partially built programme of the `<programme>`
+    /// being read — `None` when it was dropped (bad attributes or out of
+    /// window).
+    pending: Option<(String, Programme)>,
+    /// Element whose text is being collected into `text`.
+    target: TextTarget,
+    text: String,
+}
+
+impl GuideBuilder {
+    fn new(now: i64) -> Self {
+        Self {
+            guide: Guide::default(),
+            now,
+            encoding: TextEncoding::Utf8,
+            elements_seen: 0,
+            channel_id: None,
+            pending: None,
+            target: TextTarget::None,
+            text: String::new(),
+        }
+    }
+
+    fn handle(&mut self, event: XmlEvent) {
+        match event {
             XmlEvent::Decl(declaration) => {
                 if let Some(Ok(label)) = declaration.encoding() {
-                    encoding = TextEncoding::from_label(&label);
+                    self.encoding = TextEncoding::from_label(&label);
                 }
             }
-            XmlEvent::Start(element) => match element.local_name().as_ref() {
-                b"channel" => channel_id = attr_value(&element, b"id", encoding),
-                b"display-name" if channel_id.is_some() => {
-                    target = TextTarget::DisplayName;
-                    text.clear();
-                }
-                b"programme" => pending = programme_from_attrs(&element, now, encoding),
-                // Only the first <title> counts; feeds often repeat it
-                // once per language.
-                b"title" if pending.as_ref().is_some_and(|(_, p)| p.title.is_empty()) => {
-                    target = TextTarget::Title;
-                    text.clear();
-                }
-                _ => {}
-            },
+            XmlEvent::Start(element) => self.start(&element),
             // Entity references arrive as separate GeneralRef events, so
             // text and CDATA only need decoding, not unescaping.
             XmlEvent::Text(t) => {
-                if !matches!(target, TextTarget::None) {
-                    text.push_str(&encoding.decode(&t));
+                if !matches!(self.target, TextTarget::None) {
+                    self.text.push_str(&self.encoding.decode(&t));
                 }
             }
             XmlEvent::CData(t) => {
-                if !matches!(target, TextTarget::None) {
-                    text.push_str(&encoding.decode(&t));
+                if !matches!(self.target, TextTarget::None) {
+                    self.text.push_str(&self.encoding.decode(&t));
                 }
             }
             // Handle references when quick-xml reports them separately;
             // versions/configurations that expand them into Text work too.
             XmlEvent::GeneralRef(reference) => {
-                if !matches!(target, TextTarget::None)
+                if !matches!(self.target, TextTarget::None)
                     && let Some(ch) = resolve_reference(&reference)
                 {
-                    text.push(ch);
+                    self.text.push(ch);
                 }
             }
-            XmlEvent::End(element) => match element.local_name().as_ref() {
-                b"display-name" => {
-                    let name = text.trim();
-                    if matches!(target, TextTarget::DisplayName)
-                        && let Some(id) = &channel_id
-                        && !name.is_empty()
-                    {
-                        guide
-                            .display_names
-                            .entry(name.to_lowercase())
-                            .or_insert_with(|| id.clone());
-                    }
-                    target = TextTarget::None;
+            XmlEvent::End(element) => {
+                // `<title>` and `<display-name>` hold only text, so any end
+                // tag — even a misspelled `</titel>` — closes them.
+                self.close_text();
+                match element.local_name().as_ref() {
+                    b"channel" => self.channel_id = None,
+                    b"programme" => self.finish_programme(),
+                    _ => {}
                 }
-                b"title" => {
-                    if matches!(target, TextTarget::Title)
-                        && let Some((_, programme)) = &mut pending
-                    {
-                        text.trim().clone_into(&mut programme.title);
-                    }
-                    target = TextTarget::None;
-                }
-                b"channel" => channel_id = None,
-                b"programme" => {
-                    if let Some((channel, programme)) = pending.take()
-                        && !programme.title.is_empty()
-                    {
-                        guide.programmes.entry(channel).or_default().push(programme);
-                    }
-                }
-                _ => {}
-            },
-            XmlEvent::Eof => break,
+            }
             _ => {}
         }
-        buf.clear();
     }
-    for list in guide.programmes.values_mut() {
-        list.sort_by_key(|programme| programme.start);
+
+    fn start(&mut self, element: &BytesStart) {
+        // Text elements have no children: a start tag inside one means its
+        // end tag was missing or misspelled.
+        self.close_text();
+        match element.local_name().as_ref() {
+            b"channel" => {
+                self.elements_seen += 1;
+                self.channel_id = attr_value(element, b"id", self.encoding);
+            }
+            b"display-name" if self.channel_id.is_some() => {
+                self.target = TextTarget::DisplayName;
+                self.text.clear();
+            }
+            b"programme" => {
+                self.elements_seen += 1;
+                // The previous <programme> was never closed: keep it if
+                // it got that far, then start afresh.
+                self.finish_programme();
+                self.pending = programme_from_attrs(element, self.now, self.encoding);
+            }
+            // Only the first <title> counts; feeds often repeat it once
+            // per language.
+            b"title"
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(_, p)| p.title.is_empty()) =>
+            {
+                self.target = TextTarget::Title;
+                self.text.clear();
+            }
+            _ => {}
+        }
     }
-    Ok(guide)
+
+    /// Stores the collected text in the element it belongs to, if any.
+    fn close_text(&mut self) {
+        match std::mem::replace(&mut self.target, TextTarget::None) {
+            TextTarget::None => {}
+            TextTarget::DisplayName => {
+                let name = self.text.trim();
+                if let Some(id) = &self.channel_id
+                    && !name.is_empty()
+                {
+                    self.guide
+                        .display_names
+                        .entry(name.to_lowercase())
+                        .or_insert_with(|| id.clone());
+                }
+            }
+            TextTarget::Title => {
+                if let Some((_, programme)) = &mut self.pending
+                    && programme.title.is_empty()
+                {
+                    self.text.trim().clone_into(&mut programme.title);
+                }
+            }
+        }
+    }
+
+    /// Files the pending programme into the guide; one without a title is
+    /// dropped.
+    fn finish_programme(&mut self) {
+        if let Some((channel, programme)) = self.pending.take()
+            && !programme.title.is_empty()
+        {
+            self.guide
+                .programmes
+                .entry(channel)
+                .or_default()
+                .push(programme);
+        }
+    }
+
+    /// The finished guide. A document cut off inside a `<programme>`
+    /// keeps it only if its title made it through complete: a title still
+    /// open here may be truncated, so it is not closed.
+    fn finish(mut self) -> Guide {
+        self.finish_programme();
+        for list in self.guide.programmes.values_mut() {
+            list.sort_by_key(|programme| programme.start);
+        }
+        self.guide
+    }
 }
 
 /// Resolves a character reference (`&#…;`) or one of XML's five
@@ -422,28 +553,29 @@ fn programme_from_attrs(
 }
 
 /// Decodes an XMLTV timestamp — `YYYYMMDDHHMMSS ±HHMM`, where seconds and
-/// the offset may be omitted; a missing offset is read as UTC — into Unix
+/// the offset may be omitted, and the space before the offset too
+/// (`20240101120000+0100`); a missing offset is read as UTC — into Unix
 /// seconds. `None` for anything malformed (the programme is skipped).
 fn parse_xmltv_time(value: &str) -> Option<i64> {
     let value = value.trim();
-    let (digits, offset) = match value.split_once(' ') {
-        Some((digits, offset)) => (digits, Some(offset.trim())),
-        None => (value, None),
-    };
-    if !matches!(digits.len(), 12 | 14) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let digits_end = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, offset) = value.split_at(digits_end);
+    if !matches!(digits.len(), 12 | 14) {
         return None;
     }
     let mut padded = digits.to_owned();
     while padded.len() < 14 {
         padded.push('0');
     }
-    match offset {
-        Some(offset) => DateTime::parse_from_str(&format!("{padded} {offset}"), "%Y%m%d%H%M%S %z")
-            .ok()
-            .map(|time| time.timestamp()),
-        None => NaiveDateTime::parse_from_str(&padded, "%Y%m%d%H%M%S")
+    match offset.trim_start() {
+        "" => NaiveDateTime::parse_from_str(&padded, "%Y%m%d%H%M%S")
             .ok()
             .map(|naive| Utc.from_utc_datetime(&naive).timestamp()),
+        offset => DateTime::parse_from_str(&format!("{padded} {offset}"), "%Y%m%d%H%M%S %z")
+            .ok()
+            .map(|time| time.timestamp()),
     }
 }
 
@@ -492,7 +624,8 @@ impl EpgSource {
 /// Result of a background EPG load; exactly one is sent per [`spawn`].
 #[derive(Debug)]
 pub enum EpgEvent {
-    /// The guide was fetched and parsed.
+    /// The guide was fetched and parsed — possibly only in part, see
+    /// [`Guide::partial_load_warning`].
     Loaded(Guide),
     /// Loading failed; the message is also written to the log.
     Failed(String),
@@ -510,10 +643,16 @@ pub fn spawn(source: EpgSource, user_agent: Option<String>) -> Receiver<EpgEvent
         let now = Utc::now().timestamp();
         let event = match load(&source, user_agent.as_deref(), now, HttpTimeouts::STANDARD) {
             Ok(guide) => {
-                log::info!(
-                    "EPG loaded: {} channels with programmes",
-                    guide.channel_count()
-                );
+                match guide.partial_load_warning() {
+                    Some(warning) => log::warn!(
+                        "EPG partially loaded ({described}): {} channels with programmes; {warning}",
+                        guide.channel_count()
+                    ),
+                    None => log::info!(
+                        "EPG loaded: {} channels with programmes",
+                        guide.channel_count()
+                    ),
+                }
                 EpgEvent::Loaded(guide)
             }
             Err(error) => {
@@ -557,10 +696,12 @@ fn load(
 }
 
 /// Transparently unwraps gzip — many XMLTV feeds ship as `.xml.gz` — by
-/// sniffing the magic bytes rather than trusting file names.
+/// sniffing the magic bytes rather than trusting file names. Every member
+/// of a multi-member file (e.g. parts joined with `cat a.gz b.gz`) is
+/// decoded, not just the first.
 fn decompress_if_gzip(mut reader: Box<dyn BufRead>) -> std::io::Result<Box<dyn BufRead>> {
     if reader.fill_buf()?.starts_with(&[0x1f, 0x8b]) {
-        Ok(Box::new(BufReader::new(GzDecoder::new(reader))))
+        Ok(Box::new(BufReader::new(MultiGzDecoder::new(reader))))
     } else {
         Ok(reader)
     }
@@ -744,6 +885,136 @@ mod tests {
         assert_eq!(current.unwrap().title, "Fine");
     }
 
+    /// Title of the programme airing at NOW on `channel`, if any.
+    fn current_title(guide: &Guide, channel: &str) -> Option<String> {
+        guide
+            .now_next(Some(channel), "x", NOW)
+            .0
+            .map(|programme| programme.title.clone())
+    }
+
+    #[test]
+    fn mismatched_end_tags_skip_the_element_not_the_document() {
+        // Regression: end names were checked, so one typo'd end tag
+        // failed the whole guide and discarded every programme parsed.
+        let xml = format!(
+            r#"<tv>
+<programme start="{}" stop="{}" channel="before.tv"><title>Before</title></programme>
+<programme start="{}" stop="{}" channel="typo.tv"><title>Typo</titel><desc>x</dsec></programme>
+</stray>
+<programme start="{}" stop="{}" channel="after.tv"><title>After</title></programme>
+</tv>"#,
+            stamp(-1),
+            stamp(1),
+            stamp(-1),
+            stamp(1),
+            stamp(-1),
+            stamp(1),
+        );
+        let guide = parse(&xml);
+        assert_eq!(
+            current_title(&guide, "before.tv").as_deref(),
+            Some("Before")
+        );
+        assert_eq!(current_title(&guide, "after.tv").as_deref(), Some("After"));
+        // The title's misspelled end tag still ends the title.
+        assert_eq!(current_title(&guide, "typo.tv").as_deref(), Some("Typo"));
+        assert_eq!(guide.partial_load_warning(), None);
+    }
+
+    #[test]
+    fn unclosed_programme_is_kept_when_the_next_one_starts() {
+        let xml = format!(
+            r#"<tv>
+<programme start="{}" stop="{}" channel="one.tv"><title>Unclosed</title>
+<programme start="{}" stop="{}" channel="two.tv"><title>Closed</title></programme>
+</tv>"#,
+            stamp(-1),
+            stamp(1),
+            stamp(-1),
+            stamp(1),
+        );
+        let guide = parse(&xml);
+        assert_eq!(current_title(&guide, "one.tv").as_deref(), Some("Unclosed"));
+        assert_eq!(current_title(&guide, "two.tv").as_deref(), Some("Closed"));
+    }
+
+    #[test]
+    fn unescaped_ampersand_is_kept_as_text() {
+        let xml = format!(
+            r#"<tv><programme start="{}" stop="{}" channel="one.tv"><title>Tom & Jerry</title></programme></tv>"#,
+            stamp(-1),
+            stamp(1),
+        );
+        let guide = parse(&xml);
+        assert_eq!(
+            current_title(&guide, "one.tv").as_deref(),
+            Some("Tom & Jerry")
+        );
+    }
+
+    /// Two complete programmes, a third with a complete title but no end
+    /// tag, and a fourth cut off inside its start tag.
+    fn truncated_document() -> String {
+        format!(
+            r#"<tv>
+<programme start="{}" stop="{}" channel="one.tv"><title>First</title></programme>
+<programme start="{}" stop="{}" channel="two.tv"><title>Second</title></programme>
+<programme start="{}" stop="{}" channel="three.tv"><title>Third</title><desc>Half a desc
+<programme start="2026"#,
+            stamp(-1),
+            stamp(1),
+            stamp(-1),
+            stamp(1),
+            stamp(-1),
+            stamp(1),
+        )
+    }
+
+    #[test]
+    fn truncated_document_keeps_the_programmes_before_the_cut() {
+        // Regression: a document breaking off mid-way returned Err and
+        // discarded everything parsed before the cut.
+        let guide = parse(&truncated_document());
+        assert_eq!(current_title(&guide, "one.tv").as_deref(), Some("First"));
+        assert_eq!(current_title(&guide, "two.tv").as_deref(), Some("Second"));
+        assert_eq!(current_title(&guide, "three.tv").as_deref(), Some("Third"));
+        let warning = guide.partial_load_warning().unwrap();
+        assert!(warning.contains("broke off"), "got: {warning}");
+    }
+
+    #[test]
+    fn connection_dropping_mid_document_keeps_the_programmes_so_far() {
+        /// Reader that fails like a reset connection once it runs dry.
+        struct Dropped(std::io::Cursor<Vec<u8>>);
+        impl std::io::Read for Dropped {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.read(buf)? {
+                    0 => Err(std::io::ErrorKind::ConnectionReset.into()),
+                    n => Ok(n),
+                }
+            }
+        }
+        // Cut in the middle of the third programme's text.
+        let xml = truncated_document();
+        let cut = xml.find("Half a").unwrap();
+        let reader = BufReader::new(Dropped(std::io::Cursor::new(
+            xml.as_bytes()[..cut].to_vec(),
+        )));
+        let guide = parse_xmltv(reader, NOW).unwrap();
+        assert_eq!(current_title(&guide, "one.tv").as_deref(), Some("First"));
+        assert_eq!(current_title(&guide, "two.tv").as_deref(), Some("Second"));
+        assert!(guide.partial_load_warning().is_some());
+    }
+
+    #[test]
+    fn document_breaking_off_before_any_element_is_still_an_error() {
+        assert!(matches!(
+            parse_xmltv("<html><head".as_bytes(), NOW),
+            Err(EpgError::Xml(_))
+        ));
+    }
+
     #[test]
     fn timestamps_parse_offsets_and_default_to_utc() {
         // 12:00 +0200 is 10:00 UTC.
@@ -759,6 +1030,49 @@ mod tests {
         assert_eq!(parse_xmltv_time(""), None);
         assert_eq!(parse_xmltv_time("20260705"), None);
         assert_eq!(parse_xmltv_time("2026070510000"), None);
+    }
+
+    #[test]
+    fn timestamps_accept_an_offset_without_a_space() {
+        // Regression: only "digits offset" split on a space was accepted,
+        // so feeds writing "20240101120000+0100" lost every programme.
+        let spaced = parse_xmltv_time("20240101120000 +0100");
+        assert!(spaced.is_some());
+        assert_eq!(parse_xmltv_time("20240101120000+0100"), spaced);
+        assert_eq!(parse_xmltv_time("202401011200+0100"), spaced);
+        assert_eq!(
+            parse_xmltv_time("20240101110000-0000"),
+            parse_xmltv_time("20240101110000")
+        );
+        for garbage in [
+            "20240101120000+01",
+            "20240101120000+0100x",
+            "20240101120000 +0100 junk",
+            "20240101120000x",
+            "2024010112000+0100",
+            "+0100",
+            "20241301120000+0100",
+        ] {
+            assert_eq!(parse_xmltv_time(garbage), None, "{garbage}");
+        }
+    }
+
+    #[test]
+    fn programmes_with_unspaced_offsets_are_kept() {
+        let at = |hours_from_now: i64| {
+            DateTime::from_timestamp(NOW + hours(hours_from_now), 0)
+                .unwrap()
+                .format("%Y%m%d%H%M%S+0000")
+                .to_string()
+        };
+        let xml = format!(
+            r#"<tv><programme start="{}" stop="{}" channel="one.tv"><title>Unspaced</title></programme></tv>"#,
+            at(-1),
+            at(1),
+        );
+        let guide = parse(&xml);
+        let (current, _) = guide.now_next(Some("one.tv"), "x", NOW);
+        assert_eq!(current.unwrap().title, "Unspaced");
     }
 
     #[test]
@@ -790,6 +1104,38 @@ mod tests {
         let guide = parse_xmltv(decompress_if_gzip(reader).unwrap(), NOW).unwrap();
         let (current, _) = guide.now_next(Some("one.tv"), "x", NOW);
         assert_eq!(current.unwrap().title, "Zipped");
+    }
+
+    #[test]
+    fn concatenated_gzip_members_are_all_decompressed() {
+        // Regression: GzDecoder stopped after the first gzip member, so a
+        // feed built by concatenating .gz parts was silently truncated.
+        use std::io::Write as _;
+
+        let gzip = |text: &str| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(text.as_bytes()).unwrap();
+            encoder.finish().unwrap()
+        };
+        let first = format!(
+            r#"<tv><programme start="{}" stop="{}" channel="one.tv"><title>Part One</title></programme>"#,
+            stamp(-1),
+            stamp(1),
+        );
+        let second = format!(
+            r#"<programme start="{}" stop="{}" channel="two.tv"><title>Part Two</title></programme></tv>"#,
+            stamp(-1),
+            stamp(1),
+        );
+        let compressed = [gzip(&first), gzip(&second)].concat();
+
+        let reader: Box<dyn BufRead> = Box::new(BufReader::new(std::io::Cursor::new(compressed)));
+        let guide = parse_xmltv(decompress_if_gzip(reader).unwrap(), NOW).unwrap();
+        let (one, _) = guide.now_next(Some("one.tv"), "x", NOW);
+        assert_eq!(one.unwrap().title, "Part One");
+        let (two, _) = guide.now_next(Some("two.tv"), "x", NOW);
+        assert_eq!(two.unwrap().title, "Part Two");
     }
 
     #[test]

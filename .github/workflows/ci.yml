@@ -7,6 +7,13 @@ on:
   # Advisories get published against unchanged code, so audit weekly too.
   schedule:
     - cron: "0 6 * * 1"
+  # release.yml runs these same checks against the tagged commit before
+  # anything is published.
+  workflow_call:
+
+# Nothing in CI writes to the repository.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,27 +24,48 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # Every OS a release ships a binary for.
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Installs the version and components from rust-toolchain.toml.
       - name: Install toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Tests
-        run: cargo test
+        run: cargo test --locked
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    env:
+      # Broken intra-doc links and malformed doc comments fail the build.
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build docs
+        run: cargo doc --no-deps --locked
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-audit
       - name: Audit dependencies
