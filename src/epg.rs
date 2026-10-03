@@ -19,7 +19,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
-use flate2::bufread::GzDecoder;
+use flate2::bufread::MultiGzDecoder;
 use quick_xml::Reader as XmlReader;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
@@ -680,10 +680,12 @@ fn load(
 }
 
 /// Transparently unwraps gzip — many XMLTV feeds ship as `.xml.gz` — by
-/// sniffing the magic bytes rather than trusting file names.
+/// sniffing the magic bytes rather than trusting file names. Every member
+/// of a multi-member file (e.g. parts joined with `cat a.gz b.gz`) is
+/// decoded, not just the first.
 fn decompress_if_gzip(mut reader: Box<dyn BufRead>) -> std::io::Result<Box<dyn BufRead>> {
     if reader.fill_buf()?.starts_with(&[0x1f, 0x8b]) {
-        Ok(Box::new(BufReader::new(GzDecoder::new(reader))))
+        Ok(Box::new(BufReader::new(MultiGzDecoder::new(reader))))
     } else {
         Ok(reader)
     }
@@ -1043,6 +1045,38 @@ mod tests {
         let guide = parse_xmltv(decompress_if_gzip(reader).unwrap(), NOW).unwrap();
         let (current, _) = guide.now_next(Some("one.tv"), "x", NOW);
         assert_eq!(current.unwrap().title, "Zipped");
+    }
+
+    #[test]
+    fn concatenated_gzip_members_are_all_decompressed() {
+        // Regression: GzDecoder stopped after the first gzip member, so a
+        // feed built by concatenating .gz parts was silently truncated.
+        use std::io::Write as _;
+
+        let gzip = |text: &str| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(text.as_bytes()).unwrap();
+            encoder.finish().unwrap()
+        };
+        let first = format!(
+            r#"<tv><programme start="{}" stop="{}" channel="one.tv"><title>Part One</title></programme>"#,
+            stamp(-1),
+            stamp(1),
+        );
+        let second = format!(
+            r#"<programme start="{}" stop="{}" channel="two.tv"><title>Part Two</title></programme></tv>"#,
+            stamp(-1),
+            stamp(1),
+        );
+        let compressed = [gzip(&first), gzip(&second)].concat();
+
+        let reader: Box<dyn BufRead> = Box::new(BufReader::new(std::io::Cursor::new(compressed)));
+        let guide = parse_xmltv(decompress_if_gzip(reader).unwrap(), NOW).unwrap();
+        let (one, _) = guide.now_next(Some("one.tv"), "x", NOW);
+        assert_eq!(one.unwrap().title, "Part One");
+        let (two, _) = guide.now_next(Some("two.tv"), "x", NOW);
+        assert_eq!(two.unwrap().title, "Part Two");
     }
 
     #[test]
