@@ -149,6 +149,11 @@ pub struct App {
     pub(crate) filtered: Vec<usize>,
     /// Selection as an index into `filtered`.
     pub(crate) selected: usize,
+    /// Whether the user has picked a channel (navigated to it, played or
+    /// favorited it). Only then does a streaming load keep the selection
+    /// on that channel as earlier-sorting entries arrive; until then the
+    /// cursor stays on the top row instead of drifting down the list.
+    selection_pinned: bool,
     /// First visible row (index into `filtered`).
     pub(crate) offset: usize,
     /// Rows in the channel viewport as of the last render; used for
@@ -201,6 +206,7 @@ impl fmt::Debug for App {
             .field("groups", &self.groups.len())
             .field("filtered", &self.filtered.len())
             .field("selected", &self.selected)
+            .field("selection_pinned", &self.selection_pinned)
             .field("mode", &self.mode)
             .field("loading", &self.loading)
             .field("percent", &self.percent)
@@ -234,6 +240,7 @@ impl App {
             group_filter: None,
             filtered: Vec::new(),
             selected: 0,
+            selection_pinned: false,
             offset: 0,
             page_rows: 1,
             mode: Mode::Normal,
@@ -309,6 +316,7 @@ impl App {
                 self.skipped = 0;
                 self.percent = None;
                 self.selected = 0;
+                self.selection_pinned = false;
                 self.offset = 0;
                 // A GroupId is only meaningful for the batch of groups it
                 // was assigned alongside; group order depends on
@@ -434,6 +442,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Enter => {
                 if let Some(&index) = self.filtered.get(self.selected) {
+                    self.selection_pinned = true;
                     let channel = &self.channels[index];
                     self.play_request = Some(PlayRequest {
                         name: channel.name.clone(),
@@ -489,8 +498,15 @@ impl App {
             KeyCode::Down => self.move_down(1),
             KeyCode::PageUp => self.move_up(self.page_rows),
             KeyCode::PageDown => self.move_down(self.page_rows),
-            KeyCode::Home => self.selected = 0,
-            KeyCode::End => self.selected = self.filtered.len().saturating_sub(1),
+            KeyCode::Home => {
+                // Back to following the top of the list.
+                self.selected = 0;
+                self.selection_pinned = false;
+            }
+            KeyCode::End => {
+                self.selected = self.filtered.len().saturating_sub(1);
+                self.selection_pinned = true;
+            }
             _ => {}
         }
     }
@@ -592,6 +608,7 @@ impl App {
         let Some(&index) = self.filtered.get(self.selected) else {
             return;
         };
+        self.selection_pinned = true;
         let Some(store) = &mut self.store else {
             self.message = Some("✗ favorites unavailable (no config directory)".to_owned());
             return;
@@ -612,6 +629,7 @@ impl App {
         }
         self.view = target;
         self.selected = 0;
+        self.selection_pinned = false;
         if target == View::Favorites {
             // Opening favorites should show them all, not whatever text
             // filter or group restriction was left over from browsing
@@ -672,8 +690,17 @@ impl App {
     /// absorbing a batch costs O(n) rather than re-sorting everything —
     /// the same budget the previous plain-append approach spent, now
     /// spent keeping alphabetical order instead of arrival order.
+    ///
+    /// A pinned selection (see [`Self::selection_pinned`]) follows its
+    /// channel to its new row, keeping the same on-screen row so the
+    /// viewport doesn't jump; an unpinned one stays where it is.
     fn absorb_channels(&mut self, start: usize) {
-        let selected_channel = self.filtered.get(self.selected).copied();
+        let selected_channel = if self.selection_pinned {
+            self.filtered.get(self.selected).copied()
+        } else {
+            None
+        };
+        let screen_row = self.selected.saturating_sub(self.offset);
         let mut new_indices: Vec<usize> = (start..self.channels.len()).collect();
         new_indices.sort_by(|&a, &b| self.name_keys[a].cmp(&self.name_keys[b]));
         merge_by_key_into(
@@ -708,6 +735,7 @@ impl App {
                 .position(|&index| index == selected_channel)
         {
             self.selected = position;
+            self.offset = position.saturating_sub(screen_row);
         }
         self.clamp_selection();
     }
@@ -792,6 +820,7 @@ impl App {
 
     fn move_up(&mut self, by: usize) {
         self.selected = self.selected.saturating_sub(by);
+        self.selection_pinned = true;
     }
 
     fn clamp_selection(&mut self) {
@@ -802,6 +831,7 @@ impl App {
     fn move_down(&mut self, by: usize) {
         let last = self.filtered.len().saturating_sub(1);
         self.selected = (self.selected + by).min(last);
+        self.selection_pinned = true;
     }
 
     fn group_item_count(&self) -> usize {
@@ -983,7 +1013,8 @@ mod tests {
             skipped: 0,
             percent: Some(50),
         });
-        app.selected = 1;
+        app.handle_key(key(KeyCode::Down)); // Zebra
+        app.offset = 1;
 
         app.on_load_event(LoadEvent::Batch {
             channels: vec![channel("apple", None), channel("Kiwi", None)],
@@ -993,11 +1024,62 @@ mod tests {
         });
 
         assert_eq!(app.selected, 3);
+        // Same screen row as before the batch: the viewport moved with it.
+        assert_eq!(app.offset, 3);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             app.take_play_request().unwrap().url,
             "http://example.com/Zebra"
         );
+    }
+
+    #[test]
+    fn later_batches_keep_an_untouched_selection_at_the_top() {
+        // Regression: the selection was pinned to whichever channel sat
+        // on row 0, so as earlier-sorting entries streamed in the cursor
+        // (and viewport) drifted deep into the list without any input.
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Mango", None), channel("Zebra", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("apple", None), channel("Kiwi", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.offset, 0);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_play_request().unwrap().url,
+            "http://example.com/apple"
+        );
+    }
+
+    #[test]
+    fn home_unpins_the_selection_so_it_follows_the_top_again() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Mango", None), channel("Zebra", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Home));
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("apple", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(app.selected, 0);
+        assert_eq!(filtered_names(&app)[0], "apple");
     }
 
     #[test]
