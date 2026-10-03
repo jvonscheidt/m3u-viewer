@@ -118,12 +118,14 @@ huge playlists stay cheap. `e` hides/shows the EPG display.
 
 ### Filtering
 
-`/` filters over channel name and group as you type. The pattern is a
+`/` filters as you type; a channel matches when the pattern matches
+its name or its group (each checked on its own). The pattern is a
 case-insensitive [regular expression](https://docs.rs/regex/latest/regex/#syntax)
 — `bbc|cnn` matches either channel, `^sky sports` anchors at the
-name's start. Text that doesn't (yet) compile as a regex — usually a
-pattern you're still typing — falls back to a plain substring match
-instead of showing "no matches", and the status bar says so. Set
+start of the name (or group), `hd$` at its end. Text that doesn't
+(yet) compile as a regex — usually a pattern you're still typing —
+falls back to a plain substring match instead of showing "no
+matches", and the status bar says so. Set
 `regex_filter = false` in `config.toml` to always match literally
 (then `ESPN+` finds only `ESPN+`).
 
@@ -223,7 +225,8 @@ Deleting the directory resets everything.
   rendered) showing channel name and group, sorted alphabetically
   (case-insensitive) rather than playlist order — including while a large
   playlist is still streaming in.
-- `/` opens a filter prompt; matching is over channel name and group,
+- `/` opens a filter prompt; a channel matches if its name or its group
+  matches (checked separately, so a pattern never spans both),
   updated on every keystroke (debounced ≤ 50 ms).
 - Filter syntax (since 0.5.0): the text is a case-insensitive regular
   expression; input that fails to compile (typically a half-typed
@@ -305,8 +308,9 @@ Deleting the directory resets everything.
 | `q` | Quit |
 
 Inside the group selector (`g`): `/` searches the group list,
-`PgUp`/`PgDn`/`Home`/`End` page through it, `Enter` selects, and `Esc`
-closes it.
+`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End` move through it (also between
+matches while searching), `Enter` selects, and `Esc` ends the search
+(keeping the highlighted group) or closes the selector.
 
 ### Performance targets (100 MB playlist)
 

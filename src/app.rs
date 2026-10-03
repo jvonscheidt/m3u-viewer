@@ -5,7 +5,9 @@
 //! binary's event loop feeds keys and [`LoadEvent`]s in here.
 
 use std::collections::HashMap;
+use std::collections::hash_map::{Entry, RandomState};
 use std::fmt;
+use std::hash::BuildHasher;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
@@ -15,7 +17,12 @@ use crate::loader::LoadEvent;
 use crate::playlist::{Channel, GroupId};
 use crate::store::Store;
 
-/// How the current filter text is matched against a channel's search key.
+/// Most rows the load-error / refresh-warning band above the status bar
+/// may take; longer text is cut there (the full text is in the log).
+pub(crate) const MAX_NOTICE_ROWS: usize = 3;
+
+/// How the current filter text is matched against a channel's name and
+/// group (each on its own — see [`App::matches`]).
 /// Rebuilt by [`App::rebuild_filter_matcher`] whenever the filter text or
 /// the regex-filter setting changes.
 #[derive(Debug)]
@@ -110,11 +117,9 @@ impl PlayRequest {
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub(crate) channels: Vec<Channel>,
-    /// Lowercase "name group" per channel, precomputed so a filter pass
-    /// over a million entries stays within the latency budget.
-    search_keys: Vec<String>,
-    /// Lowercase channel name per channel, cached so sorting never
-    /// re-lowercases a name it has already seen.
+    /// Lowercase channel name per channel, cached so neither sorting nor a
+    /// filter pass over a million entries re-lowercases a name it has
+    /// already seen.
     name_keys: Vec<String>,
     /// All channel indices, sorted alphabetically by name (case
     /// insensitive) and merge-updated as batches arrive — see
@@ -129,6 +134,9 @@ pub struct App {
     sorted_scratch: Vec<usize>,
     filtered_scratch: Vec<usize>,
     pub(crate) groups: Vec<String>,
+    /// Lowercase name per group id (parallel to `groups`), computed once
+    /// per group rather than once per channel in it.
+    group_keys: Vec<String>,
     /// `groups` ids in alphabetical order, for the group popup. Rebuilt
     /// from scratch whenever groups change: the interned group table
     /// stays orders of magnitude smaller than the channel list, so a
@@ -149,6 +157,11 @@ pub struct App {
     pub(crate) filtered: Vec<usize>,
     /// Selection as an index into `filtered`.
     pub(crate) selected: usize,
+    /// Whether the user has picked a channel (navigated to it, played or
+    /// favorited it). Only then does a streaming load keep the selection
+    /// on that channel as earlier-sorting entries arrive; until then the
+    /// cursor stays on the top row instead of drifting down the list.
+    selection_pinned: bool,
     /// First visible row (index into `filtered`).
     pub(crate) offset: usize,
     /// Rows in the channel viewport as of the last render; used for
@@ -183,7 +196,7 @@ pub struct App {
     /// config directory (the features degrade to a status message).
     pub(crate) store: Option<Store>,
     /// First channel index per URL, for resolving recents to rows.
-    url_index: HashMap<String, usize>,
+    url_index: UrlIndex,
     play_request: Option<PlayRequest>,
     /// Programme guide, once an EPG source was found and loaded.
     pub(crate) epg: EpgState,
@@ -201,6 +214,7 @@ impl fmt::Debug for App {
             .field("groups", &self.groups.len())
             .field("filtered", &self.filtered.len())
             .field("selected", &self.selected)
+            .field("selection_pinned", &self.selection_pinned)
             .field("mode", &self.mode)
             .field("loading", &self.loading)
             .field("percent", &self.percent)
@@ -221,12 +235,12 @@ impl App {
     pub fn new(file_name: String, store: Option<Store>) -> Self {
         Self {
             channels: Vec::new(),
-            search_keys: Vec::new(),
             name_keys: Vec::new(),
             sorted_channels: Vec::new(),
             sorted_scratch: Vec::new(),
             filtered_scratch: Vec::new(),
             groups: Vec::new(),
+            group_keys: Vec::new(),
             sorted_groups: Vec::new(),
             filter: String::new(),
             filter_matcher: FilterMatcher::None,
@@ -234,6 +248,7 @@ impl App {
             group_filter: None,
             filtered: Vec::new(),
             selected: 0,
+            selection_pinned: false,
             offset: 0,
             page_rows: 1,
             mode: Mode::Normal,
@@ -250,7 +265,7 @@ impl App {
             message: None,
             view: View::All,
             store,
-            url_index: HashMap::new(),
+            url_index: UrlIndex::default(),
             play_request: None,
             epg: EpgState::Absent,
             epg_visible: true,
@@ -275,39 +290,37 @@ impl App {
                 percent,
             } => {
                 if !new_groups.is_empty() {
+                    self.group_keys
+                        .extend(new_groups.iter().map(|name| name.to_lowercase()));
                     self.groups.extend(new_groups);
                     self.rebuild_sorted_groups();
                 }
                 self.skipped = skipped;
                 self.percent = percent;
                 let start = self.channels.len();
-                for channel in &channels {
-                    let name_lower = channel.name.to_lowercase();
-                    self.search_keys
-                        .push(self.search_key(&name_lower, channel.group));
-                    self.name_keys.push(name_lower);
-                }
+                self.name_keys
+                    .extend(channels.iter().map(|channel| channel.name.to_lowercase()));
                 self.channels.extend(channels);
                 for index in start..self.channels.len() {
-                    self.url_index
-                        .entry(self.channels[index].url.clone())
-                        .or_insert(index);
+                    self.url_index.insert(&self.channels, index);
                 }
                 self.absorb_channels(start);
             }
             LoadEvent::Reset => {
                 self.channels.clear();
-                self.search_keys.clear();
                 self.name_keys.clear();
                 self.sorted_channels.clear();
                 self.groups.clear();
+                self.group_keys.clear();
                 self.sorted_groups.clear();
                 self.visible_groups.clear();
                 self.group_search.clear();
+                self.group_cursor = 0;
                 self.url_index.clear();
                 self.skipped = 0;
                 self.percent = None;
                 self.selected = 0;
+                self.selection_pinned = false;
                 self.offset = 0;
                 // A GroupId is only meaningful for the batch of groups it
                 // was assigned alongside; group order depends on
@@ -366,6 +379,11 @@ impl App {
     }
 
     /// Records a successful playback in the recents list.
+    ///
+    /// In the recents view the played channel moves to the top of the
+    /// list, so the selection follows it there: otherwise the cursor would
+    /// stay on the old row index — now a different channel — and the next
+    /// `Enter` would play something else.
     pub fn record_played(&mut self, url: &str) {
         if let Some(store) = &mut self.store {
             if let Err(error) = store.push_recent(url) {
@@ -373,6 +391,14 @@ impl App {
             }
             if self.view == View::Recents {
                 self.recompute_filter();
+                if let Some(position) = self
+                    .filtered
+                    .iter()
+                    .position(|&index| self.channels[index].url == url)
+                {
+                    self.selected = position;
+                    self.clamp_selection();
+                }
             }
         }
     }
@@ -420,6 +446,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Enter => {
                 if let Some(&index) = self.filtered.get(self.selected) {
+                    self.selection_pinned = true;
                     let channel = &self.channels[index];
                     self.play_request = Some(PlayRequest {
                         name: channel.name.clone(),
@@ -433,7 +460,8 @@ impl App {
                 self.rebuild_visible_groups();
                 self.group_cursor = self
                     .group_filter
-                    .map_or(0, |id| self.group_display_position(id) + 1);
+                    .and_then(|id| self.group_row(id))
+                    .unwrap_or(0);
                 self.mode = Mode::Groups;
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -468,14 +496,21 @@ impl App {
             KeyCode::Esc => {
                 self.filter.clear();
                 self.group_filter = None;
-                self.recompute_filter();
+                self.filter_changed();
             }
             KeyCode::Up => self.move_up(1),
             KeyCode::Down => self.move_down(1),
             KeyCode::PageUp => self.move_up(self.page_rows),
             KeyCode::PageDown => self.move_down(self.page_rows),
-            KeyCode::Home => self.selected = 0,
-            KeyCode::End => self.selected = self.filtered.len().saturating_sub(1),
+            KeyCode::Home => {
+                // Back to following the top of the list.
+                self.selected = 0;
+                self.selection_pinned = false;
+            }
+            KeyCode::End => {
+                self.selected = self.filtered.len().saturating_sub(1);
+                self.selection_pinned = true;
+            }
             _ => {}
         }
     }
@@ -485,16 +520,16 @@ impl App {
             KeyCode::Esc => {
                 self.filter.clear();
                 self.mode = Mode::Normal;
-                self.recompute_filter();
+                self.filter_changed();
             }
             KeyCode::Enter => self.mode = Mode::Normal,
             KeyCode::Backspace => {
                 self.filter.pop();
-                self.recompute_filter();
+                self.filter_changed();
             }
             KeyCode::Char(c) if is_text_input(c, key.modifiers) => {
                 self.filter.push(c);
-                self.recompute_filter();
+                self.filter_changed();
             }
             _ => {}
         }
@@ -504,49 +539,76 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('/') => self.mode = Mode::GroupSearch,
-            KeyCode::Up => self.group_cursor = self.group_cursor.saturating_sub(1),
-            KeyCode::Down => {
-                self.move_group_down(1);
-            }
-            KeyCode::PageUp => {
-                self.group_cursor = self.group_cursor.saturating_sub(self.group_page_rows);
-            }
-            KeyCode::PageDown => self.move_group_down(self.group_page_rows),
-            KeyCode::Home => self.group_cursor = 0,
-            KeyCode::End => self.group_cursor = self.group_item_count().saturating_sub(1),
             KeyCode::Enter => self.select_group(),
-            _ => {}
+            code => self.navigate_groups(code),
         }
     }
 
+    /// Group search input. Navigation keys keep moving the cursor through
+    /// the matches while typing, so `Enter` can pick any of them, not just
+    /// the first; `Esc` ends the search but keeps the highlighted group
+    /// under the cursor in the full list.
     fn key_group_search(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                let highlighted = self.group_under_cursor();
                 self.group_search.clear();
                 self.rebuild_visible_groups();
+                self.group_cursor = highlighted.and_then(|id| self.group_row(id)).unwrap_or(0);
                 self.mode = Mode::Groups;
             }
             KeyCode::Enter => self.select_group(),
             KeyCode::Backspace => {
                 self.group_search.pop();
                 self.rebuild_visible_groups();
+                self.group_cursor = 0;
             }
             KeyCode::Char(c) if is_text_input(c, key.modifiers) => {
                 self.group_search.push(c);
                 self.rebuild_visible_groups();
+                self.group_cursor = 0;
             }
+            code => self.navigate_groups(code),
+        }
+    }
+
+    /// Moves the group popup cursor for the arrow/paging keys; any other
+    /// key is ignored.
+    fn navigate_groups(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Up => self.group_cursor = self.group_cursor.saturating_sub(1),
+            KeyCode::Down => self.move_group_down(1),
+            KeyCode::PageUp => {
+                self.group_cursor = self.group_cursor.saturating_sub(self.group_page_rows);
+            }
+            KeyCode::PageDown => self.move_group_down(self.group_page_rows),
+            KeyCode::Home => self.group_cursor = 0,
+            KeyCode::End => self.group_cursor = self.group_item_count().saturating_sub(1),
             _ => {}
         }
     }
 
-    fn select_group(&mut self) {
-        let selected = if self.group_search.is_empty() {
+    /// Group shown on the popup row under [`Self::group_cursor`]; `None`
+    /// for the synthetic "(all groups)" row or an empty search result.
+    fn group_under_cursor(&self) -> Option<GroupId> {
+        if self.group_search.is_empty() {
             self.group_cursor
                 .checked_sub(1)
                 .and_then(|position| self.visible_groups.get(position).copied())
         } else {
             self.visible_groups.get(self.group_cursor).copied()
-        };
+        }
+    }
+
+    /// Popup row currently showing `id`, if it is visible at all (the
+    /// "(all groups)" row shifts real groups down by one without a search).
+    fn group_row(&self, id: GroupId) -> Option<usize> {
+        let position = self.visible_groups.iter().position(|&group| group == id)?;
+        Some(position + usize::from(self.group_search.is_empty()))
+    }
+
+    fn select_group(&mut self) {
+        let selected = self.group_under_cursor();
         if !self.group_search.is_empty() && selected.is_none() {
             self.message = Some("✗ no matching groups".to_owned());
             return;
@@ -561,6 +623,7 @@ impl App {
         let Some(&index) = self.filtered.get(self.selected) else {
             return;
         };
+        self.selection_pinned = true;
         let Some(store) = &mut self.store else {
             self.message = Some("✗ favorites unavailable (no config directory)".to_owned());
             return;
@@ -581,6 +644,7 @@ impl App {
         }
         self.view = target;
         self.selected = 0;
+        self.selection_pinned = false;
         if target == View::Favorites {
             // Opening favorites should show them all, not whatever text
             // filter or group restriction was left over from browsing
@@ -588,27 +652,34 @@ impl App {
             self.filter.clear();
             self.group_filter = None;
         }
-        self.recompute_filter();
+        self.filter_changed();
     }
 
     /// Switches between regex and plain substring filtering (mirrors
     /// [`crate::config::Config::regex_filter`]) and re-applies the filter.
     pub fn set_regex_filter(&mut self, enabled: bool) {
         self.regex_filter = enabled;
+        self.filter_changed();
+    }
+
+    /// Recompiles the matcher for a changed filter text or mode, then
+    /// re-applies it. The only place the matcher is rebuilt, so a regex is
+    /// compiled once per edit rather than once per list rebuild or batch.
+    fn filter_changed(&mut self) {
+        self.rebuild_filter_matcher();
         self.recompute_filter();
     }
 
-    /// Rebuilds the filtered index list from scratch and clamps the
-    /// selection.
+    /// Rebuilds the filtered index list from scratch with the current
+    /// matcher and clamps the selection.
     fn recompute_filter(&mut self) {
-        self.rebuild_filter_matcher();
         self.filtered = match (self.view, &self.store) {
             // Recents ordering comes from the store (newest first), not
             // alphabetically.
             (View::Recents, Some(store)) => store
                 .recents()
                 .iter()
-                .filter_map(|url| self.url_index.get(url).copied())
+                .filter_map(|url| self.url_index.get(&self.channels, url))
                 .filter(|&index| self.matches(index))
                 .collect(),
             (View::All, _) => self
@@ -632,17 +703,25 @@ impl App {
         self.clamp_selection();
     }
 
-    /// Merge-updates [`Self::sorted_channels`] (and, for the "all
-    /// channels" view, [`Self::filtered`]) with the channels appended at
-    /// `start..self.channels.len()`.
+    /// Merge-updates [`Self::sorted_channels`] and [`Self::filtered`] with
+    /// the channels appended at `start..self.channels.len()`.
     ///
     /// The new slice is sorted once (cheap: one batch) and merged into
     /// the already-sorted running lists in a single linear pass, so
     /// absorbing a batch costs O(n) rather than re-sorting everything —
     /// the same budget the previous plain-append approach spent, now
     /// spent keeping alphabetical order instead of arrival order.
+    ///
+    /// A pinned selection (see [`Self::selection_pinned`]) follows its
+    /// channel to its new row, keeping the same on-screen row so the
+    /// viewport doesn't jump; an unpinned one stays where it is.
     fn absorb_channels(&mut self, start: usize) {
-        let selected_channel = self.filtered.get(self.selected).copied();
+        let selected_channel = if self.selection_pinned {
+            self.filtered.get(self.selected).copied()
+        } else {
+            None
+        };
+        let screen_row = self.selected.saturating_sub(self.offset);
         let mut new_indices: Vec<usize> = (start..self.channels.len()).collect();
         new_indices.sort_by(|&a, &b| self.name_keys[a].cmp(&self.name_keys[b]));
         merge_by_key_into(
@@ -652,23 +731,36 @@ impl App {
             &self.name_keys,
         );
         std::mem::swap(&mut self.sorted_channels, &mut self.sorted_scratch);
-        if self.view == View::All {
-            let matching: Vec<usize> = new_indices
-                .iter()
-                .copied()
-                .filter(|&index| self.matches(index))
-                .collect();
-            merge_by_key_into(
-                &mut self.filtered_scratch,
-                &self.filtered,
-                &matching,
-                &self.name_keys,
-            );
-            std::mem::swap(&mut self.filtered, &mut self.filtered_scratch);
-        } else {
-            // Favorites/recents views need the store checks and (for
-            // recents) store-defined ordering.
-            self.recompute_filter();
+        match (self.view, &self.store) {
+            // Store-defined (newest first) order, not alphabetical; the
+            // rebuild walks at most RECENTS_CAP entries, so it stays cheap
+            // no matter how large the playlist grows.
+            (View::Recents, Some(_)) => self.recompute_filter(),
+            // Only the new batch can add rows: the alphabetical views
+            // filter just those and merge them in, instead of re-checking
+            // (and, for favorites, re-hashing the URL of) every channel
+            // already loaded on each batch.
+            (View::All, _) | (View::Favorites, Some(_)) => {
+                let favorites_only = self.store.as_ref().filter(|_| self.view == View::Favorites);
+                let matching: Vec<usize> = new_indices
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        favorites_only
+                            .is_none_or(|store| store.is_favorite(&self.channels[index].url))
+                            && self.matches(index)
+                    })
+                    .collect();
+                merge_by_key_into(
+                    &mut self.filtered_scratch,
+                    &self.filtered,
+                    &matching,
+                    &self.name_keys,
+                );
+                std::mem::swap(&mut self.filtered, &mut self.filtered_scratch);
+            }
+            // A storeless favorites/recents view stays empty.
+            (View::Favorites | View::Recents, None) => {}
         }
         if let Some(selected_channel) = selected_channel
             && let Some(position) = self
@@ -677,19 +769,29 @@ impl App {
                 .position(|&index| index == selected_channel)
         {
             self.selected = position;
+            self.offset = position.saturating_sub(screen_row);
         }
         self.clamp_selection();
     }
 
     /// Rebuilds the alphabetical group order shown in the group popup.
+    ///
+    /// Runs whenever a batch brings new groups — possibly while the popup
+    /// is open — so the cursor stays on the group it was on (which may
+    /// have shifted rows) instead of jumping back to "(all groups)".
     fn rebuild_sorted_groups(&mut self) {
+        let cursor_group = self.group_under_cursor();
         self.sorted_groups = (0..self.groups.len()).collect();
-        let groups = &self.groups;
-        self.sorted_groups
-            .sort_by(|&a, &b| groups[a].to_lowercase().cmp(&groups[b].to_lowercase()));
+        // Compare the cached lowercase keys: lowercasing inside the
+        // comparator allocated two strings per comparison.
+        let keys = &self.group_keys;
+        self.sorted_groups.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
         self.rebuild_visible_groups();
+        self.group_cursor = cursor_group.and_then(|id| self.group_row(id)).unwrap_or(0);
     }
 
+    /// Recomputes [`Self::visible_groups`] from the current search. Leaves
+    /// [`Self::group_cursor`] alone: each caller decides where it belongs.
     fn rebuild_visible_groups(&mut self) {
         if self.group_search.is_empty() {
             self.visible_groups.clone_from(&self.sorted_groups);
@@ -699,37 +801,39 @@ impl App {
                 .sorted_groups
                 .iter()
                 .copied()
-                .filter(|&id| self.groups[id].to_lowercase().contains(&needle))
+                .filter(|&id| self.group_keys[id].contains(&needle))
                 .collect();
         }
-        self.group_cursor = 0;
-    }
-
-    /// Row of `id` in the group popup (its position in
-    /// [`Self::sorted_groups`]).
-    fn group_display_position(&self, id: GroupId) -> usize {
-        self.sorted_groups
-            .iter()
-            .position(|&group_id| group_id == id)
-            .unwrap_or(0)
     }
 
     /// Group restriction and text filter (view membership is handled in
     /// [`Self::recompute_filter`]).
+    ///
+    /// The filter is tried against the channel name and the group name
+    /// separately — a channel matches if either does — so anchors like
+    /// `hd$` apply to each, and no pattern can match across the boundary
+    /// between the two.
     fn matches(&self, index: usize) -> bool {
-        let group_ok = self
-            .group_filter
-            .is_none_or(|id| self.channels[index].group == Some(id));
-        group_ok
-            && match &self.filter_matcher {
-                FilterMatcher::None => true,
-                FilterMatcher::Substring(needle) => self.search_keys[index].contains(needle),
-                FilterMatcher::Regex(re) => re.is_match(&self.search_keys[index]),
+        let group = self.channels[index].group;
+        if self.group_filter.is_some_and(|id| group != Some(id)) {
+            return false;
+        }
+        let name = self.name_keys[index].as_str();
+        let group_key = group.and_then(|id| self.group_keys.get(id));
+        match &self.filter_matcher {
+            FilterMatcher::None => true,
+            FilterMatcher::Substring(needle) => {
+                name.contains(needle.as_str())
+                    || group_key.is_some_and(|key| key.contains(needle.as_str()))
             }
+            FilterMatcher::Regex(re) => {
+                re.is_match(name) || group_key.is_some_and(|key| re.is_match(key))
+            }
+        }
     }
 
     /// Recompiles [`Self::filter_matcher`] from the current filter text and
-    /// `regex_filter` setting. Search keys are already lowercased, so plain
+    /// `regex_filter` setting. Name and group keys are already lowercased, so plain
     /// substring matching stays a lowercase-needle `contains`; regex
     /// patterns are compiled case-insensitively for the same effect. A
     /// pattern that fails to compile — most often because the user is
@@ -751,18 +855,9 @@ impl App {
         };
     }
 
-    /// Lowercase haystack for filtering: `name_lower` plus the group name.
-    fn search_key(&self, name_lower: &str, group: Option<GroupId>) -> String {
-        let mut key = name_lower.to_owned();
-        if let Some(name) = group.and_then(|id| self.groups.get(id)) {
-            key.push(' ');
-            key.push_str(&name.to_lowercase());
-        }
-        key
-    }
-
     fn move_up(&mut self, by: usize) {
         self.selected = self.selected.saturating_sub(by);
+        self.selection_pinned = true;
     }
 
     fn clamp_selection(&mut self) {
@@ -773,6 +868,7 @@ impl App {
     fn move_down(&mut self, by: usize) {
         let last = self.filtered.len().saturating_sub(1);
         self.selected = (self.selected + by).min(last);
+        self.selection_pinned = true;
     }
 
     fn group_item_count(&self) -> usize {
@@ -787,7 +883,15 @@ impl App {
     /// Updates channel and group-popup viewport sizes for the current terminal
     /// height, keeping the channel selection visible.
     pub fn update_viewports(&mut self, terminal_rows: usize) {
-        let reserved_rows = 1 + usize::from(self.visible_guide().is_some());
+        // The notice band's real height depends on the terminal width,
+        // which isn't known here; reserving its maximum only makes the
+        // list scroll a little early, never hides the selection behind it.
+        let notice_rows = if self.error.is_some() || self.warning.is_some() {
+            MAX_NOTICE_ROWS
+        } else {
+            0
+        };
+        let reserved_rows = 1 + usize::from(self.visible_guide().is_some()) + notice_rows;
         self.ensure_visible(terminal_rows.saturating_sub(reserved_rows).max(1));
         self.group_page_rows = terminal_rows.min(17).saturating_sub(3).max(1);
     }
@@ -809,10 +913,66 @@ impl App {
     }
 }
 
+/// Maps each distinct channel URL to the first channel index carrying it.
+///
+/// Keyed by a hash of the URL rather than the URL itself, so the index
+/// holds no second copy of every URL (around 100 MB at a million
+/// channels); the URL is read back from the channel list to confirm a
+/// hit. The rare URL whose hash collides with a different URL's goes to a
+/// small side table keyed by the full string, so collisions cost memory,
+/// never correctness.
+#[derive(Debug, Default)]
+struct UrlIndex<S = RandomState> {
+    hasher: S,
+    by_hash: HashMap<u64, usize>,
+    collisions: HashMap<String, usize>,
+}
+
+impl<S: BuildHasher> UrlIndex<S> {
+    /// Records `channels[index]`, unless its URL is already indexed.
+    fn insert(&mut self, channels: &[Channel], index: usize) {
+        let url = &channels[index].url;
+        match self.by_hash.entry(self.hasher.hash_one(url)) {
+            Entry::Vacant(slot) => {
+                slot.insert(index);
+            }
+            Entry::Occupied(slot) => {
+                if channels[*slot.get()].url != *url {
+                    // A genuine 64-bit hash collision between distinct
+                    // URLs: the only case that stores a copy of the URL.
+                    self.collisions.entry(url.clone()).or_insert(index);
+                }
+            }
+        }
+    }
+
+    /// First channel index whose URL is `url`.
+    fn get(&self, channels: &[Channel], url: &str) -> Option<usize> {
+        let &index = self.by_hash.get(&self.hasher.hash_one(url))?;
+        if channels[index].url == url {
+            Some(index)
+        } else {
+            self.collisions.get(url).copied()
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_hash.clear();
+        self.collisions.clear();
+    }
+}
+
 /// Merges two channel-index lists, each already sorted by `keys[index]`,
-/// into `out` — the linear-time counterpart to re-sorting the
-/// concatenation, used to fold a newly arrived batch into a running
-/// alphabetical order without re-touching the entries already placed.
+/// into `out` — the counterpart to re-sorting the concatenation, used to
+/// fold a newly arrived batch into a running alphabetical order without
+/// re-comparing the entries already placed.
+///
+/// `a` is the long running list and `b` the short new batch: each `b`
+/// entry binary-searches its slot in the rest of `a`, and the run of `a`
+/// before it is block-copied. That costs O(|b| log |a|) key comparisons
+/// plus one memcpy-speed pass over `a`, instead of a comparison — two
+/// pointer-chasing string reads — per entry of `a` on every batch. On
+/// equal keys, entries of `a` come first.
 ///
 /// `out` is cleared first and must be distinct from `a` and `b`; the
 /// caller passes a reused scratch buffer and swaps it into place, so a
@@ -821,18 +981,15 @@ impl App {
 fn merge_by_key_into(out: &mut Vec<usize>, a: &[usize], b: &[usize], keys: &[String]) {
     out.clear();
     out.reserve(a.len() + b.len());
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        if keys[a[i]] <= keys[b[j]] {
-            out.push(a[i]);
-            i += 1;
-        } else {
-            out.push(b[j]);
-            j += 1;
-        }
+    let mut rest = a;
+    for &incoming in b {
+        let key = &keys[incoming];
+        let run = rest.partition_point(|&placed| keys[placed] <= *key);
+        out.extend_from_slice(&rest[..run]);
+        out.push(incoming);
+        rest = &rest[run..];
     }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
+    out.extend_from_slice(rest);
 }
 
 fn is_text_input(character: char, modifiers: KeyModifiers) -> bool {
@@ -890,6 +1047,70 @@ mod tests {
         });
         app.on_load_event(LoadEvent::Finished);
         app
+    }
+
+    /// Hashes everything to the same value, forcing every distinct URL
+    /// into a hash collision.
+    #[derive(Default)]
+    struct CollidingHasher;
+
+    impl std::hash::Hasher for CollidingHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _bytes: &[u8]) {}
+    }
+
+    #[test]
+    fn url_index_resolves_urls_despite_hash_collisions() {
+        let channels = vec![
+            channel("A", None),
+            channel("B", None),
+            channel("A", None), // duplicate URL: first index wins
+            channel("C", None),
+        ];
+        let mut index = UrlIndex::<std::hash::BuildHasherDefault<CollidingHasher>>::default();
+        for i in 0..channels.len() {
+            index.insert(&channels, i);
+        }
+        assert_eq!(index.get(&channels, "http://example.com/A"), Some(0));
+        assert_eq!(index.get(&channels, "http://example.com/B"), Some(1));
+        assert_eq!(index.get(&channels, "http://example.com/C"), Some(3));
+        assert_eq!(index.get(&channels, "http://example.com/D"), None);
+        index.clear();
+        assert_eq!(index.get(&channels, "http://example.com/A"), None);
+    }
+
+    #[test]
+    fn url_index_keeps_the_first_of_duplicate_urls() {
+        let channels = vec![channel("A", None), channel("A", None)];
+        let mut index = UrlIndex::<RandomState>::default();
+        index.insert(&channels, 0);
+        index.insert(&channels, 1);
+        assert_eq!(index.get(&channels, "http://example.com/A"), Some(0));
+        assert_eq!(index.get(&channels, "http://example.com/B"), None);
+    }
+
+    #[test]
+    fn merge_matches_a_stable_sort_of_the_concatenation() {
+        let keys: Vec<String> = (0..200_u64)
+            .map(|i| format!("{:02}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 37))
+            .collect();
+        let sorted = |range: std::ops::Range<usize>| {
+            let mut list: Vec<usize> = range.collect();
+            list.sort_by(|&x, &y| keys[x].cmp(&keys[y]));
+            list
+        };
+        for split in [0, 1, 50, 150, 199, 200] {
+            let (a, b) = (sorted(0..split), sorted(split..200));
+            let mut out = Vec::new();
+            merge_by_key_into(&mut out, &a, &b, &keys);
+            // A stable sort of a ++ b keeps a's entries first on ties.
+            let mut expected: Vec<usize> = a.iter().chain(&b).copied().collect();
+            expected.sort_by(|&x, &y| keys[x].cmp(&keys[y]));
+            assert_eq!(out, expected, "split {split}");
+        }
     }
 
     #[test]
@@ -954,7 +1175,8 @@ mod tests {
             skipped: 0,
             percent: Some(50),
         });
-        app.selected = 1;
+        app.handle_key(key(KeyCode::Down)); // Zebra
+        app.offset = 1;
 
         app.on_load_event(LoadEvent::Batch {
             channels: vec![channel("apple", None), channel("Kiwi", None)],
@@ -964,11 +1186,62 @@ mod tests {
         });
 
         assert_eq!(app.selected, 3);
+        // Same screen row as before the batch: the viewport moved with it.
+        assert_eq!(app.offset, 3);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             app.take_play_request().unwrap().url,
             "http://example.com/Zebra"
         );
+    }
+
+    #[test]
+    fn later_batches_keep_an_untouched_selection_at_the_top() {
+        // Regression: the selection was pinned to whichever channel sat
+        // on row 0, so as earlier-sorting entries streamed in the cursor
+        // (and viewport) drifted deep into the list without any input.
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Mango", None), channel("Zebra", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("apple", None), channel("Kiwi", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.offset, 0);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_play_request().unwrap().url,
+            "http://example.com/apple"
+        );
+    }
+
+    #[test]
+    fn home_unpins_the_selection_so_it_follows_the_top_again() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Mango", None), channel("Zebra", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Home));
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("apple", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(app.selected, 0);
+        assert_eq!(filtered_names(&app)[0], "apple");
     }
 
     #[test]
@@ -1012,11 +1285,69 @@ mod tests {
     }
 
     #[test]
+    fn favorites_view_absorbs_streamed_batches_incrementally() {
+        let (mut store, dir) = temp_store("fav-stream");
+        for name in ["Zebra", "apple", "Kiwi"] {
+            store
+                .toggle_favorite(&format!("http://example.com/{name}"))
+                .unwrap();
+        }
+        let mut app = App::new("test.m3u".into(), Some(store));
+        app.handle_key(key(KeyCode::Char('F')));
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('e'))); // "Zebra", "apple"
+        app.handle_key(key(KeyCode::Enter));
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Zebra", None), channel("Mango", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![
+                channel("apple", None),
+                channel("Kiwi", None),
+                channel("Melon", None),
+            ],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(filtered_names(&app), ["apple", "Zebra"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recents_view_picks_up_channels_from_later_batches() {
+        let (mut store, dir) = temp_store("rec-stream");
+        store.push_recent("http://example.com/Zebra").unwrap();
+        store.push_recent("http://example.com/apple").unwrap();
+        let mut app = App::new("test.m3u".into(), Some(store));
+        app.handle_key(key(KeyCode::Char('R')));
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("Zebra", None), channel("Mango", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(50),
+        });
+        assert_eq!(filtered_names(&app), ["Zebra"]);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("apple", None)],
+            new_groups: Vec::new(),
+            skipped: 0,
+            percent: Some(100),
+        });
+        // Newest first, not alphabetical.
+        assert_eq!(filtered_names(&app), ["apple", "Zebra"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn group_popup_lists_groups_alphabetically() {
         let mut app = App::new("test.m3u".into(), None);
         app.on_load_event(LoadEvent::Batch {
             channels: vec![channel("A", Some(0)), channel("B", Some(1))],
-            new_groups: vec!["Zeta".into(), "Alpha".into()],
+            new_groups: vec!["Zeta".into(), "Alpha".into(), "beta".into()],
             skipped: 0,
             percent: Some(100),
         });
@@ -1025,7 +1356,8 @@ mod tests {
             .iter()
             .map(|&id| app.groups[id].as_str())
             .collect();
-        assert_eq!(names, ["Alpha", "Zeta"]);
+        // Case-insensitive: "beta" sorts between "Alpha" and "Zeta".
+        assert_eq!(names, ["Alpha", "beta", "Zeta"]);
     }
 
     #[test]
@@ -1042,6 +1374,58 @@ mod tests {
         app.handle_key(key(KeyCode::Char('g')));
         // Popup rows: 0 "(all groups)", 1 Alpha, 2 Zeta.
         assert_eq!(app.group_cursor, 2);
+    }
+
+    #[test]
+    fn group_cursor_stays_on_its_group_when_a_batch_adds_groups() {
+        // Regression: every batch with new groups reset the popup cursor
+        // to "(all groups)", so Enter ignored what the user arrowed to.
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("A", Some(0)), channel("B", Some(1))],
+            new_groups: vec!["Movies".into(), "Sports".into()],
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down)); // Sports, row 2
+        // "Kids" sorts between them, pushing Sports down to row 3.
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("C", Some(2))],
+            new_groups: vec!["Kids".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(app.group_cursor, 3);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(1));
+    }
+
+    #[test]
+    fn group_search_cursor_stays_on_its_match_when_a_batch_adds_groups() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: Vec::new(),
+            new_groups: vec!["Sports HD".into(), "Sports SD".into()],
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "sports".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.group_cursor = 1; // Sports SD
+        app.on_load_event(LoadEvent::Batch {
+            channels: Vec::new(),
+            new_groups: vec!["Sports 4K".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(app.group_cursor, 2);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(1));
     }
 
     #[test]
@@ -1076,6 +1460,57 @@ mod tests {
         assert_eq!(app.mode, Mode::Groups);
         assert_eq!(app.group_search, "");
         assert_eq!(app.visible_groups, app.sorted_groups);
+    }
+
+    /// App with three groups, the popup open and "sports" typed into its
+    /// search (matching "Sports HD" and "Sports SD", in that order).
+    fn app_searching_sports_groups() -> App {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: Vec::new(),
+            new_groups: vec!["News".into(), "Sports HD".into(), "Sports SD".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.update_viewports(20);
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "sports".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app
+    }
+
+    #[test]
+    fn group_search_can_move_between_matches() {
+        // Regression: arrow keys were ignored while searching, so Enter
+        // could only ever pick the first match.
+        let mut app = app_searching_sports_groups();
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.mode, Mode::GroupSearch);
+        assert_eq!(app.group_cursor, 1);
+        app.handle_key(key(KeyCode::Down)); // clamps to the last match
+        assert_eq!(app.group_cursor, 1);
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.group_cursor, 1);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(2)); // Sports SD
+    }
+
+    #[test]
+    fn group_search_escape_keeps_the_highlighted_group() {
+        // Regression: Esc dropped the search and reset the cursor to
+        // "(all groups)", losing the match the user had found.
+        let mut app = app_searching_sports_groups();
+        app.handle_key(key(KeyCode::Down)); // Sports SD
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Groups);
+        assert_eq!(app.group_search, "");
+        // Rows: (all groups), News, Sports HD, Sports SD.
+        assert_eq!(app.group_cursor, 3);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(2));
     }
 
     #[test]
@@ -1161,6 +1596,50 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         assert_eq!(app.filtered, vec![2]);
+    }
+
+    #[test]
+    fn filter_matches_name_and_group_separately() {
+        // Regression: the filter ran over "name group" as one string, so
+        // `$` anchored only at the group's end and patterns could match
+        // across the gap between name and group.
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![
+                channel("Sky HD", Some(0)),
+                channel("BBC News", Some(1)),
+                channel("Arte", Some(2)),
+            ],
+            new_groups: vec!["Movies".into(), "Sports".into(), "Culture HD".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.on_load_event(LoadEvent::Finished);
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "hd$".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        // Name ending in HD, and group ending in HD.
+        assert_eq!(filtered_names(&app), ["Arte", "Sky HD"]);
+
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "news sports".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(filtered_names(&app), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn substring_filter_also_matches_name_and_group_separately() {
+        let mut app = loaded_app();
+        app.set_regex_filter(false);
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "news news".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        // "BBC News" in group "News" used to match as "bbc news news".
+        assert_eq!(app.filtered, Vec::<usize>::new());
     }
 
     #[test]
@@ -1468,6 +1947,28 @@ mod tests {
         assert_eq!(app.filtered, vec![0, 1]); // BBC (newest), then CNN
         app.record_played("http://example.com/CNN");
         assert_eq!(app.filtered, vec![1, 0]); // replay reorders
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn playing_from_recents_keeps_the_selection_on_the_played_channel() {
+        // Regression: the replayed channel moved to row 0 but the cursor
+        // stayed on row 1, so a second Enter played a different stream.
+        let (store, dir) = temp_store("rec-select");
+        let mut app = loaded_app_with(Some(store));
+        app.record_played("http://example.com/CNN");
+        app.record_played("http://example.com/BBC News");
+        app.handle_key(key(KeyCode::Char('R')));
+        app.handle_key(key(KeyCode::Down)); // CNN, row 1
+        app.handle_key(key(KeyCode::Enter));
+        let request = app.take_play_request().unwrap();
+        assert_eq!(request.name, "CNN");
+        app.record_played(&request.url);
+
+        assert_eq!(filtered_names(&app), ["CNN", "BBC News"]);
+        assert_eq!(app.selected, 0);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.take_play_request().unwrap().name, "CNN");
         let _ = std::fs::remove_dir_all(dir);
     }
 
