@@ -535,27 +535,22 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('/') => self.mode = Mode::GroupSearch,
-            KeyCode::Up => self.group_cursor = self.group_cursor.saturating_sub(1),
-            KeyCode::Down => {
-                self.move_group_down(1);
-            }
-            KeyCode::PageUp => {
-                self.group_cursor = self.group_cursor.saturating_sub(self.group_page_rows);
-            }
-            KeyCode::PageDown => self.move_group_down(self.group_page_rows),
-            KeyCode::Home => self.group_cursor = 0,
-            KeyCode::End => self.group_cursor = self.group_item_count().saturating_sub(1),
             KeyCode::Enter => self.select_group(),
-            _ => {}
+            code => self.navigate_groups(code),
         }
     }
 
+    /// Group search input. Navigation keys keep moving the cursor through
+    /// the matches while typing, so `Enter` can pick any of them, not just
+    /// the first; `Esc` ends the search but keeps the highlighted group
+    /// under the cursor in the full list.
     fn key_group_search(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                let highlighted = self.group_under_cursor();
                 self.group_search.clear();
                 self.rebuild_visible_groups();
-                self.group_cursor = 0;
+                self.group_cursor = highlighted.and_then(|id| self.group_row(id)).unwrap_or(0);
                 self.mode = Mode::Groups;
             }
             KeyCode::Enter => self.select_group(),
@@ -569,6 +564,22 @@ impl App {
                 self.rebuild_visible_groups();
                 self.group_cursor = 0;
             }
+            code => self.navigate_groups(code),
+        }
+    }
+
+    /// Moves the group popup cursor for the arrow/paging keys; any other
+    /// key is ignored.
+    fn navigate_groups(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Up => self.group_cursor = self.group_cursor.saturating_sub(1),
+            KeyCode::Down => self.move_group_down(1),
+            KeyCode::PageUp => {
+                self.group_cursor = self.group_cursor.saturating_sub(self.group_page_rows);
+            }
+            KeyCode::PageDown => self.move_group_down(self.group_page_rows),
+            KeyCode::Home => self.group_cursor = 0,
+            KeyCode::End => self.group_cursor = self.group_item_count().saturating_sub(1),
             _ => {}
         }
     }
@@ -1239,6 +1250,57 @@ mod tests {
         assert_eq!(app.mode, Mode::Groups);
         assert_eq!(app.group_search, "");
         assert_eq!(app.visible_groups, app.sorted_groups);
+    }
+
+    /// App with three groups, the popup open and "sports" typed into its
+    /// search (matching "Sports HD" and "Sports SD", in that order).
+    fn app_searching_sports_groups() -> App {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: Vec::new(),
+            new_groups: vec!["News".into(), "Sports HD".into(), "Sports SD".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        app.update_viewports(20);
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "sports".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app
+    }
+
+    #[test]
+    fn group_search_can_move_between_matches() {
+        // Regression: arrow keys were ignored while searching, so Enter
+        // could only ever pick the first match.
+        let mut app = app_searching_sports_groups();
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.mode, Mode::GroupSearch);
+        assert_eq!(app.group_cursor, 1);
+        app.handle_key(key(KeyCode::Down)); // clamps to the last match
+        assert_eq!(app.group_cursor, 1);
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.group_cursor, 1);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(2)); // Sports SD
+    }
+
+    #[test]
+    fn group_search_escape_keeps_the_highlighted_group() {
+        // Regression: Esc dropped the search and reset the cursor to
+        // "(all groups)", losing the match the user had found.
+        let mut app = app_searching_sports_groups();
+        app.handle_key(key(KeyCode::Down)); // Sports SD
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Groups);
+        assert_eq!(app.group_search, "");
+        // Rows: (all groups), News, Sports HD, Sports SD.
+        assert_eq!(app.group_cursor, 3);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(2));
     }
 
     #[test]

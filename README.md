@@ -299,8 +299,9 @@ Deleting the directory resets everything.
 | `q` | Quit |
 
 Inside the group selector (`g`): `/` searches the group list,
-`PgUp`/`PgDn`/`Home`/`End` page through it, `Enter` selects, and `Esc`
-closes it.
+`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End` move through it (also between
+matches while searching), `Enter` selects, and `Esc` ends the search
+(keeping the highlighted group) or closes the selector.
 
 ### Performance targets (100 MB playlist)
 
