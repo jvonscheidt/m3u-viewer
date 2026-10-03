@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table};
 
 use crate::app::{App, EpgState, Mode, View};
 use crate::epg::{Programme, format_time};
@@ -99,7 +99,10 @@ fn draw_channels(
             } else {
                 Style::new()
             };
-            let mut cells = vec![format!("{star}{}", channel.name)];
+            let mut cells = vec![Cell::from(Line::from(vec![
+                Span::raw(star),
+                Span::raw(channel.name.as_str()),
+            ]))];
             if let Some(guide) = guide {
                 let current = if app.offset + row == app.selected {
                     selected_programmes.and_then(|(current, _)| current)
@@ -108,10 +111,11 @@ fn draw_channels(
                         .now_next(channel.tvg_id.as_deref(), &channel.name, now)
                         .0
                 };
-                let airing = current.map_or_else(String::new, |programme| programme.title.clone());
-                cells.push(airing);
+                cells.push(Cell::from(
+                    current.map_or("", |programme| programme.title.as_str()),
+                ));
             }
-            cells.push(group.to_owned());
+            cells.push(Cell::from(group));
             Row::new(cells).style(row_style)
         });
     // With a guide, the freed-up width goes to a "now playing" column.
@@ -163,7 +167,7 @@ fn draw_epg_bar(frame: &mut Frame, area: Rect, programmes: Option<ProgrammePair<
             ),
             Style::new().dim(),
         ));
-        spans.push(Span::raw(programme.title.clone()));
+        spans.push(Span::raw(programme.title.as_str()));
     }
     if let Some(programme) = next {
         if current.is_some() {
@@ -173,7 +177,7 @@ fn draw_epg_bar(frame: &mut Frame, area: Rect, programmes: Option<ProgrammePair<
             format!("next {} ", format_time(programme.start)),
             Style::new().dim(),
         ));
-        spans.push(Span::raw(programme.title.clone()));
+        spans.push(Span::raw(programme.title.as_str()));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -189,7 +193,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let line = if app.mode == Mode::Filter {
         let mut spans = vec![
             Span::raw("/"),
-            Span::raw(app.filter.clone()),
+            Span::raw(app.filter.as_str()),
             Span::styled("█", Style::new().dim()),
         ];
         if app.filter_regex_invalid() {
@@ -284,7 +288,7 @@ fn draw_group_popup(frame: &mut Frame, app: &App) {
             .chain(
                 app.visible_groups
                     .iter()
-                    .map(|&id| ListItem::new(app.groups[id].clone())),
+                    .map(|&id| ListItem::new(app.groups[id].as_str())),
             )
             .collect::<Vec<_>>()
     } else if app.visible_groups.is_empty() {
@@ -292,7 +296,7 @@ fn draw_group_popup(frame: &mut Frame, app: &App) {
     } else {
         app.visible_groups
             .iter()
-            .map(|&id| ListItem::new(app.groups[id].clone()))
+            .map(|&id| ListItem::new(app.groups[id].as_str()))
             .collect()
     };
     let list = List::new(items)
