@@ -778,9 +778,10 @@ impl App {
     fn rebuild_sorted_groups(&mut self) {
         let cursor_group = self.group_under_cursor();
         self.sorted_groups = (0..self.groups.len()).collect();
-        let groups = &self.groups;
-        self.sorted_groups
-            .sort_by(|&a, &b| groups[a].to_lowercase().cmp(&groups[b].to_lowercase()));
+        // Compare the cached lowercase keys: lowercasing inside the
+        // comparator allocated two strings per comparison.
+        let keys = &self.group_keys;
+        self.sorted_groups.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
         self.rebuild_visible_groups();
         self.group_cursor = cursor_group.and_then(|id| self.group_row(id)).unwrap_or(0);
     }
@@ -1309,7 +1310,7 @@ mod tests {
         let mut app = App::new("test.m3u".into(), None);
         app.on_load_event(LoadEvent::Batch {
             channels: vec![channel("A", Some(0)), channel("B", Some(1))],
-            new_groups: vec!["Zeta".into(), "Alpha".into()],
+            new_groups: vec!["Zeta".into(), "Alpha".into(), "beta".into()],
             skipped: 0,
             percent: Some(100),
         });
@@ -1318,7 +1319,8 @@ mod tests {
             .iter()
             .map(|&id| app.groups[id].as_str())
             .collect();
-        assert_eq!(names, ["Alpha", "Zeta"]);
+        // Case-insensitive: "beta" sorts between "Alpha" and "Zeta".
+        assert_eq!(names, ["Alpha", "beta", "Zeta"]);
     }
 
     #[test]
