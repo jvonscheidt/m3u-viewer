@@ -304,6 +304,7 @@ impl App {
                 self.sorted_groups.clear();
                 self.visible_groups.clear();
                 self.group_search.clear();
+                self.group_cursor = 0;
                 self.url_index.clear();
                 self.skipped = 0;
                 self.percent = None;
@@ -446,7 +447,8 @@ impl App {
                 self.rebuild_visible_groups();
                 self.group_cursor = self
                     .group_filter
-                    .map_or(0, |id| self.group_display_position(id) + 1);
+                    .and_then(|id| self.group_row(id))
+                    .unwrap_or(0);
                 self.mode = Mode::Groups;
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -537,29 +539,45 @@ impl App {
             KeyCode::Esc => {
                 self.group_search.clear();
                 self.rebuild_visible_groups();
+                self.group_cursor = 0;
                 self.mode = Mode::Groups;
             }
             KeyCode::Enter => self.select_group(),
             KeyCode::Backspace => {
                 self.group_search.pop();
                 self.rebuild_visible_groups();
+                self.group_cursor = 0;
             }
             KeyCode::Char(c) if is_text_input(c, key.modifiers) => {
                 self.group_search.push(c);
                 self.rebuild_visible_groups();
+                self.group_cursor = 0;
             }
             _ => {}
         }
     }
 
-    fn select_group(&mut self) {
-        let selected = if self.group_search.is_empty() {
+    /// Group shown on the popup row under [`Self::group_cursor`]; `None`
+    /// for the synthetic "(all groups)" row or an empty search result.
+    fn group_under_cursor(&self) -> Option<GroupId> {
+        if self.group_search.is_empty() {
             self.group_cursor
                 .checked_sub(1)
                 .and_then(|position| self.visible_groups.get(position).copied())
         } else {
             self.visible_groups.get(self.group_cursor).copied()
-        };
+        }
+    }
+
+    /// Popup row currently showing `id`, if it is visible at all (the
+    /// "(all groups)" row shifts real groups down by one without a search).
+    fn group_row(&self, id: GroupId) -> Option<usize> {
+        let position = self.visible_groups.iter().position(|&group| group == id)?;
+        Some(position + usize::from(self.group_search.is_empty()))
+    }
+
+    fn select_group(&mut self) {
+        let selected = self.group_under_cursor();
         if !self.group_search.is_empty() && selected.is_none() {
             self.message = Some("✗ no matching groups".to_owned());
             return;
@@ -695,14 +713,22 @@ impl App {
     }
 
     /// Rebuilds the alphabetical group order shown in the group popup.
+    ///
+    /// Runs whenever a batch brings new groups — possibly while the popup
+    /// is open — so the cursor stays on the group it was on (which may
+    /// have shifted rows) instead of jumping back to "(all groups)".
     fn rebuild_sorted_groups(&mut self) {
+        let cursor_group = self.group_under_cursor();
         self.sorted_groups = (0..self.groups.len()).collect();
         let groups = &self.groups;
         self.sorted_groups
             .sort_by(|&a, &b| groups[a].to_lowercase().cmp(&groups[b].to_lowercase()));
         self.rebuild_visible_groups();
+        self.group_cursor = cursor_group.and_then(|id| self.group_row(id)).unwrap_or(0);
     }
 
+    /// Recomputes [`Self::visible_groups`] from the current search. Leaves
+    /// [`Self::group_cursor`] alone: each caller decides where it belongs.
     fn rebuild_visible_groups(&mut self) {
         if self.group_search.is_empty() {
             self.visible_groups.clone_from(&self.sorted_groups);
@@ -715,16 +741,6 @@ impl App {
                 .filter(|&id| self.groups[id].to_lowercase().contains(&needle))
                 .collect();
         }
-        self.group_cursor = 0;
-    }
-
-    /// Row of `id` in the group popup (its position in
-    /// [`Self::sorted_groups`]).
-    fn group_display_position(&self, id: GroupId) -> usize {
-        self.sorted_groups
-            .iter()
-            .position(|&group_id| group_id == id)
-            .unwrap_or(0)
     }
 
     /// Group restriction and text filter (view membership is handled in
@@ -1055,6 +1071,58 @@ mod tests {
         app.handle_key(key(KeyCode::Char('g')));
         // Popup rows: 0 "(all groups)", 1 Alpha, 2 Zeta.
         assert_eq!(app.group_cursor, 2);
+    }
+
+    #[test]
+    fn group_cursor_stays_on_its_group_when_a_batch_adds_groups() {
+        // Regression: every batch with new groups reset the popup cursor
+        // to "(all groups)", so Enter ignored what the user arrowed to.
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("A", Some(0)), channel("B", Some(1))],
+            new_groups: vec!["Movies".into(), "Sports".into()],
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down)); // Sports, row 2
+        // "Kids" sorts between them, pushing Sports down to row 3.
+        app.on_load_event(LoadEvent::Batch {
+            channels: vec![channel("C", Some(2))],
+            new_groups: vec!["Kids".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(app.group_cursor, 3);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(1));
+    }
+
+    #[test]
+    fn group_search_cursor_stays_on_its_match_when_a_batch_adds_groups() {
+        let mut app = App::new("test.m3u".into(), None);
+        app.on_load_event(LoadEvent::Batch {
+            channels: Vec::new(),
+            new_groups: vec!["Sports HD".into(), "Sports SD".into()],
+            skipped: 0,
+            percent: Some(50),
+        });
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "sports".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.group_cursor = 1; // Sports SD
+        app.on_load_event(LoadEvent::Batch {
+            channels: Vec::new(),
+            new_groups: vec!["Sports 4K".into()],
+            skipped: 0,
+            percent: Some(100),
+        });
+        assert_eq!(app.group_cursor, 2);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.group_filter, Some(1));
     }
 
     #[test]
