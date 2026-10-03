@@ -366,6 +366,11 @@ impl App {
     }
 
     /// Records a successful playback in the recents list.
+    ///
+    /// In the recents view the played channel moves to the top of the
+    /// list, so the selection follows it there: otherwise the cursor would
+    /// stay on the old row index — now a different channel — and the next
+    /// `Enter` would play something else.
     pub fn record_played(&mut self, url: &str) {
         if let Some(store) = &mut self.store {
             if let Err(error) = store.push_recent(url) {
@@ -373,6 +378,14 @@ impl App {
             }
             if self.view == View::Recents {
                 self.recompute_filter();
+                if let Some(position) = self
+                    .filtered
+                    .iter()
+                    .position(|&index| self.channels[index].url == url)
+                {
+                    self.selected = position;
+                    self.clamp_selection();
+                }
             }
         }
     }
@@ -1468,6 +1481,28 @@ mod tests {
         assert_eq!(app.filtered, vec![0, 1]); // BBC (newest), then CNN
         app.record_played("http://example.com/CNN");
         assert_eq!(app.filtered, vec![1, 0]); // replay reorders
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn playing_from_recents_keeps_the_selection_on_the_played_channel() {
+        // Regression: the replayed channel moved to row 0 but the cursor
+        // stayed on row 1, so a second Enter played a different stream.
+        let (store, dir) = temp_store("rec-select");
+        let mut app = loaded_app_with(Some(store));
+        app.record_played("http://example.com/CNN");
+        app.record_played("http://example.com/BBC News");
+        app.handle_key(key(KeyCode::Char('R')));
+        app.handle_key(key(KeyCode::Down)); // CNN, row 1
+        app.handle_key(key(KeyCode::Enter));
+        let request = app.take_play_request().unwrap();
+        assert_eq!(request.name, "CNN");
+        app.record_played(&request.url);
+
+        assert_eq!(filtered_names(&app), ["CNN", "BBC News"]);
+        assert_eq!(app.selected, 0);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.take_play_request().unwrap().name, "CNN");
         let _ = std::fs::remove_dir_all(dir);
     }
 
