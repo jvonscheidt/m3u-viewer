@@ -17,6 +17,10 @@ use crate::loader::LoadEvent;
 use crate::playlist::{Channel, GroupId};
 use crate::store::Store;
 
+/// Most rows the load-error / refresh-warning band above the status bar
+/// may take; longer text is cut there (the full text is in the log).
+pub(crate) const MAX_NOTICE_ROWS: usize = 3;
+
 /// How the current filter text is matched against a channel's name and
 /// group (each on its own — see [`App::matches`]).
 /// Rebuilt by [`App::rebuild_filter_matcher`] whenever the filter text or
@@ -879,7 +883,15 @@ impl App {
     /// Updates channel and group-popup viewport sizes for the current terminal
     /// height, keeping the channel selection visible.
     pub fn update_viewports(&mut self, terminal_rows: usize) {
-        let reserved_rows = 1 + usize::from(self.visible_guide().is_some());
+        // The notice band's real height depends on the terminal width,
+        // which isn't known here; reserving its maximum only makes the
+        // list scroll a little early, never hides the selection behind it.
+        let notice_rows = if self.error.is_some() || self.warning.is_some() {
+            MAX_NOTICE_ROWS
+        } else {
+            0
+        };
+        let reserved_rows = 1 + usize::from(self.visible_guide().is_some()) + notice_rows;
         self.ensure_visible(terminal_rows.saturating_sub(reserved_rows).max(1));
         self.group_page_rows = terminal_rows.min(17).saturating_sub(3).max(1);
     }
