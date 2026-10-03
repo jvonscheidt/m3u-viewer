@@ -951,9 +951,16 @@ impl<S: BuildHasher> UrlIndex<S> {
 }
 
 /// Merges two channel-index lists, each already sorted by `keys[index]`,
-/// into `out` — the linear-time counterpart to re-sorting the
-/// concatenation, used to fold a newly arrived batch into a running
-/// alphabetical order without re-touching the entries already placed.
+/// into `out` — the counterpart to re-sorting the concatenation, used to
+/// fold a newly arrived batch into a running alphabetical order without
+/// re-comparing the entries already placed.
+///
+/// `a` is the long running list and `b` the short new batch: each `b`
+/// entry binary-searches its slot in the rest of `a`, and the run of `a`
+/// before it is block-copied. That costs O(|b| log |a|) key comparisons
+/// plus one memcpy-speed pass over `a`, instead of a comparison — two
+/// pointer-chasing string reads — per entry of `a` on every batch. On
+/// equal keys, entries of `a` come first.
 ///
 /// `out` is cleared first and must be distinct from `a` and `b`; the
 /// caller passes a reused scratch buffer and swaps it into place, so a
@@ -962,18 +969,15 @@ impl<S: BuildHasher> UrlIndex<S> {
 fn merge_by_key_into(out: &mut Vec<usize>, a: &[usize], b: &[usize], keys: &[String]) {
     out.clear();
     out.reserve(a.len() + b.len());
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        if keys[a[i]] <= keys[b[j]] {
-            out.push(a[i]);
-            i += 1;
-        } else {
-            out.push(b[j]);
-            j += 1;
-        }
+    let mut rest = a;
+    for &incoming in b {
+        let key = &keys[incoming];
+        let run = rest.partition_point(|&placed| keys[placed] <= *key);
+        out.extend_from_slice(&rest[..run]);
+        out.push(incoming);
+        rest = &rest[run..];
     }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
+    out.extend_from_slice(rest);
 }
 
 fn is_text_input(character: char, modifiers: KeyModifiers) -> bool {
@@ -1074,6 +1078,27 @@ mod tests {
         index.insert(&channels, 1);
         assert_eq!(index.get(&channels, "http://example.com/A"), Some(0));
         assert_eq!(index.get(&channels, "http://example.com/B"), None);
+    }
+
+    #[test]
+    fn merge_matches_a_stable_sort_of_the_concatenation() {
+        let keys: Vec<String> = (0..200_u64)
+            .map(|i| format!("{:02}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 37))
+            .collect();
+        let sorted = |range: std::ops::Range<usize>| {
+            let mut list: Vec<usize> = range.collect();
+            list.sort_by(|&x, &y| keys[x].cmp(&keys[y]));
+            list
+        };
+        for split in [0, 1, 50, 150, 199, 200] {
+            let (a, b) = (sorted(0..split), sorted(split..200));
+            let mut out = Vec::new();
+            merge_by_key_into(&mut out, &a, &b, &keys);
+            // A stable sort of a ++ b keeps a's entries first on ties.
+            let mut expected: Vec<usize> = a.iter().chain(&b).copied().collect();
+            expected.sort_by(|&x, &y| keys[x].cmp(&keys[y]));
+            assert_eq!(out, expected, "split {split}");
+        }
     }
 
     #[test]
