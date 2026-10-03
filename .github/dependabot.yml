@@ -1,0 +1,13 @@
+# Actions are pinned to commit SHAs; Dependabot bumps the SHA and the
+# trailing "# vX.Y.Z" comment together so the pins do not go stale.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
