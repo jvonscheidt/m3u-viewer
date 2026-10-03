@@ -118,7 +118,17 @@ jobs:
           sha256sum m3u-viewer-* > SHA256SUMS
           cat SHA256SUMS
       - name: Create GitHub release for the tag
+        # A re-run (or a release drafted by hand) finds the release already
+        # there and only re-uploads assets. "release not found" is the one
+        # tolerated lookup failure; anything else (auth, network, API) fails.
         run: |
+          if view=$(gh release view "$TAG" --json tagName 2>&1); then
+            echo "release $TAG already exists; uploading assets to it"
+            exit 0
+          elif [[ "$view" != *"release not found"* ]]; then
+            echo "::error::could not look up release $TAG: $view"
+            exit 1
+          fi
           flags=()
           if [ "$PRERELEASE" = "true" ]; then
             flags+=(--prerelease)
@@ -127,7 +137,7 @@ jobs:
             --title "$TAG" \
             --verify-tag \
             --generate-notes \
-            "${flags[@]}" || echo "release already exists"
+            "${flags[@]}"
       - name: Upload archives and checksums
         run: gh release upload "$TAG" dist/* --clobber
 
