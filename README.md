@@ -149,7 +149,7 @@ Press `?` inside the viewer for the full list. The essentials:
 
 ### Where your data lives
 
-All persistent data lives in the per-user config directory — on Windows
+Settings and lists live in the per-user config directory — on Windows
 `%APPDATA%\m3u-viewer\config\`, on Linux `~/.config/m3u-viewer/`, on
 macOS `~/Library/Application Support/m3u-viewer/`.
 
@@ -158,15 +158,30 @@ macOS `~/Library/Application Support/m3u-viewer/`.
 | `config.toml` | Xtream credentials, user agent, EPG source, and VLC path (written by `--save-config`); hand-edited toggles like `regex_filter`, `vlc_reuse_instance`, and `vlc_prewarm` |
 | `favorites.json` | Favorited channel URLs |
 | `recents.json` | Recently played channel URLs (newest first, capped at 50) |
-| `cache/` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs. If the refresh fails, the cached list stays on screen with a warning in the status bar |
 | `m3u-viewer.log` | Diagnostic log (startup, loading, playback timings); appended across runs and rotated to `m3u-viewer.log.old` once it spans 30 days (if that file is locked, the log keeps appending; a log that cannot be opened never stops the viewer) |
+
+The Xtream playlist cache lives in the per-user cache directory instead, so
+its tens of megabytes are never synced with a roaming profile — on Windows
+`%LOCALAPPDATA%\m3u-viewer\cache\`, on Linux `~/.cache/m3u-viewer/` (or
+`$XDG_CACHE_HOME/m3u-viewer/`), on macOS `~/Library/Caches/m3u-viewer/`.
+
+| File | Contents |
+| --- | --- |
+| `xtream-*.m3u` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs. If the refresh fails, the cached list stays on screen with a warning above the status bar. After a password change, the first successful refresh deletes the account's cache from the old password |
+| `xtream-*.m3u.tmp.*` | Playlist being downloaded; replaces the cached copy once complete. Left behind if the viewer quits or crashes mid-download, and deleted by the next launch that loads an Xtream playlist (never while another running viewer is still writing it) |
+
+Up to 0.9.1 the cache was kept in a `cache\` subdirectory of the config
+directory; the first Xtream load with a newer version deletes the playlists
+there (they are re-downloaded, not moved) and leaves the rest of the config
+directory alone.
 
 Favorites and recents are keyed by stream URL, so they survive playlist
 re-downloads and re-ordering. **Xtream credentials are stored in plaintext**
 in `config.toml` and in stream URLs inside the cache, favorites, and recents
 files. These files are protected by the user account's filesystem access
 controls (and created with mode `0600` on Unix), but they are not encrypted.
-Deleting the directory resets everything.
+Deleting both directories resets everything; deleting only the cache
+directory just makes the next launch download the playlist live.
 
 ## Specification
 
@@ -213,8 +228,8 @@ Deleting the directory resets everything.
   server, username, and password, so a changed password never reuses
   stream URLs carrying the old one. (Upgrading from an earlier version
   re-keys the cache once, so the first launch loads live.) A failed
-  live refresh keeps the cached list on screen and says so in the status
-  bar, with any password masked in the message.
+  live refresh keeps the cached list on screen and says so above the
+  status bar, with any password masked in the message.
 - Network timeouts (since 0.9.1): 10 s to connect, 60 s for the server to
   start answering, and 30 s without data mid-download; a download that
   keeps progressing is never cut off (1 h hard cap).

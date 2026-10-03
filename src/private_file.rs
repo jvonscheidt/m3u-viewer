@@ -54,15 +54,37 @@ pub(crate) fn write(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Returns a sibling temp path unique across concurrent calls and processes.
+/// Separates the original file name from the unique suffix in
+/// [`unique_tmp`] names.
+const TMP_MARKER: &str = ".tmp.";
+
+/// Returns a sibling temp path unique across concurrent calls and processes:
+/// `<file name>.tmp.<pid>.<nanos>.<sequence>` (see [`parse_tmp_name`]).
 pub(crate) fn unique_tmp(path: &Path) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp.{}.{nanos}.{sequence}", std::process::id()));
+    name.push(format!(
+        "{TMP_MARKER}{}.{nanos}.{sequence}",
+        std::process::id()
+    ));
     path.with_file_name(name)
+}
+
+/// Splits a file name produced by [`unique_tmp`] into the name of the file
+/// it was going to replace and the id of the process that created it.
+/// `None` for any other name.
+pub(crate) fn parse_tmp_name(name: &str) -> Option<(&str, u32)> {
+    let (base, suffix) = name.rsplit_once(TMP_MARKER)?;
+    let mut fields = suffix.split('.');
+    let pid = fields.next()?.parse().ok()?;
+    let is_number = |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit());
+    let well_formed = fields.next().is_some_and(is_number)
+        && fields.next().is_some_and(is_number)
+        && fields.next().is_none();
+    (well_formed && !base.is_empty()).then_some((base, pid))
 }
 
 /// Atomically replaces `path` with synchronized `contents`.
@@ -149,6 +171,32 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), path.parent());
         assert_eq!(second.parent(), path.parent());
+    }
+
+    #[test]
+    fn temp_names_parse_back_to_their_target_and_creator() {
+        let tmp = unique_tmp(Path::new("dir/xtream-a.m3u"));
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            parse_tmp_name(name),
+            Some(("xtream-a.m3u", std::process::id()))
+        );
+    }
+
+    #[test]
+    fn other_names_are_not_mistaken_for_temp_files() {
+        for name in [
+            "xtream-a.m3u",
+            "xtream-a.m3u.tmp.",
+            "xtream-a.m3u.tmp.12",
+            "xtream-a.m3u.tmp.12.34",
+            "xtream-a.m3u.tmp.12.34.x",
+            "xtream-a.m3u.tmp.12.34.56.78",
+            "xtream-a.m3u.tmp.pid.34.56",
+            ".tmp.12.34.56",
+        ] {
+            assert_eq!(parse_tmp_name(name), None, "{name}");
+        }
     }
 
     #[test]
