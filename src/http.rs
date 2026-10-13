@@ -144,7 +144,7 @@ fn resolve(base: &str, location: &str) -> Option<String> {
         format!("{scheme}://{authority}{location}")
     } else {
         let path = base.path();
-        let dir = &path[..=path.rfind('/').unwrap_or(0)];
+        let dir = path.rfind('/').map_or("/", |slash| &path[..=slash]);
         format!("{scheme}://{authority}{dir}{location}")
     };
     let uri = resolved.parse::<Uri>().ok()?;
@@ -185,6 +185,14 @@ mod tests {
         assert_eq!(
             resolve(base, "next.php").as_deref(),
             Some("http://a.example:8080/dir/next.php")
+        );
+        assert_eq!(
+            resolve("http://a.example:8080?x=1", "next.php").as_deref(),
+            Some("http://a.example:8080/next.php")
+        );
+        assert_eq!(
+            resolve("http://a.example:8080", "next.php").as_deref(),
+            Some("http://a.example:8080/next.php")
         );
         assert_eq!(resolve(base, "http://"), None);
     }
