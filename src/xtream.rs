@@ -409,12 +409,12 @@ impl Account {
     /// logged, so one bad entry does not cost the whole list.
     fn fetch_api_list<R: RawRecord>(&self, action: &str) -> Result<Vec<R::Record>, XtreamError> {
         let response = self.request(&self.api_url(action))?;
-        // Unlimited body: full stream lists routinely exceed ureq's
-        // 10 MB default (55k streams ≈ 20 MB of JSON).
+        // Raise ureq's 10 MiB default (55k streams ≈ 20 MiB of JSON),
+        // while still bounding the in-memory list parser.
         let reader = response
             .into_body()
             .into_with_config()
-            .limit(u64::MAX)
+            .limit(player_api::MAX_API_RESPONSE_BYTES)
             .reader();
         let list = player_api::parse_api_list::<R>(reader)?;
         if list.skipped > 0 {

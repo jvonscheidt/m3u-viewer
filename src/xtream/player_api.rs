@@ -17,6 +17,12 @@ use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqA
 
 use super::{Category, LiveStream, XtreamError};
 
+/// Maximum size of one `player_api.php` JSON reply (256 MiB; a 55k-stream
+/// list is ~20 MiB). Raises ureq's 10 MiB default without leaving the
+/// in-memory list parser open to unbounded responses (such as a server or
+/// proxy redirecting an API call to a live stream).
+pub(super) const MAX_API_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Records parsed from one player-API list.
 #[derive(Debug)]
 pub(super) struct ApiList<T> {
@@ -34,21 +40,36 @@ pub(super) struct ApiList<T> {
 ///
 /// # Errors
 ///
-/// [`XtreamError::Json`] when the reply is not well-formed JSON,
-/// [`XtreamError::AuthFailed`] for the panel's "not authorized" account
-/// object, and [`XtreamError::UnexpectedApiReply`] for any other reply
-/// that is not a list.
+/// [`XtreamError::Json`] when the reply is not well-formed JSON or exceeds
+/// [`MAX_API_RESPONSE_BYTES`], [`XtreamError::AuthFailed`] for the panel's
+/// "not authorized" account object, and [`XtreamError::UnexpectedApiReply`]
+/// for any other reply that is not a list.
 pub(super) fn parse_api_list<R: RawRecord>(
     reader: impl std::io::Read,
+) -> Result<ApiList<R::Record>, XtreamError> {
+    parse_api_list_bounded::<R>(reader, MAX_API_RESPONSE_BYTES)
+}
+
+fn parse_api_list_bounded<R: RawRecord>(
+    reader: impl std::io::Read,
+    max_bytes: u64,
 ) -> Result<ApiList<R::Record>, XtreamError> {
     // Straight from the byte stream into the records: no intermediate
     // `serde_json::Value` tree, which for a 20 MB stream list would cost
     // several times the body in short-lived allocations on top of the
     // records being built. Only one record's raw fields (and, for the
     // account object, the small `user_info`) exist as loose values.
-    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(reader));
+    // Read at most `max_bytes + 1` so a reply exceeding `max_bytes` fails
+    // even if the cap lands right on a token boundary.
+    let mut limited = std::io::BufReader::new(reader.take(max_bytes.saturating_add(1)));
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
     let outcome = (&mut deserializer).deserialize_any(ListVisitor::<R>(PhantomData))?;
     deserializer.end()?;
+    if limited.into_inner().limit() == 0 {
+        return Err(XtreamError::Json(serde::de::Error::custom(format!(
+            "player API response exceeds {max_bytes} bytes"
+        ))));
+    }
     match outcome {
         Outcome::List(list) => Ok(list),
         Outcome::AuthFailed => Err(XtreamError::AuthFailed),
@@ -729,6 +750,27 @@ mod tests {
         let error =
             parse_api_list::<RawLiveStream>(br#"[{"stream_id":1},"#.as_slice()).unwrap_err();
         assert!(matches!(error, XtreamError::Json(_)));
+    }
+
+    #[test]
+    fn oversized_api_reply_is_rejected_without_reading_to_eof() {
+        let payload = br#"[{"stream_id":1,"name":"One"},{"stream_id":2,"name":"Two"}]"#;
+        let within =
+            parse_api_list_bounded::<RawLiveStream>(payload.as_slice(), payload.len() as u64)
+                .unwrap();
+        assert_eq!(ids(&within), [1, 2]);
+
+        let over =
+            parse_api_list_bounded::<RawLiveStream>(payload.as_slice(), (payload.len() - 1) as u64)
+                .unwrap_err();
+        assert!(matches!(over, XtreamError::Json(_)));
+
+        // Even when the byte cap lands right after a complete JSON value,
+        // a reply larger than `max_bytes` is rejected.
+        let boundary = br#"[{"stream_id":1}]   "#;
+        let boundary_err =
+            parse_api_list_bounded::<RawLiveStream>(boundary.as_slice(), 17).unwrap_err();
+        assert!(matches!(boundary_err, XtreamError::Json(_)));
     }
 
     #[test]
