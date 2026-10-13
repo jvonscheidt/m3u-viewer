@@ -25,9 +25,17 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 const USAGE: &str = "usage: m3u-viewer <playlist.m3u> [--epg <url-or-file>] [--vlc <path>] [--vlc-reuse-instance]\n       \
      m3u-viewer --xtream <server> --username <user> --password <pass> [--epg <url-or-file>] [--user-agent <ua>] [--vlc <path>] [--vlc-reuse-instance] [--save-config]\n       \
      m3u-viewer [--vlc <path>]   (uses saved Xtream credentials from config)\n       \
-     m3u-viewer --version";
+     m3u-viewer --help | --version";
 
 const VERSION: &str = concat!("m3u-viewer ", env!("CARGO_PKG_VERSION"));
+
+fn help_requested(args: &[OsString]) -> Result<bool> {
+    let has_help = args.iter().any(|arg| arg == "--help" || arg == "-h");
+    if has_help && args.len() != 1 {
+        bail!("--help cannot be combined with other arguments\n{USAGE}");
+    }
+    Ok(has_help)
+}
 
 fn version_requested(args: &[OsString]) -> Result<bool> {
     let has_version = args.iter().any(|arg| arg == "--version" || arg == "-V");
@@ -72,6 +80,8 @@ fn looks_like_flag(arg: &OsStr) -> bool {
                 | "--epg"
                 | "--vlc-reuse-instance"
                 | "--save-config"
+                | "--help"
+                | "-h"
                 | "--version"
                 | "-V"
         )
@@ -125,6 +135,8 @@ impl CliFlags {
                 flags.vlc_reuse_instance = true;
             } else if arg == "--save-config" {
                 flags.save_config = true;
+            } else if arg.as_encoded_bytes().starts_with(b"-") {
+                bail!("unknown option: {}\n{USAGE}", arg.to_string_lossy());
             } else if flags.playlist.is_none() && flags.server.is_none() {
                 flags.playlist = Some(PathBuf::from(arg));
             } else {
@@ -454,6 +466,10 @@ fn config_to_save(args: &Args, current: &Config) -> Config {
 
 fn main() -> Result<()> {
     let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
+    if help_requested(&raw_args)? {
+        println!("{USAGE}");
+        return Ok(());
+    }
     if version_requested(&raw_args)? {
         println!("{VERSION}");
         return Ok(());
@@ -1614,5 +1630,24 @@ mod tests {
         let error = version_requested(&[OsString::from("--version"), OsString::from("list.m3u")])
             .unwrap_err();
         assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn help_flags_are_recognized_without_a_source() {
+        assert!(help_requested(&[OsString::from("--help")]).unwrap());
+        assert!(help_requested(&[OsString::from("-h")]).unwrap());
+    }
+
+    #[test]
+    fn help_flag_cannot_be_combined_with_other_arguments() {
+        let error =
+            help_requested(&[OsString::from("--help"), OsString::from("list.m3u")]).unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected_not_treated_as_a_playlist_path() {
+        let error = parse(&["--unknown"]).err().unwrap();
+        assert!(error.to_string().contains("unknown option: --unknown"));
     }
 }
