@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "m3u-viewer"
-version = "0.9.3"
+version = "0.9.4"
 dependencies = [
  "anyhow",
  "chrono",
