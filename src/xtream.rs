@@ -28,52 +28,52 @@ mod player_api;
 ///
 /// The aim is to fail fast on a dead or hung server while never cutting
 /// off a large download that is still making progress on a slow link.
-/// How the fields map onto ureq 3.3, whose timeout semantics are subtle:
-/// while waiting on the socket, ureq measures the timeout of the *current*
-/// phase from "now" (so it restarts on every read or write), and the
-/// timeout of each *preceding* phase from the moment that phase finished.
-/// Once such a deadline has passed, ureq does not abort outright: each
-/// further socket wait gets a 1 s timeout, so the first gap longer than
-/// that fails the request.
+/// How the fields map onto ureq (3.5.1 or later): every `timeout_<phase>`
+/// is a *total* budget for that phase, counted from when the previous
+/// phase finished and never restarted by socket activity; it stops
+/// applying once its phase is over. The only inactivity limit is
+/// `timeout_per_read`, which restarts on every socket read — of the
+/// response headers as well as the body.
 ///
 /// - [`connect`](Self::connect) → `timeout_resolve` + `timeout_connect`
 ///   (DNS, TCP, and TLS handshake).
-/// - [`headers`](Self::headers) → `timeout_send_request`. As the phase
-///   before "receive response", it doubles as a deadline for the response
-///   headers, counted from when the request was sent.
-/// - [`idle`](Self::idle) → `timeout_recv_body`. As the current phase
-///   during the body, it restarts on every socket read: a true inactivity
-///   timeout that never fires while bytes keep arriving.
-/// - `timeout_recv_response` is deliberately left unset: as the phase
-///   before the body, its deadline (counted from when the headers
-///   arrived) also applies to every body read, so any value would cut off
-///   a long download at its first pause of more than a second.
+/// - [`headers`](Self::headers) → `timeout_send_request` +
+///   `timeout_recv_response`: sending the request, then receiving the
+///   complete response headers.
+/// - [`idle`](Self::idle) → `timeout_per_read`: an inactivity timeout that
+///   never fires while bytes keep arriving.
+/// - `timeout_recv_body` is deliberately left unset: as a total budget for
+///   the body, any value would cut off a big download on a slow link.
 /// - [`total`](Self::total) → `timeout_global`, the only end-to-end cap.
-///   Softened the same way: past it, a download survives only as long as
-///   no gap exceeds 1 s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HttpTimeouts {
     /// Name resolution and connection setup (including TLS), each.
     pub(crate) connect: Duration,
     /// From sending the request until the response headers are complete.
-    /// Generous because panels build big `get.php` / `xmltv.php` replies
-    /// before sending the first byte.
+    /// Panels build big `get.php` / `xmltv.php` replies before sending the
+    /// first byte, but one that stays silent this long is treated as hung.
     pub(crate) headers: Duration,
-    /// Longest silence tolerated while reading the response body.
+    /// Longest silence tolerated on any single socket read. ureq applies
+    /// it to the wait for the response headers too, so a value below
+    /// [`headers`](Self::headers) would shorten that allowance.
     pub(crate) idle: Duration,
     /// Backstop for the whole request, body included; `None` for no cap.
     pub(crate) total: Option<Duration>,
 }
 
 impl HttpTimeouts {
-    /// Production values. `total` is a safety net against a server that
-    /// drip-feeds just often enough to dodge `idle` and would otherwise
-    /// pin a loader thread forever. One hour at a mere 50 kB/s is still
-    /// ~180 MB — several times the largest real playlists, stream lists,
-    /// or guides — so it never truncates a download that is progressing.
+    /// Production values. `idle` and `headers` are equal because ureq has
+    /// no inactivity limit for the body alone (see [`idle`](Self::idle)),
+    /// so one 30 s limit covers both a panel slow to start replying and a
+    /// download that stalls midway.
+    /// `total` is a safety net against a server that drip-feeds just
+    /// often enough to dodge `idle` and would otherwise pin a loader
+    /// thread forever. One hour at a mere 50 kB/s is still ~180 MB —
+    /// several times the largest real playlists, stream lists, or guides
+    /// — so it never truncates a download that is progressing.
     pub(crate) const STANDARD: Self = Self {
         connect: Duration::from_secs(10),
-        headers: Duration::from_mins(1),
+        headers: Duration::from_secs(30),
         idle: Duration::from_secs(30),
         total: Some(Duration::from_hours(1)),
     };
@@ -88,8 +88,9 @@ pub(crate) fn http_agent(timeouts: HttpTimeouts) -> ureq::Agent {
         .timeout_resolve(Some(timeouts.connect))
         .timeout_connect(Some(timeouts.connect))
         .timeout_send_request(Some(timeouts.headers))
-        .timeout_recv_response(None)
-        .timeout_recv_body(Some(timeouts.idle))
+        .timeout_recv_response(Some(timeouts.headers))
+        .timeout_recv_body(None)
+        .timeout_per_read(Some(timeouts.idle))
         .timeout_global(timeouts.total)
         .max_redirects(0)
         .build();
@@ -490,10 +491,11 @@ pub(crate) mod test_server {
         total: Some(Duration::from_secs(20)),
     };
 
-    /// Gap between body chunks in the slow-but-steady tests. It must
-    /// exceed one second: once a ureq deadline has passed, ureq keeps
-    /// reading with a 1 s socket timeout instead of failing at once, so
-    /// only gaps longer than that expose a body that is wrongly capped.
+    /// Gap between body chunks in the slow-but-steady tests. Two gaps
+    /// outlast every [`PATIENT`] limit but `total`, so a body wrongly
+    /// capped by a fixed budget (such as ureq's `timeout_recv_body`) is
+    /// cut off; it also exceeds one second, the grace that ureq 3.3 gave
+    /// reads past an expired deadline.
     pub(crate) const TRICKLE_GAP: Duration = Duration::from_millis(1200);
 
     /// [`FAST`], but with an idle timeout that tolerates [`TRICKLE_GAP`].
@@ -894,6 +896,15 @@ mod tests {
         assert_eq!(text, expected);
         drop(reader);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn standard_idle_does_not_shorten_the_header_wait() {
+        // ureq's per-read limit (`idle`) also covers the wait for the
+        // response headers, so a smaller value would silently cut the
+        // generous `headers` allowance for panels slow to start replying.
+        let standard = HttpTimeouts::STANDARD;
+        assert!(standard.idle >= standard.headers, "{standard:?}");
     }
 
     #[test]
