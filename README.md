@@ -238,7 +238,7 @@ directory just makes the next launch download the playlist live.
   re-keys the cache once, so the first launch loads live.) A failed
   live refresh keeps the cached list on screen and says so above the
   status bar, with any password masked in the message.
-- Network timeouts (since 0.9.1): 10 s to connect, 60 s for the server to
+- Network timeouts (since 0.9.1): 10 s to connect, 30 s for the server to
   start answering, and 30 s without data mid-download; a download that
   keeps progressing is never cut off (1 h hard cap).
 - Player API (since 0.9.2): lists are parsed record by record and

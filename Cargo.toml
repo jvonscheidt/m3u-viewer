@@ -23,7 +23,7 @@ serde_json = "1.0.150"
 simplelog = "0.12.2"
 thiserror = "2.0.18"
 toml = "1.1.2"
-ureq = "3.3.0"
+ureq = "3.5.1"
 
 # Only for WaitForInputIdle, which times how long VLC takes to finish
 # initialising; already in the lock tree via crossterm, so no new build.
