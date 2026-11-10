@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
@@ -21,7 +21,6 @@ use std::thread;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use flate2::bufread::MultiGzDecoder;
 use quick_xml::Reader as XmlReader;
-use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
 use thiserror::Error;
 
@@ -180,9 +179,10 @@ pub fn format_time(epoch: i64) -> String {
 }
 
 /// How the document's bytes map to characters, taken from its XML
-/// declaration. quick-xml is built without its `encoding` feature, so it
-/// hands over raw bytes and decoding happens here — leniently, so one bad
-/// byte costs one character (U+FFFD), not the whole guide.
+/// declaration. quick-xml (since 0.42) only accepts UTF-8 and fails the
+/// document on the first invalid byte, so [`Utf8Transcoder`] decodes the
+/// input before it reaches the parser — leniently, so one bad byte costs
+/// one character (U+FFFD), not the whole guide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextEncoding {
     /// UTF-8, the XML default.
@@ -237,6 +237,152 @@ impl TextEncoding {
             _ => String::from_utf8_lossy(bytes),
         }
     }
+
+    /// Length of the UTF-8 sequence that `bytes` ends in the middle of —
+    /// to be completed by the next read rather than decoded as U+FFFD — or
+    /// 0. Windows-1252 has no multi-byte characters, so it is always 0.
+    fn incomplete_tail_len(self, bytes: &[u8]) -> usize {
+        if self == Self::Windows1252 {
+            return 0;
+        }
+        // A sequence is at most four bytes, so a cut one starts within the
+        // last three; find its lead byte (anything but a continuation byte).
+        let tail_start = bytes.len().saturating_sub(3);
+        let Some(lead) = bytes[tail_start..]
+            .iter()
+            .rposition(|&byte| byte & 0xc0 != 0x80)
+            .map(|offset| tail_start + offset)
+        else {
+            return 0;
+        };
+        let expected = match bytes[lead] {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            // ASCII, or a byte that never starts a valid sequence.
+            _ => return 0,
+        };
+        let present = bytes.len() - lead;
+        if present < expected { present } else { 0 }
+    }
+}
+
+/// Feeds quick-xml the document as UTF-8: decodes it per the XML
+/// declaration's `encoding` (see [`TextEncoding`]), turning invalid bytes
+/// into U+FFFD instead of letting them fail the whole guide.
+///
+/// quick-xml's own `DecodingReader` would need its `encoding` feature and
+/// `encoding_rs`, and it reports invalid input as an error.
+struct Utf8Transcoder<R> {
+    inner: R,
+    /// Settled on the first read, from the document's opening bytes.
+    encoding: Option<TextEncoding>,
+    /// Decoded text; `out[pos..]` has not been consumed by the parser yet.
+    out: String,
+    pos: usize,
+    /// Input read but not decoded yet: the bytes sniffed for the XML
+    /// declaration, or a UTF-8 sequence cut off at the end of a read.
+    raw: Vec<u8>,
+}
+
+impl<R: BufRead> Utf8Transcoder<R> {
+    /// The XML declaration ends at the document's first `>`; a document
+    /// without one stops the search here.
+    const SNIFF_LIMIT: u64 = 1024;
+
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            encoding: None,
+            out: String::new(),
+            pos: 0,
+            raw: Vec::new(),
+        }
+    }
+
+    /// Reads the document's opening bytes into `raw` and picks the
+    /// encoding from the XML declaration among them, if any.
+    fn sniff(&mut self) -> io::Result<TextEncoding> {
+        self.inner
+            .by_ref()
+            .take(Self::SNIFF_LIMIT)
+            .read_until(b'>', &mut self.raw)?;
+        // A UTF-8 byte order mark is authoritative, whatever the label says.
+        let encoding = if self.raw.starts_with(b"\xef\xbb\xbf") {
+            TextEncoding::Utf8
+        } else {
+            declared_encoding(&self.raw).unwrap_or(TextEncoding::Utf8)
+        };
+        self.encoding = Some(encoding);
+        Ok(encoding)
+    }
+}
+
+/// The encoding an XML declaration at the start of `head` names; `None`
+/// when there is no declaration or it names none.
+fn declared_encoding(head: &[u8]) -> Option<TextEncoding> {
+    // The declaration itself is ASCII, so lossy decoding cannot change it.
+    let head = String::from_utf8_lossy(head);
+    let mut reader = XmlReader::from_str(&head);
+    loop {
+        match reader.read_event() {
+            Ok(XmlEvent::Decl(declaration)) => {
+                let label = declaration.encoding()?.ok()?;
+                return Some(TextEncoding::from_label(label.as_bytes()));
+            }
+            // Leading whitespace (or junk) before the declaration.
+            Ok(XmlEvent::Text(_)) => {}
+            _ => return None,
+        }
+    }
+}
+
+impl<R: BufRead> BufRead for Utf8Transcoder<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        while self.pos == self.out.len() {
+            self.out.clear();
+            self.pos = 0;
+            let encoding = match self.encoding {
+                Some(encoding) => encoding,
+                None => self.sniff()?,
+            };
+            let chunk = self.inner.fill_buf()?;
+            let read = chunk.len();
+            if read == 0 {
+                // End of input: a sequence still cut off is invalid.
+                if self.raw.is_empty() {
+                    break;
+                }
+                self.out.push_str(&encoding.decode(&self.raw));
+                self.raw.clear();
+            } else if self.raw.is_empty() {
+                let complete = read - encoding.incomplete_tail_len(chunk);
+                self.out.push_str(&encoding.decode(&chunk[..complete]));
+                self.raw.extend_from_slice(&chunk[complete..]);
+            } else {
+                self.raw.extend_from_slice(chunk);
+                let complete = self.raw.len() - encoding.incomplete_tail_len(&self.raw);
+                self.out.push_str(&encoding.decode(&self.raw[..complete]));
+                self.raw.drain(..complete);
+            }
+            self.inner.consume(read);
+        }
+        Ok(&self.out.as_bytes()[self.pos..])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.pos = (self.pos + amount).min(self.out.len());
+    }
+}
+
+impl<R: BufRead> Read for Utf8Transcoder<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let count = available.len().min(buf.len());
+        buf[..count].copy_from_slice(&available[..count]);
+        self.consume(count);
+        Ok(count)
+    }
 }
 
 /// The character a Windows-1252 byte stands for. Bytes the code page
@@ -284,7 +430,7 @@ pub fn parse_xmltv<R: BufRead>(input: R, now: i64) -> Result<Guide, EpgError> {
     // No trim_text: per-event trimming could eat spaces around separately
     // reported entity references. Collected text is trimmed once, when its
     // element ends.
-    let mut reader = XmlReader::from_reader(input);
+    let mut reader = XmlReader::from_reader(Utf8Transcoder::new(input));
     let config = reader.config_mut();
     // One misspelled or misplaced end tag must not cost the whole guide.
     config.check_end_names = false;
@@ -333,8 +479,6 @@ struct GuideBuilder {
     guide: Guide,
     /// Reference time for the kept window.
     now: i64,
-    /// Text encoding named by the XML declaration.
-    encoding: TextEncoding,
     /// `<channel>` and `<programme>` start tags seen, usable or not: tells
     /// a guide cut short from a source that never was one.
     elements_seen: usize,
@@ -354,7 +498,6 @@ impl GuideBuilder {
         Self {
             guide: Guide::default(),
             now,
-            encoding: TextEncoding::Utf8,
             elements_seen: 0,
             channel_id: None,
             pending: None,
@@ -365,22 +508,18 @@ impl GuideBuilder {
 
     fn handle(&mut self, event: XmlEvent) {
         match event {
-            XmlEvent::Decl(declaration) => {
-                if let Some(Ok(label)) = declaration.encoding() {
-                    self.encoding = TextEncoding::from_label(&label);
-                }
-            }
             XmlEvent::Start(element) => self.start(&element),
             // Entity references arrive as separate GeneralRef events, so
-            // text and CDATA only need decoding, not unescaping.
+            // text and CDATA (already UTF-8, see `Utf8Transcoder`) are taken
+            // as they are, without unescaping.
             XmlEvent::Text(t) => {
                 if !matches!(self.target, TextTarget::None) {
-                    self.text.push_str(&self.encoding.decode(&t));
+                    self.text.push_str(&t);
                 }
             }
             XmlEvent::CData(t) => {
                 if !matches!(self.target, TextTarget::None) {
-                    self.text.push_str(&self.encoding.decode(&t));
+                    self.text.push_str(&t);
                 }
             }
             // Handle references when quick-xml reports them separately;
@@ -397,8 +536,8 @@ impl GuideBuilder {
                 // tag — even a misspelled `</titel>` — closes them.
                 self.close_text();
                 match element.local_name().as_ref() {
-                    b"channel" => self.channel_id = None,
-                    b"programme" => self.finish_programme(),
+                    "channel" => self.channel_id = None,
+                    "programme" => self.finish_programme(),
                     _ => {}
                 }
             }
@@ -411,24 +550,24 @@ impl GuideBuilder {
         // end tag was missing or misspelled.
         self.close_text();
         match element.local_name().as_ref() {
-            b"channel" => {
+            "channel" => {
                 self.elements_seen += 1;
-                self.channel_id = attr_value(element, b"id", self.encoding);
+                self.channel_id = attr_value(element, "id");
             }
-            b"display-name" if self.channel_id.is_some() => {
+            "display-name" if self.channel_id.is_some() => {
                 self.target = TextTarget::DisplayName;
                 self.text.clear();
             }
-            b"programme" => {
+            "programme" => {
                 self.elements_seen += 1;
                 // The previous <programme> was never closed: keep it if
                 // it got that far, then start afresh.
                 self.finish_programme();
-                self.pending = programme_from_attrs(element, self.now, self.encoding);
+                self.pending = programme_from_attrs(element, self.now);
             }
             // Only the first <title> counts; feeds often repeat it once
             // per language.
-            b"title"
+            "title"
                 if self
                     .pending
                     .as_ref()
@@ -499,7 +638,7 @@ fn resolve_reference(reference: &quick_xml::events::BytesRef) -> Option<char> {
     if let Ok(Some(ch)) = reference.resolve_char_ref() {
         return Some(ch);
     }
-    match reference.decode().ok()?.as_ref() {
+    match &**reference {
         "amp" => Some('&'),
         "lt" => Some('<'),
         "gt" => Some('>'),
@@ -509,21 +648,14 @@ fn resolve_reference(reference: &quick_xml::events::BytesRef) -> Option<char> {
     }
 }
 
-/// Reads one attribute of `element`, decoded like text (see
-/// [`TextEncoding`]) and then unescaped and normalized; `None` when absent
-/// or when it references an unknown entity.
-fn attr_value(element: &BytesStart, name: &[u8], encoding: TextEncoding) -> Option<String> {
-    let attr = element
+/// Reads one attribute of `element` (already UTF-8, see
+/// [`Utf8Transcoder`]), unescaped and normalized; `None` when absent or
+/// when it references an unknown entity.
+fn attr_value(element: &BytesStart, name: &str) -> Option<String> {
+    element
         .attributes()
         .flatten()
-        .find(|attr| attr.key.as_ref() == name)?;
-    // quick-xml's unescaping/normalization insists on UTF-8, so hand it
-    // the already decoded value rather than the raw bytes.
-    let decoded = Attribute {
-        key: attr.key,
-        value: Cow::Owned(encoding.decode(&attr.value).into_owned().into_bytes()),
-    };
-    decoded
+        .find(|attr| attr.key.as_ref() == name)?
         .normalized_value(quick_xml::XmlVersion::Implicit1_0)
         .ok()
         .map(Cow::into_owned)
@@ -532,14 +664,10 @@ fn attr_value(element: &BytesStart, name: &[u8], encoding: TextEncoding) -> Opti
 /// Builds the programme skeleton from a `<programme>` start tag; `None`
 /// when attributes are missing/malformed or the programme lies outside
 /// the kept window.
-fn programme_from_attrs(
-    element: &BytesStart,
-    now: i64,
-    encoding: TextEncoding,
-) -> Option<(String, Programme)> {
-    let channel = attr_value(element, b"channel", encoding)?;
-    let start = parse_xmltv_time(&attr_value(element, b"start", encoding)?)?;
-    let stop = parse_xmltv_time(&attr_value(element, b"stop", encoding)?)?;
+fn programme_from_attrs(element: &BytesStart, now: i64) -> Option<(String, Programme)> {
+    let channel = attr_value(element, "channel")?;
+    let start = parse_xmltv_time(&attr_value(element, "start")?)?;
+    let stop = parse_xmltv_time(&attr_value(element, "stop")?)?;
     (stop > now && start <= now + KEEP_AHEAD_SECS).then(|| {
         (
             channel,
@@ -1240,6 +1368,70 @@ mod tests {
             TextEncoding::Windows1252.decode(b"\x80 \x92s \x96 \xe9\x81"),
             "€ ’s – é\u{81}"
         );
+    }
+
+    #[test]
+    fn characters_cut_across_reads_decode_intact() {
+        // Since quick-xml 0.42 the document is transcoded before parsing;
+        // a multi-byte character split between two reads must not turn
+        // into U+FFFD. One-byte reads split every one of them.
+        let xml = format!(
+            r#"<tv>
+<channel id="télé.tv"><display-name>Télé – Ünï 🎬</display-name></channel>
+<programme start="{}" stop="{}" channel="télé.tv"><title>Caf@ – 🎬 &amp; ½</title></programme>
+</tv>"#,
+            stamp(-1),
+            stamp(1),
+        );
+        let (before, after) = xml.split_once('@').unwrap();
+        // A Latin-1 "é" (invalid UTF-8) next to the valid multi-byte ones.
+        let bytes = [before.as_bytes(), b"\xe9", after.as_bytes()].concat();
+        let guide = parse_xmltv(BufReader::with_capacity(1, bytes.as_slice()), NOW).unwrap();
+        let (current, _) = guide.now_next(Some("télé.tv"), "x", NOW);
+        assert_eq!(current.unwrap().title, "Caf\u{fffd} – 🎬 & ½");
+        let (by_name, _) = guide.now_next(None, "TÉLÉ – ÜNÏ 🎬", NOW);
+        assert!(by_name.is_some());
+
+        // Likewise for a Latin-1 feed, whose declaration is sniffed from
+        // the opening bytes before any of them is decoded.
+        let latin = format!(
+            r#"<?xml version="1.0" encoding="ISO-8859-1"?><tv><programme start="{}" stop="{}" channel="one.tv"><title>Crème brûlée</title></programme></tv>"#,
+            stamp(-1),
+            stamp(1),
+        );
+        let bytes = latin1(&latin);
+        let guide = parse_xmltv(BufReader::with_capacity(1, bytes.as_slice()), NOW).unwrap();
+        assert_eq!(
+            current_title(&guide, "one.tv").as_deref(),
+            Some("Crème brûlée")
+        );
+    }
+
+    #[test]
+    fn utf8_byte_order_mark_overrides_a_latin1_label() {
+        let xml = format!(
+            "\u{feff}<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\
+             <tv><programme start=\"{}\" stop=\"{}\" channel=\"one.tv\"><title>Café</title></programme></tv>",
+            stamp(-1),
+            stamp(1),
+        );
+        let guide = parse(&xml);
+        assert_eq!(current_title(&guide, "one.tv").as_deref(), Some("Café"));
+    }
+
+    #[test]
+    fn incomplete_utf8_tail_is_held_back() {
+        let utf8 = TextEncoding::Utf8;
+        assert_eq!(utf8.incomplete_tail_len(b""), 0);
+        assert_eq!(utf8.incomplete_tail_len(b"abc"), 0);
+        assert_eq!(utf8.incomplete_tail_len("é🎬".as_bytes()), 0);
+        assert_eq!(utf8.incomplete_tail_len(b"a\xc3"), 1);
+        assert_eq!(utf8.incomplete_tail_len(b"a\xe2\x80"), 2);
+        assert_eq!(utf8.incomplete_tail_len(b"a\xf0\x9f\x8e"), 3);
+        // Never a valid start: decoded (as U+FFFD) right away.
+        assert_eq!(utf8.incomplete_tail_len(b"a\xff"), 0);
+        assert_eq!(utf8.incomplete_tail_len(b"a\x80\x80\x80"), 0);
+        assert_eq!(TextEncoding::Windows1252.incomplete_tail_len(b"a\xc3"), 0);
     }
 
     #[test]
