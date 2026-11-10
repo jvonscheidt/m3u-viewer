@@ -1,13 +1,44 @@
-# Actions are pinned to commit SHAs; Dependabot bumps the SHA and the
-# trailing "# vX.Y.Z" comment together so the pins do not go stale.
+# Dependabot version updates. PRs run the normal CI (fmt, clippy, test,
+# cargo audit); nothing ships until a v* tag is pushed from main.
 version: 2
+
 updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Skip releases younger than a week: most compromised or broken releases
+    # are pulled within days.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # Dev-only crates (criterion): one PR, they never reach the binary.
+      dev-dependencies:
+        dependency-type: development
+      # Runtime minor/patch bumps together; majors get their own PRs.
+      runtime:
+        dependency-type: production
+        update-types:
+          - minor
+          - patch
+
+  # Actions are pinned to commit SHAs; Dependabot bumps the SHA and the
+  # trailing "# vX.Y.Z" comment together so the pins do not go stale.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-    groups:
-      github-actions:
-        patterns: ["*"]
+      day: monday
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: chore
+      include: scope
+    groups:
+      github-actions:
+        patterns:
+          - "*"
