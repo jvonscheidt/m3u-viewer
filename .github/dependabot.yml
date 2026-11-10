@@ -30,6 +30,20 @@ updates:
           - minor
           - patch
 
+  # rust-toolchain.toml pins the exact stable release. A bump can bring new
+  # clippy lints, which CI (-D warnings) turns into errors, so a PR that
+  # trips one stays blocked until the lints are fixed on its branch.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+
   # Actions are pinned to commit SHAs; Dependabot bumps the SHA and the
   # trailing "# vX.Y.Z" comment together so the pins do not go stale.
   - package-ecosystem: github-actions
