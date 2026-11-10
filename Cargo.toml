@@ -31,7 +31,7 @@ ureq = "3.3.0"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
-criterion = "0.5.1"
+criterion = "0.8.2"
 
 [[bench]]
 name = "absorb"
