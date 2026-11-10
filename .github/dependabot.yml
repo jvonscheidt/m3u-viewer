@@ -15,13 +15,17 @@ updates:
     commit-message:
       prefix: chore
       include: scope
+    # Groups match by name: Dependabot ignores dependency-type for cargo.
+    # Keep both lists in sync with [dev-dependencies] in Cargo.toml.
     groups:
-      # Dev-only crates (criterion): one PR, they never reach the binary.
+      # Dev-only crates: one PR, they never reach the binary.
       dev-dependencies:
-        dependency-type: development
+        patterns:
+          - criterion
       # Runtime minor/patch bumps together; majors get their own PRs.
       runtime:
-        dependency-type: production
+        exclude-patterns:
+          - criterion
         update-types:
           - minor
           - patch
