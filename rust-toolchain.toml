@@ -2,5 +2,5 @@
 # Pinned so new clippy lints in a stable release cannot break CI on
 # their own. Dependabot proposes bumps weekly; a PR that trips new lints
 # stays blocked until they are fixed on its branch.
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
