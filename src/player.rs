@@ -138,8 +138,7 @@ impl Player {
             };
         }
         let path_dirs = env::var_os("PATH")
-            .map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
-            .unwrap_or_default();
+            .map_or_default(|paths| env::split_paths(&paths).collect::<Vec<_>>());
         let result = find_executable(path_dirs.iter().map(PathBuf::as_path))
             .or_else(|| find_executable(standard_dirs().iter().map(PathBuf::as_path)))
             .map(|exe| Self {
