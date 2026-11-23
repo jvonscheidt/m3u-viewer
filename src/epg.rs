@@ -18,8 +18,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use flate2::bufread::MultiGzDecoder;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use quick_xml::Reader as XmlReader;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
 use thiserror::Error;
@@ -172,9 +173,13 @@ impl Guide {
 /// Formats Unix seconds as local wall-clock `HH:MM` for display.
 #[must_use]
 pub fn format_time(epoch: i64) -> String {
-    DateTime::from_timestamp(epoch, 0).map_or_else(
-        || "--:--".to_owned(),
-        |time| time.with_timezone(&Local).format("%H:%M").to_string(),
+    Timestamp::from_second(epoch).map_or_else(
+        |_| "--:--".to_owned(),
+        |time| {
+            time.to_zoned_datetime(TimeZone::system())
+                .strftime("%H:%M")
+                .to_string()
+        },
     )
 }
 
@@ -697,14 +702,13 @@ fn parse_xmltv_time(value: &str) -> Option<i64> {
     while padded.len() < 14 {
         padded.push('0');
     }
-    match offset.trim_start() {
-        "" => NaiveDateTime::parse_from_str(&padded, "%Y%m%d%H%M%S")
-            .ok()
-            .map(|naive| Utc.from_utc_datetime(&naive).timestamp()),
-        offset => DateTime::parse_from_str(&format!("{padded} {offset}"), "%Y%m%d%H%M%S %z")
-            .ok()
-            .map(|time| time.timestamp()),
-    }
+    let offset = match offset.trim_start() {
+        "" => "+0000",
+        offset => offset,
+    };
+    Timestamp::strptime("%Y%m%d%H%M%S %z", format!("{padded} {offset}"))
+        .ok()
+        .map(Timestamp::as_second)
 }
 
 /// Where the XMLTV guide comes from.
@@ -768,7 +772,7 @@ pub fn spawn(source: EpgSource, user_agent: Option<String>) -> Receiver<EpgEvent
     thread::spawn(move || {
         let described = source.describe();
         log::info!("loading EPG from {described}");
-        let now = Utc::now().timestamp();
+        let now = Timestamp::now().as_second();
         let event = match load(&source, user_agent.as_deref(), now, HttpTimeouts::STANDARD) {
             Ok(guide) => {
                 match guide.partial_load_warning() {
@@ -854,13 +858,13 @@ mod tests {
 
     /// XMLTV timestamp (UTC, explicit offset) `n` hours from NOW.
     fn stamp(offset_hours: i64) -> String {
-        let time = DateTime::from_timestamp(NOW + hours(offset_hours), 0).unwrap();
-        time.format("%Y%m%d%H%M%S +0000").to_string()
+        let time = Timestamp::from_second(NOW + hours(offset_hours)).unwrap();
+        time.strftime("%Y%m%d%H%M%S +0000").to_string()
     }
 
     fn stamp_seconds(offset_seconds: i64) -> String {
-        let time = DateTime::from_timestamp(NOW + offset_seconds, 0).unwrap();
-        time.format("%Y%m%d%H%M%S +0000").to_string()
+        let time = Timestamp::from_second(NOW + offset_seconds).unwrap();
+        time.strftime("%Y%m%d%H%M%S +0000").to_string()
     }
 
     fn sample_guide() -> Guide {
@@ -1161,6 +1165,17 @@ mod tests {
     }
 
     #[test]
+    fn format_time_renders_local_hours_and_minutes() {
+        let shown = format_time(NOW);
+        let local = Timestamp::from_second(NOW)
+            .unwrap()
+            .to_zoned_datetime(TimeZone::system());
+        assert_eq!(shown, format!("{:02}:{:02}", local.hour(), local.minute()));
+        // Beyond the representable range: a placeholder, not a panic.
+        assert_eq!(format_time(i64::MAX), "--:--");
+    }
+
+    #[test]
     fn timestamps_accept_an_offset_without_a_space() {
         // Regression: only "digits offset" split on a space was accepted,
         // so feeds writing "20240101120000+0100" lost every programme.
@@ -1188,9 +1203,9 @@ mod tests {
     #[test]
     fn programmes_with_unspaced_offsets_are_kept() {
         let at = |hours_from_now: i64| {
-            DateTime::from_timestamp(NOW + hours(hours_from_now), 0)
+            Timestamp::from_second(NOW + hours(hours_from_now))
                 .unwrap()
-                .format("%Y%m%d%H%M%S+0000")
+                .strftime("%Y%m%d%H%M%S+0000")
                 .to_string()
         };
         let xml = format!(

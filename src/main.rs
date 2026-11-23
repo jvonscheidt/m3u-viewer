@@ -10,7 +10,8 @@ use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{NaiveDate, Utc};
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use m3u_viewer::app::App;
 use m3u_viewer::config::{Config, ConfigError, XtreamConfig};
 use m3u_viewer::epg::{self, EpgEvent, EpgSource};
@@ -235,7 +236,7 @@ fn parse_args(args: impl Iterator<Item = OsString>, config: &Config) -> Result<A
 }
 
 /// How many days a log file collects entries before it is rotated aside.
-const LOG_RETENTION_DAYS: i64 = 30;
+const LOG_RETENTION_DAYS: i32 = 30;
 
 /// Initialises file-only logging to `path`, appending so a launch no
 /// longer discards the previous run, and rotating the file aside once it
@@ -248,7 +249,12 @@ const LOG_RETENTION_DAYS: i64 = 30;
 /// treat this as a warning: the viewer works without a log.
 fn init_logger(path: Option<&Path>) -> Result<()> {
     let Some(path) = path else { return Ok(()) };
-    let (file, rotation_failure) = open_log_file(path, Utc::now().date_naive())?;
+    let (file, rotation_failure) = open_log_file(
+        path,
+        jiff::Timestamp::now()
+            .to_zoned_datetime(TimeZone::UTC)
+            .date(),
+    )?;
     simplelog::WriteLogger::init(
         simplelog::LevelFilter::Info,
         // Dated timestamps: a log spanning up to 30 days needs them to be
@@ -276,7 +282,7 @@ fn init_logger(path: Option<&Path>) -> Result<()> {
 /// # Errors
 ///
 /// When the log directory cannot be created or the file not opened.
-fn open_log_file(path: &Path, today: NaiveDate) -> Result<(std::fs::File, Option<String>)> {
+fn open_log_file(path: &Path, today: Date) -> Result<(std::fs::File, Option<String>)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create log directory {}", parent.display()))?;
@@ -298,24 +304,26 @@ fn open_log_file(path: &Path, today: NaiveDate) -> Result<(std::fs::File, Option
 /// `None` when the file is empty, unreadable, or was written by a version
 /// that timestamped entries with the time alone — all of which mean the
 /// file's age is unknown and it is due for rotation.
-fn log_start_date(path: &Path) -> Option<NaiveDate> {
+fn log_start_date(path: &Path) -> Option<Date> {
     let mut first_line = String::new();
     BufReader::new(std::fs::File::open(path).ok()?)
         .read_line(&mut first_line)
         .ok()?;
-    NaiveDate::parse_from_str(first_line.get(..10)?, "%Y-%m-%d").ok()
+    Date::strptime("%Y-%m-%d", first_line.get(..10)?).ok()
 }
 
 /// Renames the log to `<name>.old` once its oldest entry is
 /// [`LOG_RETENTION_DAYS`] or more behind `today`, so the previous period
 /// is still on disk. Any earlier `.old` file is replaced, keeping the two
 /// files bounded.
-fn rotate_if_stale(path: &Path, today: NaiveDate) -> Result<()> {
+fn rotate_if_stale(path: &Path, today: Date) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let within_retention =
-        log_start_date(path).is_some_and(|start| (today - start).num_days() < LOG_RETENTION_DAYS);
+    // Spans between dates default to days as their largest unit.
+    let within_retention = log_start_date(path)
+        .and_then(|start| today.since(start).ok())
+        .is_some_and(|age| age.get_days() < LOG_RETENTION_DAYS);
     if within_retention {
         return Ok(());
     }
@@ -1150,8 +1158,8 @@ mod tests {
         assert!(!restored.get());
     }
 
-    fn date(text: &str) -> NaiveDate {
-        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+    fn date(text: &str) -> Date {
+        Date::strptime("%Y-%m-%d", text).unwrap()
     }
 
     #[test]
