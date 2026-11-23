@@ -25,7 +25,7 @@ sha256sum --check --ignore-missing SHA256SUMS
 
 ### Build & run
 
-Requires [Rust](https://rustup.rs) 1.99.0 (pinned via
+Requires [Rust](https://rustup.rs) 1.100.0 (pinned via
 `rust-toolchain.toml`; rustup installs it automatically) and, for
 playback, [VLC](https://www.videolan.org).
 
