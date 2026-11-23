@@ -14,7 +14,7 @@ type ProgrammePair<'a> = (Option<&'a Programme>, Option<&'a Programme>);
 
 /// Draws one frame.
 pub fn draw(frame: &mut Frame, app: &App) {
-    draw_at(frame, app, chrono::Utc::now().timestamp());
+    draw_at(frame, app, jiff::Timestamp::now().as_second());
 }
 
 /// Draws one frame as of `now` (Unix seconds — injected so tests render
@@ -671,9 +671,9 @@ mod tests {
     /// channels carry no tvg-id) airs "Current Show" then "Next Show".
     fn test_guide() -> crate::epg::Guide {
         let stamp = |offset_hours: i64| {
-            chrono::DateTime::from_timestamp(NOW + offset_hours * 3600, 0)
+            jiff::Timestamp::from_second(NOW + offset_hours * 3600)
                 .unwrap()
-                .format("%Y%m%d%H%M%S +0000")
+                .strftime("%Y%m%d%H%M%S +0000")
                 .to_string()
         };
         let xml = format!(
